@@ -1002,3 +1002,55 @@ fn no_selection_means_the_cursor_is_still_drawn() {
     assert!(!copy_cursor_in_selection(3, 3, Some((1, 1)), None, "char"));
     assert!(!copy_cursor_in_selection(3, 3, None, Some((5, 5)), "char"));
 }
+
+// ---------------------------------------------------------------------------
+// PasteGesture: the "already forwarded" latch must expire.
+//
+// A client that pastes without a Ctrl+V keystroke -- a mobile terminal, a paste
+// button on a terminal that does support bracketed paste -- never calls
+// `start()` or `finish()`.  The latch those two cleared used to be permanent,
+// so the first paste went through and every later one was dropped with
+// "dropping duplicate of N char(s) already sent as characters", whatever the
+// clipboard held.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn paste_gesture_latch_does_not_outlive_its_read_back_window() {
+    let mut g: super::PasteGesture = Default::default();
+    // A burst flushed as characters with no Ctrl+V press before it: the mobile
+    // terminal case.  Nothing opens or closes a gesture here.
+    g.record("C2");
+    // Right after the burst the read-back is still that paste -- the upstream
+    // contract (a_gesture_that_forwarded_characters_blocks_the_read_back).
+    assert!(
+        g.blocks("C2"),
+        "the read-back of a burst that just went out is still that paste"
+    );
+    // Once the window has passed, that burst must not suppress anything: a latch
+    // that never expired is what dropped every paste after the first.
+    std::thread::sleep(super::PASTE_GESTURE_WINDOW + std::time::Duration::from_millis(50));
+    assert!(
+        !g.blocks("a completely different clipboard payload"),
+        "a forwarded burst must not block later, unrelated pastes"
+    );
+    assert!(
+        !g.blocks("abc123abc"),
+        "the second paste of a fresh client must reach the pane"
+    );
+}
+
+#[test]
+fn paste_gesture_still_blocks_the_read_back_of_its_own_paste() {
+    let mut g: super::PasteGesture = Default::default();
+    g.start(); // Ctrl+V press: the characters arriving now are that paste
+    g.record("C2"); // first half went out as typing
+    assert!(
+        g.blocks("C2中文"),
+        "while the gesture is live, the read-back of the same paste stays a duplicate"
+    );
+    g.finish(); // Ctrl+V release / gesture over
+    assert!(
+        !g.blocks("C2中文"),
+        "after the gesture ends the same text is a new deliberate paste"
+    );
+}

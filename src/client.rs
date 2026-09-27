@@ -8838,7 +8838,25 @@ impl PasteGesture {
     /// characters were already forwarded (whatever they were split into), or
     /// the same text went out a moment ago.
     fn blocks(&self, text: &str) -> bool {
-        self.injected || duplicates_recent_paste(text, self.recent())
+        // "Already forwarded" covers the read-back of a paste whose characters
+        // went out as typing in pieces (`C2` then the CJK part), where the text
+        // no longer compares equal even though it is the whole paste: whatever
+        // comes back right after a burst of this gesture's characters is that
+        // paste, not typing the user did.
+        //
+        // The window runs from that burst, not from the Ctrl+V press, and it
+        // expires.  A client that pastes without a Ctrl+V keystroke (a mobile
+        // terminal, a paste button) sets `injected` too, and the old unbounded
+        // latch -- cleared only by `start()` / `finish()`, a press and its
+        // release -- made it drop every paste after the first as a duplicate of
+        // it, whatever the content.
+        let injected_recently = self.injected
+            && self
+                .recent()
+                .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+        injected_recently
+            || (self.is_open() && self.injected)
+            || duplicates_recent_paste(text, self.recent())
     }
 }
 
