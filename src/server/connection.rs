@@ -4029,6 +4029,10 @@ match cmd {
     "copy-mode" => {
         if args.iter().any(|a| *a == "-u") {
             let _ = tx.send(CtrlReq::CopyEnterPageUp);
+        } else if args.iter().any(|a| *a == "-H") {
+            // tmux hides the position indicator for this entry only
+            // (`window-copy.c` `window_copy_init` reads the flag), #704.
+            let _ = tx.send(CtrlReq::CopyEnterHidden);
         } else {
             let _ = tx.send(CtrlReq::CopyEnter);
         }

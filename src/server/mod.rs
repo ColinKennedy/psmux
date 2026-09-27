@@ -3211,6 +3211,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::PrefixBegin => { app.client_prefix_active = true; app.current_key_table = None; state_dirty = true; }
                 CtrlReq::PrefixEnd => { app.client_prefix_active = false; state_dirty = true; }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); hook_event = Some("pane-mode-changed"); }
+                CtrlReq::CopyEnterHidden => {
+                    crate::copy_mode::enter_copy_mode_hidden(&mut app);
+                    hook_event = Some("pane-mode-changed");
+                }
                 CtrlReq::CopyEnterPageUp => {
                     if crate::copy_mode::enter_copy_mode_page_up(&mut app) {
                         hook_event = Some("pane-mode-changed");
@@ -3926,6 +3930,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // tmux 3.3 calls this refresh-toggle; older tables and
                         // the #498 report use refresh-from-pane for the same key.
                         "refresh-from-pane" | "refresh-toggle" => { crate::copy_mode::toggle_refresh(&mut app); }
+                        "toggle-position" => { crate::copy_mode::toggle_position(&mut app); }
                         "next-paragraph" => {
                             crate::copy_mode::move_next_paragraph(&mut app);
                         }
@@ -7647,6 +7652,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
             }
             if mutates_state {
+                state_dirty = true;
+            }
+            // A copy-mode command that changed only how the mode is drawn asks
+            // for its frame here. `SendText` and `SendKey` are left out of
+            // `mutates_state` because an ordinary keystroke's frame comes from
+            // the pty echo, and a copy-mode key has no echo to ride on (#704).
+            if app.copy_needs_redraw {
+                app.copy_needs_redraw = false;
                 state_dirty = true;
             }
         }

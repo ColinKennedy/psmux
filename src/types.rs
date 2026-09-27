@@ -1157,6 +1157,9 @@ pub struct CopyModeState {
     /// Mark and last-jump are pane-local like the rest of copy state (#498)
     pub mark: Option<(usize, u16, u16)>,
     pub last_jump: Option<(u8, char)>,
+    /// `toggle-position` is pane-local too, so a pane parked in copy mode keeps
+    /// its own answer while another pane is focused (#704)
+    pub hide_position: bool,
     /// true when the pane was in CopySearch (not CopyMode)
     pub in_search: bool,
     /// search input buffer (only meaningful when in_search == true)
@@ -1349,6 +1352,16 @@ pub struct AppState {
     /// When true the pane keeps following live output while in copy mode
     /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
     pub copy_refresh_live: bool,
+    /// When true the copy-mode position indicator is not drawn. Toggled by `P`
+    /// (`toggle-position`) and set on entry by `copy-mode -H` (#704). It lives
+    /// on the mode the way tmux's `hide_position` does, so leaving copy mode
+    /// and coming back shows the indicator again.
+    pub copy_hide_position: bool,
+    /// Set by a copy-mode command that changes only how the mode is drawn, with
+    /// nothing in the pane or the layout to notice. The server loop turns it
+    /// into one frame and clears it. tmux says the same thing by returning
+    /// `WINDOW_COPY_CMD_REDRAW` from the command (#704).
+    pub copy_needs_redraw: bool,
     /// Named registers a-z for copy-mode yank/paste
     pub named_registers: std::collections::HashMap<char, String>,
     pub display_map: Vec<(usize, Vec<usize>)>,
@@ -2247,6 +2260,8 @@ impl AppState {
             copy_mark: None,
             copy_last_jump: None,
             copy_refresh_live: false,
+            copy_hide_position: false,
+            copy_needs_redraw: false,
             named_registers: std::collections::HashMap::new(),
             display_map: Vec::new(),
             key_tables: std::collections::HashMap::new(),
@@ -2627,6 +2642,8 @@ pub enum CtrlReq {
     PrefixEnd,
     CopyEnter,
     CopyEnterPageUp,
+    /// `copy-mode -H`: enter with the position indicator hidden.
+    CopyEnterHidden,
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,

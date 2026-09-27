@@ -428,6 +428,7 @@ again and jumps to the bottom of the history. Press `r` again to re-anchor.
 | `H` | Jump to top of visible area |
 | `M` | Jump to middle of visible area |
 | `L` | Jump to bottom of visible area |
+| `P` | Hide or show the position indicator in the top-right corner |
 
 ### Character Find
 
@@ -560,8 +561,12 @@ word, `Alt+v` pages up, `Alt+w` copies and exits, `Ctrl+s` / `Ctrl+r` search for
 When in copy mode:
 - The pane border turns **yellow**
 - `[copy mode]` appears in the title
-- A scroll position indicator shows in the top-right corner
+- A position indicator shows in the top-right corner, which `P` hides and shows
 - Mouse drag-select copies to Windows clipboard on release
+
+`P` is tmux's `toggle-position`, bound in both copy-mode tables. The indicator comes back the next
+time you enter copy mode, because the setting belongs to that visit rather than to the pane.
+`copy-mode -H` opens copy mode with it already hidden.
 
 ## Mouse Bindings
 

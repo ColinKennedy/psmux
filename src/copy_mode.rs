@@ -57,7 +57,21 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_mark = None;
     app.copy_last_jump = None;
     app.copy_refresh_live = false;
+    // tmux sets `hide_position` from the `-H` flag every time the mode is
+    // created (`window-copy.c` `window_copy_init`), so a plain entry always
+    // shows the indicator. `enter_copy_mode_hidden` is the `-H` path.
+    app.copy_hide_position = false;
     // Mark the active pane as being in copy mode (pane-local state).
+    save_copy_state_to_pane(app);
+}
+
+/// `copy-mode -H`: enter copy mode with the position indicator hidden (#704).
+///
+/// Separate from `enter_copy_mode` rather than a parameter on it: that function
+/// has more than forty callers and every one of them wants the indicator.
+pub fn enter_copy_mode_hidden(app: &mut AppState) {
+    enter_copy_mode(app);
+    app.copy_hide_position = true;
     save_copy_state_to_pane(app);
 }
 
@@ -156,6 +170,7 @@ pub fn save_copy_state_to_pane(app: &mut AppState) {
         register: app.copy_register,
         mark: app.copy_mark,
         last_jump: app.copy_last_jump,
+        hide_position: app.copy_hide_position,
         in_search,
         search_input,
         search_input_forward,
@@ -190,6 +205,7 @@ pub fn restore_copy_state_from_pane(app: &mut AppState) {
         app.copy_register = s.register;
         app.copy_mark = s.mark;
         app.copy_last_jump = s.last_jump;
+        app.copy_hide_position = s.hide_position;
         if s.in_search {
             app.mode = Mode::CopySearch { input: s.search_input, forward: s.search_input_forward };
         } else {
@@ -1370,6 +1386,25 @@ pub fn toggle_refresh(app: &mut AppState) {
     }
 }
 
+/// Hide or show the copy-mode position indicator, the `P` key and the
+/// `toggle-position` command (#704).
+///
+/// tmux keeps this on the mode entry and flips it in
+/// `window_copy_cmd_toggle_position` (`window-copy.c`), which is why it is
+/// saved with the rest of the pane-local copy state rather than kept as a
+/// client setting: two panes in copy mode answer independently, and leaving
+/// the mode forgets it.
+pub fn toggle_position(app: &mut AppState) {
+    app.copy_hide_position = !app.copy_hide_position;
+    // Nothing in the pane or the layout changes, so the frame has to be asked
+    // for: measured on a key press without this, the indicator took 2.6s and
+    // 3.8s to go, and once did not go at all inside ten seconds, because it
+    // waited for an unrelated frame. The `-X` route never had the problem
+    // because a command request marks the state dirty on its own.
+    app.copy_needs_redraw = true;
+    save_copy_state_to_pane(app);
+}
+
 /// Yank from cursor to end of line — D key
 pub fn copy_end_of_line(app: &mut AppState) -> io::Result<()> {
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return Ok(()) };
@@ -2170,3 +2205,7 @@ mod test_issue673_copy_snapshot_per_pane;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue687_copy_mode_keyboard_selection.rs"]
 mod test_issue687_copy_mode_keyboard_selection;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue704_toggle_position.rs"]
+mod test_issue704_toggle_position;
