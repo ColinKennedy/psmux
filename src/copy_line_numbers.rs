@@ -97,6 +97,34 @@ pub fn gutter_text(mode: CopyLnMode, width: usize, py: usize, oy: usize, cy: usi
     format!("{:>w$} ", n, w = width - 1)
 }
 
+/// Whether the line number mode counts from the top of the grid, so the
+/// position indicator has to agree with the gutter beside it. Mirrors tmux
+/// `window_copy_line_number_is_absolute` (window-copy.c).
+pub fn is_absolute(mode: CopyLnMode) -> bool {
+    matches!(mode, CopyLnMode::Absolute | CopyLnMode::Relative | CopyLnMode::Hybrid)
+}
+
+/// The `(copy_position, copy_position_limit)` pair tmux builds in
+/// `window_copy_formats` (window-copy.c):
+/// - `off` / `default`: the scroll offset over the scrollback rows.
+/// - `absolute` / `relative` / `hybrid`: the 1 based absolute line at the top
+///   of the view over the total lines (scrollback plus the pane height).
+pub fn copy_position(mode: CopyLnMode, oy: usize, hsize: usize, height: usize) -> (usize, usize) {
+    if is_absolute(mode) {
+        ((hsize + 1).saturating_sub(oy), hsize + height)
+    } else {
+        (oy, hsize)
+    }
+}
+
+/// The copy mode position indicator text, tmux's default
+/// `copy-mode-position-format` minus its alignment, time and search parts:
+/// `[#{copy_position}/#{copy_position_limit}]`.
+pub fn position_indicator(mode: CopyLnMode, oy: usize, hsize: usize, height: usize) -> String {
+    let (position, limit) = copy_position(mode, oy, hsize, height);
+    format!("[{}/{}]", position, limit)
+}
+
 /// Whether row `py` is the current (cursor) line, which is styled distinctly.
 pub fn is_current_row(py: usize, cy: usize) -> bool {
     py == cy
@@ -165,3 +193,7 @@ mod tests {
         assert_eq!(gutter_text(CopyLnMode::Absolute, 6, 0, 0, 5, 9959), " 9960 ");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue702_copy_position_indicator.rs"]
+mod tests_issue702_copy_position_indicator;
