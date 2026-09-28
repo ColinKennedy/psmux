@@ -495,17 +495,64 @@ if (!$hasCargo) {
     Report "Cargo install" $true "[SKIP: cargo not installed]"
 } else {
     Kill-All-Psmux
+    # Sweep 2026-09-28_06-16-17: this scenario uninstalled psmux, then cargo
+    # install could not reach index.crates.io (21 s connect timeout), so the
+    # machine was left with NO psmux, tmux or pmux and every later suite in the
+    # sweep failed against a missing binary. The installed binaries are now
+    # backed up first and put back whenever an install does not produce one; a
+    # network failure is retried once --offline from the local crate cache and
+    # otherwise scored as a skip, because it says nothing about psmux.
+    $cargoRoot = if ($env:CARGO_INSTALL_ROOT) { $env:CARGO_INSTALL_ROOT } elseif ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+    $cargoBinDir = Join-Path $cargoRoot "bin"
+    $cargoBackup = Join-Path $env:TEMP "psmux-install-speed-backup-$PID"
+    New-Item -ItemType Directory -Path $cargoBackup -Force | Out-Null
+    foreach ($exe in "psmux.exe", "tmux.exe", "pmux.exe") {
+        $src = Join-Path $cargoBinDir $exe
+        if (Test-Path $src) { Copy-Item $src (Join-Path $cargoBackup $exe) -Force }
+    }
+    function Restore-CargoBinaries {
+        foreach ($exe in "psmux.exe", "tmux.exe", "pmux.exe") {
+            $bak = Join-Path $cargoBackup $exe
+            $dst = Join-Path $cargoBinDir $exe
+            if ((Test-Path $bak) -and -not (Test-Path $dst)) {
+                Copy-Item $bak $dst -Force
+                Write-Host "  Restored $exe from the pre-test backup" -ForegroundColor Yellow
+            }
+        }
+    }
+    function Invoke-CargoInstall {
+        $out = @(cargo install --path $ProjectRoot --locked 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+        $net = ($out -join "`n") -match "index\.crates\.io|Could not connect|Timeout was reached|failed to download|curl failed|spurious network error"
+        if ($code -ne 0 -and $net) {
+            Write-Host "    crates.io unreachable, retrying from the local crate cache (--offline)" -ForegroundColor Yellow
+            $out = @(cargo install --path $ProjectRoot --locked --offline 2>&1 | ForEach-Object { "$_" })
+            $code = $LASTEXITCODE
+        }
+        $out | Select-Object -Last 5 | ForEach-Object { Write-Host "    $($_.Trim())" -ForegroundColor DarkGray }
+        return @{ Code = $code; Network = $net }
+    }
+
     # Uninstall existing
     cargo uninstall psmux 2>$null | Out-Null
 
     # Install from source
     Write-Host "  Installing via cargo install --path ..." -ForegroundColor Gray
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    cargo install --path $ProjectRoot 2>&1 | Select-Object -Last 5 | ForEach-Object { Write-Host "    $("$_".Trim())" -ForegroundColor DarkGray }
+    $inst = Invoke-CargoInstall
     $sw.Stop()
     Add-Benchmark "Cargo: install time" $sw.ElapsedMilliseconds
 
     $cargoBin = (Get-Command psmux -ErrorAction SilentlyContinue).Source
+    if (-not $cargoBin) {
+        Restore-CargoBinaries
+        if ($inst.Network) {
+            Write-Host "  [SKIP] crates.io unreachable and the offline retry failed; the previous binaries were restored" -ForegroundColor Yellow
+            Report "Cargo install" $true "[SKIP: crates.io unreachable, binaries restored]"
+            $cargoBin = $null
+            $cargoSkipped = $true
+        }
+    }
     if ($cargoBin) {
         Kill-All-Psmux
         Test-FirstRunSpeed -Label "Cargo" -Binary $cargoBin
@@ -519,18 +566,21 @@ if (!$hasCargo) {
         Write-Host "  Reinstalling via cargo install --path ..." -ForegroundColor Gray
         Kill-All-Psmux
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        cargo install --path $ProjectRoot 2>&1 | Select-Object -Last 5 | ForEach-Object { Write-Host "    $("$_".Trim())" -ForegroundColor DarkGray }
+        $inst2 = Invoke-CargoInstall
         $sw.Stop()
         Add-Benchmark "Cargo: reinstall time" $sw.ElapsedMilliseconds
+        if (-not (Get-Command psmux -ErrorAction SilentlyContinue)) { Restore-CargoBinaries }
 
         $cargoBin2 = (Get-Command psmux -ErrorAction SilentlyContinue).Source
         if ($cargoBin2) {
             Kill-All-Psmux
             Test-FirstRunSpeed -Label "Cargo (reinstall)" -Binary $cargoBin2
         }
-    } else {
+    } elseif (-not $cargoSkipped) {
         Report "Cargo: binary found after install" $false "psmux not in PATH"
     }
+    Restore-CargoBinaries
+    Remove-Item $cargoBackup -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 ###############################################################################
