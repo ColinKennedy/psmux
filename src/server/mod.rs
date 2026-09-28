@@ -1515,6 +1515,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Surface any non-fatal config parse warnings to the attaching client
     // (issue #370 follow-up) instead of silently dropping them.
     write_config_warnings_log(&app.config_warnings);
+    crate::startup_trace::mark_detail("srv.cfgwarn", &format!("n={}", app.config_warnings.len()));
     // Config may set pane-border-status which changes content height (#288)
     resize_all_panes(&mut app);
 
@@ -4491,6 +4492,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     load_config(&mut app);
                     // Surface config warnings to the claiming client (#370 follow-up).
                     write_config_warnings_log(&app.config_warnings);
+                    crate::startup_trace::mark_detail("srv.cfgwarn", &format!("n={}", app.config_warnings.len()));
                     // A standby parses the config at ITS boot, which is when
                     // the previous session's server spawned it. If default-shell
                     // changed on disk since (a user editing
