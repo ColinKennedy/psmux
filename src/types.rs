@@ -1804,6 +1804,19 @@ impl AppState {
             if self.latest_client_id == Some(cid) {
                 self.latest_client_id = self.client_registry.keys().max().copied();
             }
+            // Record whether the connection was still tracked at reap time.
+            // That is the normal order for a detach the client asked for
+            // (`client-detach` on its own connection, prefix d): the registry
+            // entry goes first and the client closes the socket itself right
+            // after. It is only a fault when no such request precedes it and
+            // no `client-reader` line follows, which is the deaf client that
+            // `teardown_client_connection` exists to prevent.
+            if has_persistent_stream(cid) {
+                crate::debug_log::server_log(
+                    "client-reap",
+                    &format!("client {cid}: registry entry reaped, stream still registered (expected for a client initiated detach)"),
+                );
+            }
             true
         } else {
             false
@@ -3650,6 +3663,36 @@ pub fn deregister_persistent_stream(client_id: u64) {
     }
 }
 
+/// True when a persistent stream is still tracked for this client id.
+///
+/// The reaper logs it so a registry entry removed while the connection is
+/// still open can be told apart in the debug log.
+pub fn has_persistent_stream(client_id: u64) -> bool {
+    PERSISTENT_STREAMS
+        .lock()
+        .map(|v| v.iter().any(|(cid, _)| *cid == client_id))
+        .unwrap_or(false)
+}
+
+/// Close everything a client's connection owns: the tracked TCP stream, its
+/// frame-push slot, its directive channel and its frame channel.
+///
+/// The client registry and the connection are two different things, and
+/// dropping one without the other leaves a client that keeps *receiving*
+/// frames (its writer thread and persistent stream are untouched) while
+/// nothing ever reads its input again (the reader that just ended was the only
+/// reader there is). That client is invisible in `list-clients` and completely
+/// dead to the user: clicks, wheel and keystrokes do nothing while the screen
+/// keeps updating, and the only way out is to restart the client by hand.
+///
+/// Closing the connection instead makes the client see EOF, so it reconnects
+/// under a fresh client id and its input works again.
+pub fn teardown_client_connection(client_id: u64) {
+    shutdown_client_stream(client_id);
+    deregister_persistent_stream(client_id);
+    deregister_frame_channel(client_id);
+}
+
 /// Shut down all tracked persistent client streams so their readers get EOF.
 pub fn shutdown_persistent_streams() {
     if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
@@ -3860,6 +3903,10 @@ pub struct ParsedTarget {
 #[cfg(test)]
 #[path = "../tests-rs/test_pr267_backpressure_proof.rs"]
 mod tests_pr267_backpressure;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_client_connection_teardown.rs"]
+mod tests_client_connection_teardown;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue434_reap_client.rs"]

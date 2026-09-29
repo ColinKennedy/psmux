@@ -1374,10 +1374,19 @@ loop {
         line.clear();
         match r.read_line(&mut line) {
             Ok(0) => {
-                // EOF - client disconnected
+                // EOF - client disconnected. A zero byte read is EOF here, but
+                // it is also how a timed out socket read surfaces on some
+                // Windows stacks, so log which one we think we saw: this line
+                // is the only witness that separates a real disconnect from a
+                // client that goes on receiving frames while losing its input.
+                crate::debug_log::server_log(
+                    "client-reader",
+                    &format!("client {client_id}: batching read EOF (attached_sent={attached_sent}), closing the connection"),
+                );
                 if attached_sent {
                     let _ = tx.send(CtrlReq::ClientDetach(client_id));
                 }
+                crate::types::teardown_client_connection(client_id);
                 break;
             }
             Err(e) => {
@@ -1386,9 +1395,14 @@ loop {
                     line.clear(); // Clear any partial data from interrupted read
                     continue;
                 }
+                crate::debug_log::server_log(
+                    "client-reader",
+                    &format!("client {client_id}: batching read error {e:?} (attached_sent={attached_sent}), closing the connection"),
+                );
                 if attached_sent {
                     let _ = tx.send(CtrlReq::ClientDetach(client_id));
                 }
+                crate::types::teardown_client_connection(client_id);
                 break; // Real error or non-persistent timeout
             }
             Ok(_) => {
@@ -4635,10 +4649,18 @@ match cmd {
     line.clear();
     match r.read_line(&mut line) {
         Ok(0) => {
-            // EOF - client disconnected
+            // EOF - client disconnected. Logged for the same reason as the
+            // batching read above, and closed for real: a client whose reader
+            // ends but whose writer and stream stay alive keeps painting frames
+            // while nothing can reach the server from its keyboard or mouse.
+            crate::debug_log::server_log(
+                "client-reader",
+                &format!("client {client_id}: read EOF (attached_sent={attached_sent}), closing the connection"),
+            );
             if attached_sent {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
             }
+            crate::types::teardown_client_connection(client_id);
             break;
         }
         Err(e) => {
@@ -4646,9 +4668,14 @@ match cmd {
                 line.clear(); // Clear any partial data from interrupted read
                 continue; // Persistent mode - keep waiting
             }
+            crate::debug_log::server_log(
+                "client-reader",
+                &format!("client {client_id}: read error {e:?} (attached_sent={attached_sent}), closing the connection"),
+            );
             if attached_sent {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
             }
+            crate::types::teardown_client_connection(client_id);
             break; // Non-persistent timeout or real error
         }
         Ok(_) => {
