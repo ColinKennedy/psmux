@@ -1597,6 +1597,11 @@ fn run_main() -> io::Result<()> {
                 let raw_cmd: Option<Vec<String>> = args.iter().position(|a| a == "--").map(|pos| {
                     args.iter().skip(pos + 1).cloned().collect()
                 }).filter(|v: &Vec<String>| !v.is_empty());
+                // The server that spawned a warm standby (`pid:creation`), so
+                // the standby can tell that a kill-server ended it.
+                if let Some(spec) = args.iter().position(|a| a == "--spawner").and_then(|i| args.get(i + 1)) {
+                    crate::server::set_warm_spawner(spec);
+                }
                 return run_server(name, server_socket_name, initial_cmd, raw_cmd, srv_start_dir, srv_window_name, srv_init_size, srv_group_target, srv_env_vars);
             }
             "new-session" | "new" => {

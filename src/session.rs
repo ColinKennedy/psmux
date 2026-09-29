@@ -1003,6 +1003,10 @@ pub fn kill_servers_in_scope(
     // Snapshot the force-kill candidates BEFORE the graceful pass removes the
     // `.pid` files, scoped the same way, so the fallback can never reach a
     // server the graceful pass was not allowed to touch.
+    //
+    // Stamp the kill BEFORE enumerating (see `warm_standby_verdict`): a
+    // standby that registers after the enumeration below must find it.
+    write_kill_marker(dir, scope, crate::platform::process_kill::now_process_filetime());
     let fk_targets: Vec<PidTarget> = force_kill_targets(dir, scope);
     let excluded_pid = exclude_base.and_then(|b| {
         std::fs::read_to_string(crate::paths::pid_file(b))
@@ -1011,6 +1015,10 @@ pub fn kill_servers_in_scope(
             .map(|(pid, _)| pid)
     });
     let (targets, stale) = kill_server_targets(dir, scope, exclude_base);
+    // ...and again AFTER it, before anything is ended: every server found
+    // above was created before this stamp, so a standby whose spawner dies in
+    // this kill reads a stamp newer than that spawner.
+    write_kill_marker(dir, scope, crate::platform::process_kill::now_process_filetime());
     let killed = user_session_count(&targets);
     let handles: Vec<std::thread::JoinHandle<()>> = targets
         .into_iter()
@@ -1057,6 +1065,7 @@ pub fn kill_servers_in_scope(
     // identity gate (exact process-creation-time match) skips any pid that has
     // already exited or been recycled — no machine-wide, name-based scan.
     std::thread::sleep(Duration::from_millis(50));
+    let mut ended: Vec<PidTarget> = Vec::new();
     for t in fk_targets {
         if Some(t.pid) == excluded_pid {
             continue;
@@ -1067,8 +1076,196 @@ pub fn kill_servers_in_scope(
         ) {
             crate::platform::process_kill::terminate_server_pid(t.pid, None);
         }
+        ended.push(t);
     }
+    // A server that had written its `.pid` but not yet its `.port` when the
+    // registry was read (a standby mid registration) is ended above by pid,
+    // with nobody to remove its files: it went on to write `.port` and `.key`
+    // before it died, and the dead entry was left listed. Sweep every set
+    // whose `.pid` still names one of the servers this kill ended.
+    sweep_registry_sets_of(dir, scope, &ended);
     killed
+}
+
+/// Remove the registry set of every `.pid` in `scope` that names exactly one
+/// of `ended` (same pid and creation time) and whose process is no longer
+/// running under that identity. A pid that was recycled, or a set that a new
+/// server has since rewritten, is left alone.
+fn sweep_registry_sets_of(dir: &Path, scope: KillScope, ended: &[PidTarget]) {
+    if ended.is_empty() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e != "pid").unwrap_or(true) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if !scope.covers(stem) {
+            continue;
+        }
+        let Some((pid, Some(creation))) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| parse_pid_file_contents(&s))
+        else {
+            continue;
+        };
+        if !ended.iter().any(|t| t.pid == pid && t.creation_time == creation) {
+            continue;
+        }
+        // Creation time alone is not liveness: an exited process whose object
+        // is still held open somewhere answers GetProcessTimes as before.
+        // TerminateProcess returns before the process is gone, so give one
+        // that was just ended a moment to finish dying.
+        let still_running = || {
+            crate::platform::process_is_alive(pid)
+                && confirms_identity(crate::platform::process_kill::process_creation_time(pid), creation)
+        };
+        let mut running = still_running();
+        for _ in 0..10 {
+            if !running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            running = still_running();
+        }
+        if running {
+            continue;
+        }
+        remove_session_registry_files(&path.with_extension("port"));
+    }
+}
+
+// --- kill-server and the warm standby -----------------------------------------
+// A server spawns its namespace's `__warm__` standby a moment AFTER it has
+// registered, and the standby needs a few hundred milliseconds more before its
+// own `.port`/`.pid` appear. A kill-server that lands in that window enumerates
+// the registry, finds the session server but not the standby, ends the session
+// server and returns; the standby registers afterwards and nothing ever ends
+// it. Measured on the unfixed build: `-L ns new-session -d` then `-L ns
+// kill-server` at once left the standby alive 10 times out of 10, and one of
+// them rebuilt the data directory after it had been deleted.
+//
+// No amount of waiting in kill-server closes that, because the standby can
+// register at any later moment. So the kill leaves a marker instead, and the
+// standby checks it: kill-server stamps the time into a per scope marker file
+// before it enumerates and again after it has enumerated, and an unclaimed
+// standby that finds a marker covering it ends itself. The two stamps are what
+// make the ordering airtight, see `warm_standby_verdict`.
+
+/// The kill marker for `scope`, inside `dir/killed/`. The per namespace file
+/// reuses the identity file's name (readable prefix plus a hash of the full
+/// namespace name, see `paths::namespace_instance_file`), so any `-L` value maps
+/// to a legal and distinct file name. `all` cannot collide with those, since
+/// every namespace name ends in `-<16 hex digits>`.
+pub fn kill_marker_path(dir: &Path, scope: KillScope) -> std::path::PathBuf {
+    let killed = dir.join("killed");
+    match scope {
+        KillScope::All => killed.join("all"),
+        KillScope::Namespace(ns) => {
+            let inst = crate::paths::namespace_instance_file(dir, ns);
+            killed.join(inst.file_name().unwrap_or_default())
+        }
+    }
+}
+
+/// Stamp `when` (a FILETIME) into the kill marker for `scope`. Written to a
+/// temporary file and renamed over the marker, so a standby reading it at the
+/// same moment sees the old stamp or the new one, never an empty file.
+pub fn write_kill_marker(dir: &Path, scope: KillScope, when: u64) {
+    let path = kill_marker_path(dir, scope);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, when.to_string()).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::write(&path, when.to_string());
+}
+
+/// The newest kill that covers namespace `ns`: its own marker or an
+/// everything (`-a`) marker, whichever is later. `None` when neither exists.
+pub fn read_kill_marker(dir: &Path, ns: Option<&str>) -> Option<u64> {
+    let read = |scope: KillScope| -> Option<u64> {
+        std::fs::read_to_string(kill_marker_path(dir, scope))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    match (read(KillScope::Namespace(ns)), read(KillScope::All)) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What an unclaimed standby knows about itself when it asks whether it should
+/// still be running. Times are FILETIMEs; `None` means unknown, and an unknown
+/// value never makes a standby exit.
+#[derive(Debug, Clone, Copy)]
+pub struct WarmStandbyFacts {
+    /// When this standby process was created.
+    pub own_creation: Option<u64>,
+    /// When the server that spawned this standby was created, if it said.
+    pub spawner_creation: Option<u64>,
+    /// Whether that spawner is still running under the same identity.
+    pub spawner_alive: bool,
+    /// The newest kill marker covering this namespace.
+    pub kill_marker: Option<u64>,
+    /// Whether the data directory still exists.
+    pub data_dir_present: bool,
+}
+
+/// Why an unclaimed standby must end, or `Keep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmStandbyVerdict {
+    Keep,
+    /// The data directory was deleted. A standby serves the sessions of one
+    /// data directory; recreating it (the registry self heal would) resurrects
+    /// a namespace somebody removed on purpose.
+    DataDirGone,
+    /// A kill-server of this namespace ran after this standby was created.
+    NamespaceKilled,
+    /// The spawner is dead and a kill-server ran after the spawner was
+    /// created: the kill that ended the spawner is the one this standby missed.
+    SpawnerKilled,
+}
+
+/// The decision, kept free of I/O so it can be tested exhaustively.
+///
+/// Why this closes the race rather than narrowing it. kill-server writes stamp
+/// M1, enumerates the registry, writes stamp M2, then ends what it found.
+///
+/// * A standby that already existed at M1 either registered before the
+///   enumeration, and was ended by it, or registered after it. In the second
+///   case its first check comes after its own registration, so after the
+///   enumeration, so after M1 was written: it reads a stamp at or after M1,
+///   which is at or after its own creation, and exits (`NamespaceKilled`).
+/// * A standby created after M1 was spawned by some server X. If X was ended by
+///   this kill, X was in the enumeration, so X was created before M2 was
+///   written, and X died after M2 was written. The standby polls X, sees it
+///   gone, reads a stamp at or after M2, which is after X's creation, and
+///   exits (`SpawnerKilled`). If X survived (it registered too late to be
+///   enumerated) the standby survives with it, which is the right answer for a
+///   server that is still running.
+pub fn warm_standby_verdict(f: &WarmStandbyFacts) -> WarmStandbyVerdict {
+    if !f.data_dir_present {
+        return WarmStandbyVerdict::DataDirGone;
+    }
+    let Some(marker) = f.kill_marker else { return WarmStandbyVerdict::Keep };
+    if let Some(own) = f.own_creation {
+        if marker >= own {
+            return WarmStandbyVerdict::NamespaceKilled;
+        }
+    }
+    if let Some(spawner) = f.spawner_creation {
+        if !f.spawner_alive && marker >= spawner {
+            return WarmStandbyVerdict::SpawnerKilled;
+        }
+    }
+    WarmStandbyVerdict::Keep
 }
 
 /// `.pid` registry entries belonging to namespace `ns`, excluding `self_pid`
@@ -2762,6 +2959,10 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue649_kill_server_namespace_scope.rs"]
 mod tests_issue649_kill_server_namespace_scope;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_kill_server_reaps_warm.rs"]
+mod tests_kill_server_reaps_warm;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue250_root_cause.rs"]
