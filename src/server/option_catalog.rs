@@ -70,11 +70,25 @@ pub enum ChoiceKind {
     Priority,
     Unvalidated,
     PaneBorderIndicators,
+    /// tmux `options_table_copy_mode_line_numbers_list`: a CHOICE option, so
+    /// tmux refuses anything else with `unknown value` (#706).
+    CopyModeLineNumbers,
 }
 
 impl ChoiceKind {
     fn validate_value(self, value: &str) -> Result<(), String> {
         match self {
+            Self::CopyModeLineNumbers => {
+                if crate::copy_line_numbers::CHOICES.contains(&value.trim()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "value for 'copy-mode-line-numbers' must be one of {}, got '{}'",
+                        crate::copy_line_numbers::CHOICES.join(", "),
+                        value,
+                    ))
+                }
+            }
             Self::Priority if crate::platform::normalize_priority(value).is_none() => Err(format!(
                 "value for 'priority' must be one of {}, got '{}'",
                 crate::platform::PRIORITY_VALUES.join(", "),
@@ -89,14 +103,14 @@ impl ChoiceKind {
 
     const fn allows_append(self) -> bool {
         match self {
-            Self::Priority | Self::Unvalidated => true,
+            Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers => true,
             Self::PaneBorderIndicators => false,
         }
     }
 
     const fn allows_local_window_override(self) -> bool {
         match self {
-            Self::Priority | Self::Unvalidated => true,
+            Self::Priority | Self::Unvalidated | Self::CopyModeLineNumbers => true,
             Self::PaneBorderIndicators => false,
         }
     }
@@ -217,7 +231,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "mouse-selection-force", scope: Session, option_type: Boolean, default: "off", description: "Keep psmux drag selection active in mouse-aware apps; replay plain clicks while consuming drags" },
     OptionDef { name: "paste-detection", scope: Session, option_type: Boolean, default: "on", description: "Detect Ctrl+V paste from console host and send as bracketed paste (disable to let Ctrl+V reach child apps)" },
     OptionDef { name: "mode-keys", scope: Session, option_type: UNVALIDATED_CHOICE, default: "emacs", description: "Key bindings in copy mode (vi/emacs)" },
-    OptionDef { name: "copy-mode-line-numbers", scope: Window, option_type: UNVALIDATED_CHOICE, default: "off", description: "Line number mode in copy mode (off/default/absolute/relative/hybrid)" },
+    OptionDef { name: "copy-mode-line-numbers", scope: Window, option_type: Choice(ChoiceKind::CopyModeLineNumbers), default: "off", description: "Line number mode in copy mode (off/default/absolute/relative/hybrid)" },
     OptionDef { name: "copy-mode-line-number-style", scope: Window, option_type: OptionType::String, default: "fg=brightblack", description: "Style for copy-mode line numbers" },
     OptionDef { name: "copy-mode-current-line-number-style", scope: Window, option_type: OptionType::String, default: "fg=yellow,bold", description: "Style for the current copy-mode line number" },
     OptionDef { name: "status", scope: Session, option_type: Boolean, default: "on", description: "Show/hide the status bar" },

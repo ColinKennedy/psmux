@@ -3202,6 +3202,10 @@ pub enum CtrlReq {
     FocusOut,
     CommandPrompt(String),
     ShowMessages(mpsc::Sender<String>),
+    /// The warnings THIS server recorded while loading its config, framed by
+    /// `server::config_warnings_reply`. Answered by the main loop, so it is
+    /// never answered before the config is loaded (#706).
+    ConfigWarnings(mpsc::Sender<String>),
     /// Forward raw bytes to the popup PTY (base64-decoded by connection handler)
     PopupInput(Vec<u8>),
     /// Close the current overlay (popup, menu, confirm, etc.)

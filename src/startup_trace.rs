@@ -28,6 +28,9 @@
 //!   `cli.warm.claimed` a warm standby server was claimed (fast path)
 //!   `cli.server.spawn` `spawn_server_hidden` returned (cold path)
 //!   `cli.ready`        the readiness gate accepted the server
+//!   `cli.cfgwarn`      the client read `config-warnings.log`, with what it
+//!                      found. It has to land after `srv.cfgwarn` or the
+//!                      warnings are lost (#706)
 //!   `cli.attach`       the attach/TUI path is entered
 //!   `cli.connected`    the client's socket to the server is up
 //!   `srv.entry`        first line of `run_server`
@@ -41,6 +44,7 @@
 //!   `srv.reg.marker`   this process is claimed for the data dir (#510)
 //!   `srv.bound`        `.port` written: the readiness beacon is visible
 //!   `srv.config`       `load_config` returned
+//!   `srv.cfgwarn`      `config-warnings.log` written, with how many
 //!   `srv.pty.open`     `openpty` called
 //!   `srv.pty.ready`    `CreatePseudoConsole` returned
 //!   `srv.child.argv`   the pane child's argv, about to be spawned

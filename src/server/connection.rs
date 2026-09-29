@@ -4129,6 +4129,17 @@ match cmd {
         let text = args.join(" ");
         let _ = tx.send(CtrlReq::CustomizeFilter(text));
     }
+    "__config-warnings" => {
+        // Internal: the client that just started or claimed this server asks
+        // for the warnings its config load recorded (#706). Not a tmux command
+        // and not in the command table.
+        let (rtx, rrx) = mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::ConfigWarnings(rtx));
+        if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
+            let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
+        }
+        if !persistent { break; }
+    }
     "show-messages" | "showmsgs" => {
         let (rtx, rrx) = mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::ShowMessages(rtx));

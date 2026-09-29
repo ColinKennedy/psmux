@@ -821,6 +821,49 @@ fn validate_dangling_flag_values(args: &[String]) {
     }
 }
 
+/// Print the config warnings the server recorded, once it has got far enough to
+/// have written them down.
+///
+/// The server writes `config-warnings.log` only after it has loaded the config,
+/// and the config load is the last thing it does: the listener, the accept
+/// thread and the port file all come first so a `run-shell` inside the config
+/// can connect back to the server that is running it. A detached start waits
+/// for `list-windows`, which only the main loop answers, so by then the log is
+/// there. Every attached start stops as soon as the port is reachable, which
+/// the server offers before it has read a line of config, so the read used to
+/// come first and find nothing (#706). Take the same round trip rather than
+/// make the gates stricter: the attach that follows has to wait for the main
+/// loop in any case, and five starts to a drawn status bar averaged 420ms
+/// before this round trip and 406ms after it.
+///
+/// Call it only where a server was actually started or claimed. Attaching to a
+/// server that is already running reloads no config, so there is nothing new to
+/// report and the previous run's log is not this client's to print.
+///
+/// The round trip itself carries the warnings, asked of the server this client
+/// started, rather than reading them back from `config-warnings.log`. That file
+/// is one name for every server sharing the data directory, so another server
+/// loading or sourcing a config at the same moment could overwrite it between
+/// this server's write and this client's read, and the client printed the
+/// other server's warnings or lost its own (#706, second symptom). The log is
+/// only read when the server does not understand the request, which is a
+/// server built before it existed.
+fn surface_config_warnings(since_epoch: u64, detached: bool) {
+    let reply = send_control_with_response("__config-warnings\n".to_string()).ok();
+    let (cfg_warnings, source) = match reply.as_deref().and_then(crate::server::parse_config_warnings_reply) {
+        Some(w) => (w, "server"),
+        None => (crate::server::read_fresh_config_warnings(since_epoch), "log"),
+    };
+    crate::startup_trace::mark_detail("cli.cfgwarn",
+        &format!("found={} since={} detached={} from={}", cfg_warnings.len(), since_epoch, detached, source));
+    if cfg_warnings.is_empty() {
+        return;
+    }
+    eprintln!("psmux: {} config warning(s):", cfg_warnings.len());
+    for w in &cfg_warnings {
+        eprintln!("psmux:   {}", w);
+    }
+}
 fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
@@ -2103,13 +2146,7 @@ fn run_main() -> io::Result<()> {
                 // during config load, so a typo'd ~/.psmux.conf is not silently
                 // ignored (issue #370 follow-up). Printed before attaching so it
                 // is visible in the terminal / scrollback.
-                let cfg_warnings = crate::server::read_fresh_config_warnings(attempt_start_epoch);
-                if !cfg_warnings.is_empty() {
-                    eprintln!("psmux: {} config warning(s):", cfg_warnings.len());
-                    for w in &cfg_warnings {
-                        eprintln!("psmux:   {}", w);
-                    }
-                }
+                surface_config_warnings(attempt_start_epoch, detached);
 
                 if detached {
                     // The readiness wait above already confirmed the initial
@@ -5016,6 +5053,13 @@ fn run_main() -> io::Result<()> {
             session_name.clone()
         };
         let port_path = crate::paths::port_file(&port_file_base);
+        // When this start began, for the config warnings below: the log the
+        // server writes carries its own timestamp and anything older than
+        // this start belongs to a previous one (#706).
+        let bare_start_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         // If a server is ALREADY alive under this exact name (e.g. PSMUX_SESSION_NAME
         // was set to target an existing session rather than to request a fresh one —
@@ -5181,6 +5225,25 @@ fn run_main() -> io::Result<()> {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A bare `psmux` reaches the same TUI as `new-session` but through this
+        // block, which had no config warning reporting at all, so the commonest
+        // way to start psmux never showed them (#706). Nothing to say when the
+        // server was already up: it read no config for this client.
+        if !server_already_alive {
+            // The round trip inside needs to know which server to ask, and a
+            // bare start has no `-t` to have set it, so it would resolve to
+            // `default` and fail. Point it at the session about to be attached
+            // and put the variable back: what an explicit `-t` means is load
+            // bearing further down (#485), so this must not outlive the call.
+            let saved_target = env::var("PSMUX_TARGET_SESSION").ok();
+            env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
+            surface_config_warnings(bare_start_epoch, false);
+            match saved_target {
+                Some(v) => env::set_var("PSMUX_TARGET_SESSION", v),
+                None => env::remove_var("PSMUX_TARGET_SESSION"),
+            }
         }
 
         // Now attach to the session

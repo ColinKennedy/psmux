@@ -1063,6 +1063,49 @@ pub(crate) fn write_config_warnings_log(warnings: &[String]) {
     let _ = std::fs::write(&path, body);
 }
 
+/// First line of the reply to the internal `__config-warnings` request (#706).
+const CONFIG_WARNINGS_REPLY_HEADER: &str = "psmux-config-warnings";
+
+/// Frame the warnings this server recorded for the client that started it: a
+/// header carrying the count, then one warning per line.
+///
+/// `config-warnings.log` is one file for every server sharing the data
+/// directory, so another server that loads or sources a config at the same
+/// moment overwrites it, and a client reading it back can print that server's
+/// warnings or lose its own. This reply comes from the server the client
+/// started, over that server's own port, so it can only carry that server's
+/// warnings. The log is still written, as the record a user can look at.
+pub(crate) fn config_warnings_reply(warnings: &[String]) -> String {
+    let mut out = format!("{} {}\n", CONFIG_WARNINGS_REPLY_HEADER, warnings.len());
+    for w in warnings {
+        // One warning per line: a newline inside one would split it and throw
+        // the count off.
+        out.push_str(&w.replace(['\r', '\n'], " "));
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse `config_warnings_reply`. None when the reply is not one, which is
+/// what a server built before the request existed sends (it ignores the
+/// unknown command and closes the connection), so the caller can read the log
+/// the way it used to.
+pub(crate) fn parse_config_warnings_reply(reply: &str) -> Option<Vec<String>> {
+    let mut lines = reply.lines();
+    let n: usize = lines
+        .next()?
+        .trim()
+        .strip_prefix(CONFIG_WARNINGS_REPLY_HEADER)?
+        .trim()
+        .parse()
+        .ok()?;
+    let warnings: Vec<String> = lines.take(n).map(|l| l.to_string()).collect();
+    if warnings.len() != n {
+        return None;
+    }
+    Some(warnings)
+}
+
 /// Read fresh config warnings written during the current startup attempt.
 /// `since_epoch` is when the attempt began; a log older than that (minus 2s of
 /// clock slack) is stale and ignored. Returns the warning lines.
@@ -1519,6 +1562,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Surface any non-fatal config parse warnings to the attaching client
     // (issue #370 follow-up) instead of silently dropping them.
     write_config_warnings_log(&app.config_warnings);
+    crate::startup_trace::mark_detail("srv.cfgwarn", &format!("n={}", app.config_warnings.len()));
     // Config may set pane-border-status which changes content height (#288)
     resize_all_panes(&mut app);
 
@@ -4501,6 +4545,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     load_config(&mut app);
                     // Surface config warnings to the claiming client (#370 follow-up).
                     write_config_warnings_log(&app.config_warnings);
+                    crate::startup_trace::mark_detail("srv.cfgwarn", &format!("n={}", app.config_warnings.len()));
                     // A standby parses the config at ITS boot, which is when
                     // the previous session's server spawned it. If default-shell
                     // changed on disk since (a user editing
@@ -7104,6 +7149,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Return message log (tmux stores recent log messages)
                     let _ = resp.send(String::new());
                 }
+                CtrlReq::ConfigWarnings(resp) => {
+                    let _ = resp.send(config_warnings_reply(&app.config_warnings));
+                }
                 CtrlReq::ResizeWindow(request, resp) => {
                     let result = crate::resize_window::apply_resize_window(&mut app, &request);
                     match result {
@@ -8250,3 +8298,7 @@ mod test_issue674_claim_window_name;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue677_warm_spawn_lock.rs"]
 mod test_issue677_warm_spawn_lock;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue706_config_warnings_reply.rs"]
+mod test_issue706_config_warnings_reply;

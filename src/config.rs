@@ -1428,6 +1428,15 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         "status-right-style" => { app.status_right_style = value.to_string(); }
         "clock-mode-colour" | "clock-mode-style" => { app.user_options.insert(key.to_string(), value.to_string()); }
         "pane-border-format" | "pane-border-status" | "pane-border-indicators" => { app.user_options.insert(key.to_string(), value.to_string()); }
+        // Read back from user_options by the copy mode gutter and the border
+        // renderer. Without an arm here they reached the fallthrough below,
+        // which stored the value (so it worked) and reported the option as
+        // unknown (#706). The value of copy-mode-line-numbers is checked
+        // against its choices by the catalog before this match, like tmux.
+        "copy-mode-line-numbers" | "copy-mode-line-number-style"
+        | "copy-mode-current-line-number-style" | "pane-border-lines" => {
+            app.user_options.insert(key.to_string(), value.to_string());
+        }
         "popup-style" | "popup-border-style" | "popup-border-lines" => { app.user_options.insert(key.to_string(), value.to_string()); }
         "window-style" | "window-active-style" => { app.user_options.insert(key.to_string(), value.to_string()); }
         "wrap-search" => { app.user_options.insert(key.to_string(), value.to_string()); }
@@ -2748,6 +2757,10 @@ mod tests_issue287_german_keyboard;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue362_config_new_session.rs"]
 mod tests_issue362_config_new_session;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue706_copy_mode_line_numbers.rs"]
+mod tests_issue706_copy_mode_line_numbers;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue370_config_warnings.rs"]
