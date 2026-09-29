@@ -1787,16 +1787,17 @@ impl AppState {
             if self.latest_client_id == Some(cid) {
                 self.latest_client_id = self.client_registry.keys().max().copied();
             }
-            // Witness the one combination that must not happen: the registry
-            // says the client is gone while its connection is still tracked.
-            // A live connection with no registry entry keeps receiving frames
-            // but can never deliver input again (see
-            // `teardown_client_connection`), so name it in the debug log
-            // rather than letting it hide behind a clean-looking reap.
+            // Record whether the connection was still tracked at reap time.
+            // That is the normal order for a detach the client asked for
+            // (`client-detach` on its own connection, prefix d): the registry
+            // entry goes first and the client closes the socket itself right
+            // after. It is only a fault when no such request precedes it and
+            // no `client-reader` line follows, which is the deaf client that
+            // `teardown_client_connection` exists to prevent.
             if has_persistent_stream(cid) {
                 crate::debug_log::server_log(
                     "client-reap",
-                    &format!("client {cid}: registry entry reaped while its stream was still registered"),
+                    &format!("client {cid}: registry entry reaped, stream still registered (expected for a client initiated detach)"),
                 );
             }
             true
@@ -3642,8 +3643,8 @@ pub fn deregister_persistent_stream(client_id: u64) {
 
 /// True when a persistent stream is still tracked for this client id.
 ///
-/// The reaper uses it to witness the one combination that must never happen:
-/// a registry entry removed while the connection is still open.
+/// The reaper logs it so a registry entry removed while the connection is
+/// still open can be told apart in the debug log.
 pub fn has_persistent_stream(client_id: u64) -> bool {
     PERSISTENT_STREAMS
         .lock()
