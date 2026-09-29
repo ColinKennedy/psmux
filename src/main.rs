@@ -2468,6 +2468,7 @@ fn run_main() -> io::Result<()> {
                 let mut literal = false;
                 let mut has_x = false;
                 let mut has_hex = false;
+                let mut repeat: Option<String> = None;
                 let mut keys: Vec<String> = Vec::new();
                 // Getopt-style parsing: -t consumes next arg, -l/-R/-X/-H are flags
                 let mut i = 1;
@@ -2478,7 +2479,11 @@ fn run_main() -> io::Result<()> {
                         "-X" => { has_x = true; }
                         "-H" => { has_hex = true; }
                         "-t" => { i += 1; } // consume target value (already handled globally)
-                        "-N" => { i += 1; } // repeat count, consume value
+                        // Repeat count. It used to be consumed and dropped
+                        // here, so `send-keys -N 40 -X scroll-up` and
+                        // `send-keys -N 3 x` ran once; the server already
+                        // honours -N, it just never received it.
+                        "-N" => { i += 1; repeat = cmd_args.get(i).map(|s| s.to_string()); }
                         _ => { keys.push(cmd_args[i].to_string()); }
                     }
                     i += 1;
@@ -2487,6 +2492,9 @@ fn run_main() -> io::Result<()> {
                 if literal { cmd.push_str(" -l"); }
                 if has_x { cmd.push_str(" -X"); }
                 if has_hex { cmd.push_str(" -H"); }
+                if let Some(n) = repeat.as_deref() {
+                    cmd.push_str(&format!(" -N {}", crate::util::quote_arg_if_needed(n)));
+                }
                 // Quote arguments that need it. quote_arg_if_needed escapes
                 // backslashes as well as quotes inside the wrapping quotes,
                 // matching what parse_command_line decodes there (#547) —
@@ -2498,6 +2506,16 @@ fn run_main() -> io::Result<()> {
                     cmd.push_str(&format!(" {}", crate::util::quote_arg_if_needed(&k)));
                 }
                 cmd.push('\n');
+                if has_x {
+                    // tmux: `send-keys -X` on a pane in no mode is
+                    // "not in a mode" at exit 1 (cmd-send-keys.c).
+                    let resp = send_control_with_response(cmd)?;
+                    if resp.trim_start().starts_with("ERROR") {
+                        eprintln!("{}", resp.trim_start().trim_start_matches("ERROR:").trim());
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
                 send_control(cmd)?;
                 return Ok(());
             }
@@ -4398,16 +4416,19 @@ fn run_main() -> io::Result<()> {
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
-                        "-u" => { cmd.push_str(" -u"); }
-                        "-d" => { cmd.push_str(" -d"); }
-                        "-e" => { cmd.push_str(" -e"); }
-                        "-H" => { cmd.push_str(" -H"); }
-                        "-q" => { cmd.push_str(" -q"); }
-                        "-t" => {
+                        "-t" | "-s" => {
                             if let Some(t) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -t {}", t));
+                                cmd.push_str(&format!(" {} {}", cmd_args[i], t));
                                 i += 1;
                             }
+                        }
+                        // Every other flag goes through as written, clusters
+                        // included: `copy-mode -Hu` used to match none of the
+                        // single-flag arms and reached the server as a bare
+                        // `copy-mode`. The server reads the flags with
+                        // CopyModeFlags::parse, which handles clusters.
+                        s if s.starts_with('-') && s.len() > 1 && s != "--" => {
+                            cmd.push_str(&format!(" {}", s));
                         }
                         _ => {}
                     }

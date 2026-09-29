@@ -133,6 +133,19 @@ impl CopyModeFlags {
     }
 }
 
+/// Is `cmd` a `copy-mode` command that pages up (`-u`)? These are the
+/// bindings `scroll-enter-copy-mode off` skips so the key reaches the pane
+/// (#284). The flags are read the way `copy-mode` itself reads them, so a
+/// cluster such as `-Hu` counts and a target such as `-t my-ubuntu` does not.
+/// A text search for `-u` got both of those wrong.
+pub fn is_page_up_copy_mode_command(cmd: &str) -> bool {
+    // Only the first command of a `\;` chain decides, as the old prefix test did.
+    let first = crate::config::split_chained_commands_pub(cmd).into_iter().next().unwrap_or_default();
+    let parts = crate::commands::parse_command_line(&first);
+    parts.first().map(|s| s.as_str()) == Some("copy-mode")
+        && CopyModeFlags::parse(&parts[1..]).page_up
+}
+
 /// What running a `copy-mode` command did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyModeOutcome {
@@ -818,6 +831,11 @@ pub fn scroll_to_top(app: &mut AppState) {
     let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
     parser.screen_mut().set_scrollback(usize::MAX);
     app.copy_scroll_offset = parser.screen().scrollback();
+    drop(parser);
+    // tmux window_copy_cmd_history_top puts the cursor on the first cell of
+    // the oldest line (`data->cy = 0; data->cx = 0;`). Leaving the cursor on
+    // its old screen row parked it a whole screen below the top of history.
+    app.copy_pos = Some((0, 0));
 }
 
 pub fn scroll_to_bottom(app: &mut AppState) {

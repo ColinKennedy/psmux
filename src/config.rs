@@ -156,6 +156,9 @@ pub fn priority_from_config() -> Option<String> {
 /// so that unbind-key <key> can actually remove them.
 /// Must be called BEFORE load_config / source_file.
 pub fn populate_default_bindings(app: &mut AppState) {
+    // A re-seed restores every built-in copy-mode key, as tmux's
+    // key_bindings_init does for its copy-mode tables.
+    app.copy_mode_defaults_unbound.clear();
     let defaults = crate::help::PREFIX_DEFAULTS;
     let table = app.key_tables.entry("prefix".to_string()).or_default();
     for (key_str, cmd_str) in defaults {
@@ -183,6 +186,92 @@ pub fn populate_default_bindings(app: &mut AppState) {
             }
         }
     }
+}
+
+/// The built-in copy-mode keys of `table`, parsed once: normalised key, the
+/// key name as `list-keys` prints it, and the `send-keys -X` command. Empty
+/// for any table that is not `copy-mode` or `copy-mode-vi`.
+pub fn copy_mode_default_keys(table: &str) -> &'static [((KeyCode, KeyModifiers), &'static str, &'static str)] {
+    use std::sync::OnceLock;
+    type Parsed = Vec<((KeyCode, KeyModifiers), &'static str, &'static str)>;
+    fn parse(list: &'static [(&'static str, &'static str)]) -> Parsed {
+        list.iter()
+            .filter_map(|(k, c)| parse_key_name(k).map(|key| (normalize_key_for_binding(key), *k, *c)))
+            .collect()
+    }
+    static VI: OnceLock<Parsed> = OnceLock::new();
+    static EMACS: OnceLock<Parsed> = OnceLock::new();
+    match table {
+        "copy-mode-vi" => VI.get_or_init(|| parse(crate::help::COPY_MODE_VI_DEFAULTS)),
+        "copy-mode" => EMACS.get_or_init(|| parse(crate::help::COPY_MODE_EMACS_DEFAULTS)),
+        _ => &[],
+    }
+}
+
+/// The copy-mode table the built-in handlers follow: `copy-mode-vi` for
+/// `mode-keys vi`, `copy-mode` otherwise (tmux picks its table the same way).
+pub fn active_copy_mode_table(app: &AppState) -> &'static str {
+    if app.mode_keys == "vi" { "copy-mode-vi" } else { "copy-mode" }
+}
+
+/// True when `key` is a built-in copy-mode key of the active table that the
+/// user unbound, so the built-in handler must leave it alone. In tmux an
+/// unbound copy-mode key does nothing: the table simply has no entry for it.
+pub fn copy_mode_default_unbound(app: &AppState, key: (KeyCode, KeyModifiers)) -> bool {
+    if app.copy_mode_defaults_unbound.is_empty() { return false; }
+    let key = normalize_key_for_binding(key);
+    let table = active_copy_mode_table(app);
+    app.copy_mode_defaults_unbound.contains(&(table.to_string(), key))
+}
+
+/// `unbind-key -T <table> <key>`: drop the key from the table, and when it is
+/// a built-in copy-mode key record that, so the built-in handler stops acting
+/// on it.
+pub fn unbind_key_in_table(app: &mut AppState, table: &str, key: (KeyCode, KeyModifiers)) {
+    let key = normalize_key_for_binding(key);
+    if let Some(binds) = app.key_tables.get_mut(table) {
+        binds.retain(|b| b.key != key);
+    }
+    if copy_mode_default_keys(table).iter().any(|(k, _, _)| *k == key) {
+        app.copy_mode_defaults_unbound.insert((table.to_string(), key));
+    }
+}
+
+/// `unbind-key -a -T <table>`: empty the table. For a copy-mode table that
+/// takes the built-in keys away too, as it does in tmux.
+pub fn unbind_all_in_table(app: &mut AppState, table: &str) {
+    if let Some(binds) = app.key_tables.get_mut(table) {
+        binds.clear();
+    }
+    for (k, _, _) in copy_mode_default_keys(table) {
+        app.copy_mode_defaults_unbound.insert((table.to_string(), *k));
+    }
+}
+
+/// Every binding `list-keys` reports, as `(table, key, command, repeat)`: the
+/// key tables, then the built-in copy-mode keys that are neither rebound nor
+/// unbound.
+pub fn list_keys_entries(app: &AppState) -> Vec<(String, String, String, bool)> {
+    let mut out: Vec<(String, String, String, bool)> = Vec::new();
+    for (table_name, binds) in &app.key_tables {
+        for bind in binds {
+            out.push((
+                table_name.clone(),
+                format_key_binding(&bind.key),
+                crate::commands::format_action(&bind.action),
+                bind.repeat,
+            ));
+        }
+    }
+    for table in ["copy-mode", "copy-mode-vi"] {
+        let user = app.key_tables.get(table);
+        for (key, name, cmd) in copy_mode_default_keys(table) {
+            if user.map_or(false, |b| b.iter().any(|b| b.key == *key)) { continue; }
+            if app.copy_mode_defaults_unbound.contains(&(table.to_string(), *key)) { continue; }
+            out.push((table.to_string(), (*name).to_string(), (*cmd).to_string(), false));
+        }
+    }
+    out
 }
 
 pub fn load_config(app: &mut AppState) {
@@ -811,6 +900,15 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         // command (a known-but-unrouted command like `new-window` stays silent
         // to match prior behavior; a genuine typo like `bnid-key` is surfaced).
         let cmd = l.split_whitespace().next().unwrap_or("");
+        // tmux runs a `copy-mode` line in a sourced file like any other
+        // command (cfg.c queues every line), so `source-file` on a file that
+        // says `copy-mode` enters copy mode. It needs a pane, and a startup
+        // load (including the reload a claimed warm server does) is left out
+        // so a config file never opens a new session in copy mode.
+        if cmd == "copy-mode" && !app.windows.is_empty() && !in_startup_load() {
+            let _ = crate::commands::execute_command_string(app, l);
+            return;
+        }
         if !cmd.is_empty() && !is_known_command(app, cmd) {
             warn_config(app, format!("unknown command: {}", cmd));
         }
@@ -1837,9 +1935,7 @@ pub fn parse_unbind_key(app: &mut AppState, line: &str) {
     if unbind_all {
         if let Some(t) = table {
             // -a -T <table>: only clear that table
-            if let Some(binds) = app.key_tables.get_mut(&t) {
-                binds.clear();
-            }
+            unbind_all_in_table(app, &t);
         } else {
             // -a (no table): clear ALL tables + suppress defaults
             app.key_tables.clear();
@@ -1854,9 +1950,7 @@ pub fn parse_unbind_key(app: &mut AppState, line: &str) {
             // Remove from the targeted table only (tmux behavior).
             // Default is "prefix" when no -n or -T is specified.
             let target = table.unwrap_or_else(|| "prefix".to_string());
-            if let Some(binds) = app.key_tables.get_mut(&target) {
-                binds.retain(|b| b.key != key);
-            }
+            unbind_key_in_table(app, &target, key);
         } else {
             // Same reasoning as parse_bind_key: tmux's cmd-unbind-key.c reports
             // `unknown key: <name>` rather than quietly doing nothing, and the
