@@ -16,7 +16,16 @@ pub fn emit_osc52<W: Write>(writer: &mut W, text: &str) {
     let _ = writer.flush();
 }
 
+/// True while the focused pane is in copy mode, including its search prompt.
+pub fn in_copy_mode(app: &AppState) -> bool {
+    matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. })
+}
+
 pub fn enter_copy_mode(app: &mut AppState) {
+    // tmux only creates the mode when the pane is not already in it
+    // (`window_pane_set_mode` returns 1 for the same mode), so `copy-mode`
+    // run again inside copy mode keeps the hidden indicator (#704).
+    let fresh = !in_copy_mode(app);
     app.mode = Mode::CopyMode;
     // Copy mode reads a snapshot of the pane's screen (tmux's copy-mode grid):
     // the application keeps running underneath, so new output can neither
@@ -57,8 +66,113 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_mark = None;
     app.copy_last_jump = None;
     app.copy_refresh_live = false;
+    // tmux sets `hide_position` from the `-H` flag every time the mode is
+    // created (`window-copy.c` `window_copy_init`), so a plain entry always
+    // shows the indicator. `enter_copy_mode_hidden` is the `-H` path.
+    if fresh {
+        app.copy_hide_position = false;
+    }
     // Mark the active pane as being in copy mode (pane-local state).
     save_copy_state_to_pane(app);
+}
+
+/// `copy-mode -H`: enter copy mode with the position indicator hidden (#704).
+///
+/// Separate from `enter_copy_mode` rather than a parameter on it: that function
+/// has more than forty callers and every one of them wants the indicator.
+/// Like tmux, `-H` only counts when the mode is created: a pane already in
+/// copy mode keeps whatever `toggle-position` left it with.
+pub fn enter_copy_mode_hidden(app: &mut AppState) {
+    let fresh = !in_copy_mode(app);
+    enter_copy_mode(app);
+    if fresh {
+        app.copy_hide_position = true;
+        save_copy_state_to_pane(app);
+    }
+}
+
+/// The flags of a `copy-mode` command that change what it does, read the way
+/// tmux's `cmd_copy_mode_exec` reads them (cmd-copy-mode.c).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyModeFlags {
+    /// `-q`: leave the pane's mode instead of entering copy mode.
+    pub quit: bool,
+    /// `-H`: a fresh entry starts with the position indicator hidden.
+    pub hide_position: bool,
+    /// `-u`: page up after entering.
+    pub page_up: bool,
+}
+
+impl CopyModeFlags {
+    /// Read the flags from the arguments after `copy-mode`. Clustered flags
+    /// (`-uH`) count like separate ones, and the values of `-t` and `-s` are
+    /// skipped so a target is never read as flags.
+    pub fn parse<S: AsRef<str>>(args: &[S]) -> Self {
+        let mut flags = CopyModeFlags::default();
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i].as_ref();
+            i += 1;
+            if a == "--" { break; }
+            if !a.starts_with('-') || a.len() < 2 { continue; }
+            for (pos, ch) in a[1..].char_indices() {
+                match ch {
+                    'q' => flags.quit = true,
+                    'H' => flags.hide_position = true,
+                    'u' => flags.page_up = true,
+                    't' | 's' => {
+                        // The value is the rest of this argument, or the next one.
+                        if pos + 1 == a.len() - 1 { i += 1; }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        flags
+    }
+}
+
+/// What running a `copy-mode` command did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyModeOutcome {
+    /// The pane entered copy mode, or `-q` left a mode.
+    ModeChanged,
+    /// `-q` with no mode to leave.
+    Nothing,
+    /// `-u` with `scroll-enter-copy-mode` off: the caller forwards PageUp to
+    /// the pane instead (#284).
+    ForwardPageUp,
+}
+
+/// Run a `copy-mode` command on the focused pane the way tmux does:
+/// `-q` leaves the mode (`window_pane_reset_mode_all`, which for psmux means
+/// copy mode and clock mode, the two modes `pane_in_mode` reports), otherwise
+/// the pane enters copy mode, hidden for `-H`, and `-u` pages up.
+pub fn run_copy_mode_command(app: &mut AppState, flags: CopyModeFlags) -> CopyModeOutcome {
+    if flags.quit {
+        if in_copy_mode(app) {
+            exit_copy_mode(app);
+            return CopyModeOutcome::ModeChanged;
+        }
+        if matches!(app.mode, Mode::ClockMode) {
+            app.mode = Mode::Passthrough;
+            return CopyModeOutcome::ModeChanged;
+        }
+        return CopyModeOutcome::Nothing;
+    }
+    if flags.page_up && !app.scroll_enter_copy_mode {
+        return CopyModeOutcome::ForwardPageUp;
+    }
+    if flags.hide_position {
+        enter_copy_mode_hidden(app);
+    } else {
+        enter_copy_mode(app);
+    }
+    if flags.page_up {
+        page_scroll(app, true, false);
+    }
+    CopyModeOutcome::ModeChanged
 }
 
 /// Exit copy mode: reset all copy state and scroll the active pane back to
@@ -156,6 +270,7 @@ pub fn save_copy_state_to_pane(app: &mut AppState) {
         register: app.copy_register,
         mark: app.copy_mark,
         last_jump: app.copy_last_jump,
+        hide_position: app.copy_hide_position,
         in_search,
         search_input,
         search_input_forward,
@@ -190,6 +305,7 @@ pub fn restore_copy_state_from_pane(app: &mut AppState) {
         app.copy_register = s.register;
         app.copy_mark = s.mark;
         app.copy_last_jump = s.last_jump;
+        app.copy_hide_position = s.hide_position;
         if s.in_search {
             app.mode = Mode::CopySearch { input: s.search_input, forward: s.search_input_forward };
         } else {
@@ -632,12 +748,8 @@ pub fn toggle_rectangle(app: &mut AppState) {
 /// Returns false when `scroll-enter-copy-mode` is off, leaving copy mode
 /// untouched so the caller can forward PageUp to the pane instead (#284).
 pub fn enter_copy_mode_page_up(app: &mut AppState) -> bool {
-    if !app.scroll_enter_copy_mode {
-        return false;
-    }
-    enter_copy_mode(app);
-    page_scroll(app, true, false);
-    true
+    let flags = CopyModeFlags { page_up: true, ..CopyModeFlags::default() };
+    run_copy_mode_command(app, flags) != CopyModeOutcome::ForwardPageUp
 }
 
 /// Copy-mode offset after the pane's retained history shrank by
@@ -1368,6 +1480,25 @@ pub fn toggle_refresh(app: &mut AppState) {
         // which is where that output lands.
         scroll_to_bottom(app);
     }
+}
+
+/// Hide or show the copy-mode position indicator, the `P` key and the
+/// `toggle-position` command (#704).
+///
+/// tmux keeps this on the mode entry and flips it in
+/// `window_copy_cmd_toggle_position` (`window-copy.c`), which is why it is
+/// saved with the rest of the pane-local copy state rather than kept as a
+/// client setting: two panes in copy mode answer independently, and leaving
+/// the mode forgets it.
+pub fn toggle_position(app: &mut AppState) {
+    app.copy_hide_position = !app.copy_hide_position;
+    // Nothing in the pane or the layout changes, so the frame has to be asked
+    // for: measured on a key press without this, the indicator took 2.6s and
+    // 3.8s to go, and once did not go at all inside ten seconds, because it
+    // waited for an unrelated frame. The `-X` route never had the problem
+    // because a command request marks the state dirty on its own.
+    app.copy_needs_redraw = true;
+    save_copy_state_to_pane(app);
 }
 
 /// Yank from cursor to end of line — D key
@@ -2170,3 +2301,7 @@ mod test_issue673_copy_snapshot_per_pane;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue687_copy_mode_keyboard_selection.rs"]
 mod test_issue687_copy_mode_keyboard_selection;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue704_toggle_position.rs"]
+mod test_issue704_toggle_position;

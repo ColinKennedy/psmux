@@ -1374,10 +1374,19 @@ loop {
         line.clear();
         match r.read_line(&mut line) {
             Ok(0) => {
-                // EOF - client disconnected
+                // EOF - client disconnected. A zero byte read is EOF here, but
+                // it is also how a timed out socket read surfaces on some
+                // Windows stacks, so log which one we think we saw: this line
+                // is the only witness that separates a real disconnect from a
+                // client that goes on receiving frames while losing its input.
+                crate::debug_log::server_log(
+                    "client-reader",
+                    &format!("client {client_id}: batching read EOF (attached_sent={attached_sent}), closing the connection"),
+                );
                 if attached_sent {
                     let _ = tx.send(CtrlReq::ClientDetach(client_id));
                 }
+                crate::types::teardown_client_connection(client_id);
                 break;
             }
             Err(e) => {
@@ -1386,9 +1395,14 @@ loop {
                     line.clear(); // Clear any partial data from interrupted read
                     continue;
                 }
+                crate::debug_log::server_log(
+                    "client-reader",
+                    &format!("client {client_id}: batching read error {e:?} (attached_sent={attached_sent}), closing the connection"),
+                );
                 if attached_sent {
                     let _ = tx.send(CtrlReq::ClientDetach(client_id));
                 }
+                crate::types::teardown_client_connection(client_id);
                 break; // Real error or non-persistent timeout
             }
             Ok(_) => {
@@ -3276,7 +3290,9 @@ match cmd {
                 let (rtx, rrx) = mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
                 if let Ok(v) = rrx.recv_timeout(Duration::from_millis(2000)) {
-                    if values_only {
+                    if let Some(text) = crate::terminal_overrides::show_array_lines(name, &v, values_only) {
+                        out.push_str(&text);
+                    } else if values_only {
                         out.push_str(&format!("{}\n", v));
                     } else {
                         out.push_str(&format!("{} {}\n", name, v));
@@ -3379,7 +3395,14 @@ match cmd {
                         text
                     };
                     if !(has_q && resolved.is_empty()) {
-                        let output = if has_v {
+                        let array_text = if window_scope {
+                            None
+                        } else {
+                            crate::terminal_overrides::show_array_lines(name, &resolved, has_v)
+                        };
+                        let output = if let Some(text) = array_text {
+                            text
+                        } else if has_v {
                             format!("{}\n", resolved)
                         } else {
                             format!("{} {}\n", name, resolved)
@@ -4027,11 +4050,11 @@ match cmd {
         if !persistent { break; }
     }
     "copy-mode" => {
-        if args.iter().any(|a| *a == "-u") {
-            let _ = tx.send(CtrlReq::CopyEnterPageUp);
-        } else {
-            let _ = tx.send(CtrlReq::CopyEnter);
-        }
+        // `-q` leaves, `-H` hides the position indicator for this entry only
+        // (`window-copy.c` `window_copy_init` reads the flag), `-u` pages up,
+        // and they combine the way tmux's `cmd_copy_mode_exec` combines them
+        // (#704).
+        let _ = tx.send(CtrlReq::CopyModeCmd(crate::copy_mode::CopyModeFlags::parse(&args)));
     }
     "clock-mode" => { let _ = tx.send(CtrlReq::ClockMode); }
     // Overlay interaction commands (sent by client during active overlays)
@@ -4637,10 +4660,18 @@ match cmd {
     line.clear();
     match r.read_line(&mut line) {
         Ok(0) => {
-            // EOF - client disconnected
+            // EOF - client disconnected. Logged for the same reason as the
+            // batching read above, and closed for real: a client whose reader
+            // ends but whose writer and stream stay alive keeps painting frames
+            // while nothing can reach the server from its keyboard or mouse.
+            crate::debug_log::server_log(
+                "client-reader",
+                &format!("client {client_id}: read EOF (attached_sent={attached_sent}), closing the connection"),
+            );
             if attached_sent {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
             }
+            crate::types::teardown_client_connection(client_id);
             break;
         }
         Err(e) => {
@@ -4648,9 +4679,14 @@ match cmd {
                 line.clear(); // Clear any partial data from interrupted read
                 continue; // Persistent mode - keep waiting
             }
+            crate::debug_log::server_log(
+                "client-reader",
+                &format!("client {client_id}: read error {e:?} (attached_sent={attached_sent}), closing the connection"),
+            );
             if attached_sent {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
             }
+            crate::types::teardown_client_connection(client_id);
             break; // Non-persistent timeout or real error
         }
         Ok(_) => {
@@ -5221,7 +5257,9 @@ fn dispatch_control_command(
                     let (srtx, srrx) = mpsc::channel::<String>();
                     let _ = tx.send(CtrlReq::ShowOptionValue(srtx, name.to_string()));
                     if let Ok(v) = srrx.recv_timeout(Duration::from_millis(2000)) {
-                        if value_only {
+                        if let Some(t) = crate::terminal_overrides::show_array_lines(name, &v, value_only) {
+                            text.push_str(&t);
+                        } else if value_only {
                             text.push_str(&format!("{}\n", v));
                         } else {
                             text.push_str(&format!("{} {}\n", name, v));
@@ -5231,6 +5269,8 @@ fn dispatch_control_command(
                 let _ = resp_tx.send(text);
                 return true;
             }
+            // Array options print one `name[i] value` line per element (#700).
+            let array_name = opt_name.clone().filter(|n| !window_scope2 && n == "terminal-overrides");
             if let Some(name) = opt_name {
                 // #648: `-wv <name>` used to fall into the plain
                 // ShowOptionValue arm because `value_only` was tested first,
@@ -5277,6 +5317,11 @@ fn dispatch_control_command(
                         .collect::<Vec<_>>()
                         .join("\n");
                     let _ = resp_tx.send(values_only);
+                } else if let Some(t) = array_name
+                    .as_deref()
+                    .and_then(|n| crate::terminal_overrides::show_array_lines(n, &text, value_only))
+                {
+                    let _ = resp_tx.send(t.trim_end_matches('\n').to_string());
                 } else {
                     let _ = resp_tx.send(text);
                 }

@@ -87,6 +87,9 @@ pub(crate) fn serialize_bindings_json(app: &AppState) -> String {
 /// The scrollback size also ships whenever the client is in copy mode with the
 /// option off, because the position indicator needs it as
 /// `copy_position_limit` (tmux `window_copy_formats`, #702).
+///
+/// `copy_hide_position` rides along on the same condition, and only when it is
+/// set, so an ordinary copy-mode frame carries no extra bytes for it (#704).
 pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
     if !buf.ends_with('}') { return; }
     let cln = app.user_options.get("copy-mode-line-numbers").filter(|v| v.as_str() != "off");
@@ -99,6 +102,9 @@ pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
     buf.pop();
     buf.push_str(",\"copy_hsize\":");
     buf.push_str(&hsize.to_string());
+    if app.copy_hide_position && in_copy {
+        buf.push_str(",\"copy_hide_position\":true");
+    }
     let Some(cln) = cln else { buf.push('}'); return; };
     buf.push_str(",\"copy_mode_line_numbers\":\"");
     buf.push_str(&json_escape_string(cln));
@@ -267,6 +273,11 @@ pub(crate) fn expand_status_formats(
                 None
             } else {
                 Some(app.codepoint_widths.clone())
+            },
+            terminal_overrides: if app.terminal_overrides.is_empty() {
+                None
+            } else {
+                Some(app.terminal_overrides.clone())
             },
         },
         status_format_json: {

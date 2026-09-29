@@ -41,7 +41,7 @@ fn render_gutters(leaf: &LayoutJson, mode: CopyLnMode, hsize: usize, w: u16, h: 
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();
     let copy_ln = Some(CopyLnRender {
-        mode, hsize,
+        mode, hsize, hide_position: false,
         num_style: Style::default().fg(Color::DarkGray),
         cur_style: Style::default().fg(Color::Yellow),
     });
@@ -148,7 +148,7 @@ fn gutter_shifts_content_right() {
         let backend = TestBackend::new(40, h);
         let mut term = Terminal::new(backend).unwrap();
         let copy_ln = Some(CopyLnRender {
-            mode: CopyLnMode::Relative, hsize: 0,
+            mode: CopyLnMode::Relative, hsize: 0, hide_position: false,
             num_style: Style::default().fg(Color::DarkGray),
             cur_style: Style::default().fg(Color::Yellow),
         });

@@ -1480,6 +1480,9 @@ pub(crate) fn render_float_overlays(
 pub struct CopyLnRender {
     pub mode: crate::copy_line_numbers::CopyLnMode,
     pub hsize: usize,
+    /// `toggle-position` / `copy-mode -H`: the position indicator is not drawn
+    /// while this is set (#704).
+    pub hide_position: bool,
     pub num_style: Style,
     pub cur_style: Style,
 }
@@ -2080,7 +2083,10 @@ pub fn render_layout_json(
             // `window_copy_write_line`, pair from `window_copy_formats`).
             // This used to print the scroll offset on both sides of the slash
             // and skip offset 0 (#702).
-            if *copy_mode && *active {
+            // `toggle-position` (P) and `copy-mode -H` hide it, the way
+            // `window_copy_write_line` skips the draw on `data->hide_position`
+            // (#704).
+            if *copy_mode && *active && !copy_ln.map(|cfg| cfg.hide_position).unwrap_or(false) {
                 let (mode, hsize) = copy_ln
                     .map(|cfg| (cfg.mode, cfg.hsize))
                     .unwrap_or((crate::copy_line_numbers::CopyLnMode::Off, 0));
@@ -3085,6 +3091,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// Active pane scrollback size, for absolute/hybrid line numbers.
         #[serde(default)]
         copy_hsize: usize,
+        /// toggle-position / copy-mode -H: hide the position indicator.
+        #[serde(default)]
+        copy_hide_position: bool,
         #[serde(default)]
         copy_mode_line_number_style: Option<String>,
         #[serde(default)]
@@ -6935,6 +6944,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             vt100::set_codepoint_widths(codepoint_widths);
             last_codepoint_widths = codepoint_widths.to_vec();
         }
+        // Issue #700: the first frame decides the host screen. The server's
+        // `terminal-overrides` ride on it, and `smcup@` for this client's TERM
+        // keeps the host terminal on its main screen. A no-op after the first.
+        crate::terminal_overrides::client_screen_start(
+            terminal.backend_mut(),
+            state.client_render_options.terminal_overrides.as_deref().unwrap_or(&[]),
+        );
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             // Pass full string — visual truncation is handled by ratatui
@@ -7070,7 +7086,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                      state.copy_mode_current_line_number_style.as_deref()
                         .map(crate::style::parse_tmux_style).unwrap_or_else(|| Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
                 } else { (Style::default(), Style::default()) };
-                Some(CopyLnRender { mode, hsize: state.copy_hsize, num_style, cur_style })
+                Some(CopyLnRender {
+                    mode,
+                    hsize: state.copy_hsize,
+                    hide_position: state.copy_hide_position,
+                    num_style,
+                    cur_style,
+                })
             };
             let window_styles = WindowContentStyles {
                 inactive: state.client_render_options.window_style.as_deref()

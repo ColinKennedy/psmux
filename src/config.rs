@@ -1115,7 +1115,15 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
     // Handle -a (append to current value)
     let final_value = if append_mode {
         let current = crate::format::lookup_option_pub(key, app).unwrap_or_default();
-        format!("{}{}", current, value)
+        if matches!(key, "terminal-overrides" | "codepoint-widths") {
+            // ARRAY option: `-a` adds elements, it does not glue characters
+            // onto the last one (tmux options_array_assign), so
+            // `set -ga terminal-overrides 'xterm*:Tc'` without a leading
+            // comma still lands as its own element.
+            format!("{},{}", current, value)
+        } else {
+            format!("{}{}", current, value)
+        }
     } else {
         value
     };
@@ -1384,7 +1392,11 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         "allow-set-title" => {
             app.allow_set_title = matches!(value, "on" | "true" | "1" | "yes");
         }
-        "terminal-overrides" => { /* tmux terminfo override — accepted for compatibility, no-op on Windows */ }
+        "terminal-overrides" => {
+            // Array option (issue #700): smcup/rmcup decide whether the
+            // attach client uses the host's alternate screen.
+            app.terminal_overrides = crate::terminal_overrides::split_array(value);
+        }
         "default-terminal" => {
             // tmux sets the TERM env var from this option (#137)
             app.environment.insert("TERM".to_string(), value.to_string());
