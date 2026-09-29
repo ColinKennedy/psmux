@@ -3531,7 +3531,7 @@ fn run_main() -> io::Result<()> {
                         "-k" => { cmd.push_str(" -k"); }
                         "-c" => {
                             if let Some(d) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -c {}", d));
+                                cmd.push_str(&format!(" -c {}", crate::util::quote_arg_if_needed(d)));
                                 i += 1;
                             }
                         }

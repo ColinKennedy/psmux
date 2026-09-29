@@ -277,6 +277,29 @@ impl Grid {
 
     /// Updates the scrollback buffer's maximum size.  When `new_len` is
     /// smaller than the current fill, the oldest rows are trimmed away.
+    /// Move the retained history out of this grid, leaving it empty.  The
+    /// rows are shared (`Arc`), so this moves pointers, never cells.
+    pub fn take_scrollback(
+        &mut self,
+    ) -> std::collections::VecDeque<std::sync::Arc<crate::row::Row>> {
+        self.scrollback_offset = 0;
+        std::mem::take(&mut self.scrollback)
+    }
+
+    /// Install history taken from another grid with `take_scrollback`,
+    /// replacing whatever this grid held and trimming the oldest rows to this
+    /// grid's limit.
+    pub fn put_scrollback(
+        &mut self,
+        history: std::collections::VecDeque<std::sync::Arc<crate::row::Row>>,
+    ) {
+        self.scrollback = history;
+        self.scrollback_offset = 0;
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+        }
+    }
+
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.scrollback_len = new_len;
         while self.scrollback.len() > self.scrollback_len {
@@ -804,14 +827,19 @@ impl Grid {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
             let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            // On a ONE row screen the row that wrapped has just scrolled off
+            // (0 - 1): it is history now, or gone with no scrollback, and
+            // there is no visible row to flag. The bare subtraction here
+            // underflowed and the unwrap below panicked the pane's reader
+            // thread (found under #708; psmux allows one row panes, #644).
+            let Some(prev_row) = prev_pos.row.checked_sub(scrolled) else {
+                return;
+            };
+            prev_pos.row = prev_row;
+            if let Some(row) = self.drawing_row_mut(prev_pos.row) {
+                row.wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            }
         }
     }
 

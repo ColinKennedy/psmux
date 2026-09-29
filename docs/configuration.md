@@ -1108,9 +1108,14 @@ psmux respawn-pane -c "C:\Projects"
 
 # Respawn with a specific command
 psmux respawn-pane -- python app.py
+
+# Give the new process extra environment (repeatable, this process only)
+psmux respawn-pane -k -e AGENT_ID=bob -e ROLE=review -- claude
 ```
 
 This is useful for monitoring: if a long-running process crashes, you can see its final output and restart it without losing the pane layout.
+
+A respawn behaves like tmux's: the pane keeps its id and its scrollback history, so the new process starts below everything its predecessor printed (`capture-pane -S -` and copy mode still reach it). The rows that were on screen when the old process died are cleared rather than moved into history, the cursor goes back to the top left, copy mode is left, and a process that died on the alternate screen leaves the pane on the normal one. Use `clear-history` after the respawn when you want a clean slate.
 
 ### Background Processes and `@kill-descendants`
 

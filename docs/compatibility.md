@@ -312,7 +312,7 @@ Three deliberate choices:
 
 - **The palette is per pane and is never forwarded to the outer terminal.** Two panes with different palettes would fight over one terminal, which is precisely why tmux resolves it per pane instead.
 - **A pane that never sets a palette is unchanged, byte for byte.** The substitution costs one null check per frame for such a pane, and nothing travels on the wire that did not travel before.
-- **A respawned pane starts empty.** `respawn-pane` installs a fresh parser, and an in band RIS (`ESC c`) clears the palette too, matching tmux.
+- **A respawn keeps the palette, RIS clears it.** tmux keeps the palette on the pane and clears it only on RIS (`ESC c`), `ESC]104` and `send-keys -R`, so a `respawn-pane` or `respawn-window` keeps it, along with the pane's history (#708). The respawn resets everything else the way tmux's `screen_reinit` does: the visible rows are cleared, the cursor goes home, the modes are reset and the alternate screen is left.
 
 One platform limit, measured on Windows 11 build 26200: conhost swallows a **bare** `ESC]104 ESC\` on the ConPTY output path, so a pane child running under ConPTY cannot reach the clear-everything form. `ESC]104;4 ESC\` arrives normally.
 
