@@ -3732,7 +3732,11 @@ pub(crate) fn reinit_parser_keep_history(
     let rows = rows.max(1);
     let cols = cols.max(1);
     let mut parser = match old.lock() {
-        Ok(mut guard) => std::mem::replace(&mut *guard, vt100::Parser::new(1, 1, 0)),
+        // What is left behind is a full screen at the pane's size (no
+        // history), so a late flush from the old reader is processed exactly
+        // as it would have been before. A 1x1 placeholder panicked the server
+        // on the first wrapped line (see Grid::col_wrap).
+        Ok(mut guard) => std::mem::replace(&mut *guard, vt100::Parser::new(rows, cols, 0)),
         Err(_) => vt100::Parser::new(rows, cols, history_limit),
     };
     let screen = parser.screen_mut();

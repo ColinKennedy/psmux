@@ -221,7 +221,7 @@ PS> psmux list-panes -t work:worker -F '#{pane_index} dead=#{pane_dead} cmd=#{pa
 0 dead=0 cmd=pwsh
 ```
 
-A supervisor loop is a few lines of PowerShell: poll `#{pane_dead}` every few seconds and `respawn-pane -k` when it turns to `1`. The layout, the pane id and the log pipe are all preserved across the respawn.
+A supervisor loop is a few lines of PowerShell: poll `#{pane_dead}` every few seconds and `respawn-pane -k` when it turns to `1`. The layout, the pane id, the log pipe and the pane's scrollback are all preserved across the respawn, so a restarted agent's pane still shows what the previous run printed above the new output. `-e KEY=VALUE` hands the new process its own environment, for example an identity for a successor agent.
 
 ## Showing the active agent in the status line
 

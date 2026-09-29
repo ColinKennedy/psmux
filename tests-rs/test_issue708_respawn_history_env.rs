@@ -217,6 +217,22 @@ fn reinit_keeps_hyperlinks_that_history_cells_point_into() {
     assert_eq!(p.screen().hyperlink_uri(2), Some("https://example.com/b"));
 }
 
+/// tmux keeps `wp->palette` across a respawn; only RIS, OSC 104 and
+/// `send-keys -R` clear it (input.c, cmd-send-keys.c).
+#[test]
+fn reinit_keeps_the_osc4_palette_like_tmux() {
+    let mut p = dead_screen();
+    p.process(b"]4;4;rgb:00/00/80\\");
+    let gen = p.screen().palette_generation();
+    assert_eq!(p.screen().palette_entry(4), Some((0, 0, 0x80)));
+    p.screen_mut().reinit_keep_history();
+    assert_eq!(p.screen().palette_entry(4), Some((0, 0, 0x80)));
+    assert_eq!(p.screen().palette_generation(), gen);
+    // RIS in the new process still clears it
+    p.process(b"c");
+    assert_eq!(p.screen().palette_entry(4), None);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 2. The pane side: the history moves to the new parser, the old Arc is left
 //    empty for the dead reader thread.
@@ -387,4 +403,56 @@ fn respawned_child_sees_env_and_it_overrides_the_session() {
     let _ = std::fs::remove_file(&script);
     assert!(text.contains("ENV=[hello][fromflag]"), "child environment wrong:\n{text}");
     assert!(text.starts_with("MARKER\n"), "history kept under the new process:\n{text}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 4. One row screens. Found while fixing #708: the first cut left a 1x1
+//    placeholder parser behind for the dead reader thread, and a wrapped
+//    line on a one row screen panicked in `Grid::col_wrap`
+//    (`prev_pos.row - scrolled` underflows), which killed the server. psmux
+//    allows one row panes (#644, MIN_PTY_DIM 1), so the grid must survive it.
+// ─────────────────────────────────────────────────────────────────────────
+
+fn wrap_on(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser {
+    let mut p = vt100::Parser::new(rows, cols, scrollback);
+    p.process(b"abcdefghijklmnopqrstuvwxyz0123456789");
+    p
+}
+
+#[test]
+fn one_row_with_scrollback_wraps_into_history() {
+    let p = wrap_on(1, 10, 100);
+    assert_eq!(p.screen().contents(), "456789", "36 chars over 10 columns: the 4th row is the visible one");
+    assert_eq!(p.screen().scrollback_filled(), 3);
+}
+
+#[test]
+fn one_row_without_scrollback_wraps() {
+    let p = wrap_on(1, 10, 0);
+    assert_eq!(p.screen().contents(), "456789", "36 chars over 10 columns: the 4th row is the visible one");
+}
+
+#[test]
+fn one_by_one_screen_survives_any_output() {
+    let mut p = vt100::Parser::new(1, 1, 0);
+    p.process("hello\r\nworld\r\n\x1b[31mcolour\x1b[0m wide \u{4e2d} end".as_bytes());
+    let _ = p.screen().contents();
+}
+
+#[test]
+fn two_rows_still_mark_the_wrap() {
+    let p = wrap_on(2, 10, 100);
+    assert!(p.screen().row_wrapped(0), "the row above the last one wrapped into it");
+}
+
+/// The parser left behind in the old Arc takes whatever the dead process's
+/// reader flushes last, at the pane's own size, without panicking.
+#[test]
+fn the_parser_left_for_the_old_reader_takes_late_output() {
+    let old = Arc::new(Mutex::new(dead_screen()));
+    let _fresh = crate::window_ops::reinit_parser_keep_history(&old, ROWS, COLS, 2000, true);
+    let mut left = old.lock().unwrap();
+    assert_eq!(left.screen().size(), (ROWS, COLS));
+    left.process(&[b'x'; 500]);
+    left.process(b"\r\nlate\r\n");
 }
