@@ -1002,3 +1002,171 @@ fn no_selection_means_the_cursor_is_still_drawn() {
     assert!(!copy_cursor_in_selection(3, 3, Some((1, 1)), None, "char"));
     assert!(!copy_cursor_in_selection(3, 3, None, Some((5, 5)), "char"));
 }
+
+// ---------------------------------------------------------------------------
+// PasteGesture: the "already forwarded" latch must expire.
+//
+// A client that pastes without a Ctrl+V keystroke -- a mobile terminal, a paste
+// button on a terminal that does support bracketed paste -- never calls
+// `start()` or `finish()`.  The latch those two cleared used to be permanent,
+// so the first paste went through and every later one was dropped with
+// "dropping duplicate of N char(s) already sent as characters", whatever the
+// clipboard held.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn paste_gesture_latch_does_not_outlive_its_read_back_window() {
+    let mut g: super::PasteGesture = Default::default();
+    // A burst flushed as characters with no Ctrl+V press before it: the mobile
+    // terminal case.  Nothing opens or closes a gesture here.
+    g.record("C2");
+    // Right after the burst the read-back is still that paste -- the upstream
+    // contract (a_gesture_that_forwarded_characters_blocks_the_read_back).
+    assert!(
+        g.blocks("C2"),
+        "the read-back of a burst that just went out is still that paste"
+    );
+    // Once the window has passed, that burst must not suppress anything: a latch
+    // that never expired is what dropped every paste after the first.
+    std::thread::sleep(super::PASTE_GESTURE_WINDOW + std::time::Duration::from_millis(50));
+    assert!(
+        !g.blocks("a completely different clipboard payload"),
+        "a forwarded burst must not block later, unrelated pastes"
+    );
+    assert!(
+        !g.blocks("abc123abc"),
+        "the second paste of a fresh client must reach the pane"
+    );
+}
+
+#[test]
+fn paste_gesture_still_blocks_the_read_back_of_its_own_paste() {
+    let mut g: super::PasteGesture = Default::default();
+    g.start(); // Ctrl+V press: the characters arriving now are that paste
+    g.record("C2"); // first half went out as typing
+    assert!(
+        g.blocks("C2中文"),
+        "while the gesture is live, the read-back of the same paste stays a duplicate"
+    );
+    g.finish(); // Ctrl+V release / gesture over
+    assert!(
+        !g.blocks("C2中文"),
+        "after the gesture ends the same text is a new deliberate paste"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #598: a bracketed paste event is dropped only when it repeats
+// characters that just went out, never because of an earlier paste or a key.
+//
+// The sequence is the reporter's input_debug.log (iTerm2 over ssh, pwsh pane):
+//
+//   [event] Paste (203 bytes)  -> send-paste
+//   [event] Key C-c, 5x Backspace
+//   [event] Paste (31 bytes)   -> "dropping duplicate of 31 char(s) already sent as characters"
+//   [event] Paste (25 / 16 / 9 / 9 / 9 bytes), each dropped the same way
+//
+// No Ctrl+V keystroke ever reaches a client behind ssh, so nothing cleared the
+// latch the first paste's own send-paste had set.
+// ---------------------------------------------------------------------------
+
+/// What the `Event::Paste` arm does with one paste event: ask whether it is a
+/// duplicate, and when it is not, forward it and record it.
+fn issue598_paste_event(g: &mut super::PasteGesture, text: &str) -> bool {
+    if super::paste_event_is_duplicate(g, text) {
+        false
+    } else {
+        g.record(text);
+        true
+    }
+}
+
+#[test]
+fn issue598_every_paste_of_an_ssh_client_reaches_the_pane() {
+    let mut g: super::PasteGesture = Default::default();
+    let first = format!("FIRST598{}", "x".repeat(195));
+    assert_eq!(first.len(), 203);
+    assert!(issue598_paste_event(&mut g, &first), "the first paste is forwarded");
+    // Ctrl+C and the backspaces go out as send-key and are not recorded.
+    // The reporter's next paste came six seconds later; anything past the
+    // gesture window is the same case.
+    std::thread::sleep(super::PASTE_GESTURE_WINDOW + std::time::Duration::from_millis(50));
+    let later = [
+        "0123456789012345678901234567890",
+        "abcdefghijklmnopqrstuvwxy",
+        "sixteen chars ok",
+        "nine char",
+        "nine char",
+        "nine char",
+    ];
+    for (i, text) in later.iter().enumerate() {
+        assert!(
+            issue598_paste_event(&mut g, text),
+            "paste {} ({} bytes) was dropped as a duplicate of an earlier paste",
+            i + 2,
+            text.len()
+        );
+        std::thread::sleep(super::PASTE_GESTURE_WINDOW + std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn issue598_a_key_typed_just_before_a_paste_does_not_swallow_it() {
+    let mut g: super::PasteGesture = Default::default();
+    // `git commit -m ` and Cmd+V a moment later: the space went out through
+    // the zero latency typing path, which records it.
+    g.record(" ");
+    assert!(
+        !super::paste_event_is_duplicate(&g, "fix the build"),
+        "a paste right after a typed key is a new paste"
+    );
+    // A typed character that happens to be the paste's first character is
+    // still not the paste.
+    g.record("f");
+    assert!(!super::paste_event_is_duplicate(&g, "fix the build"));
+}
+
+#[test]
+fn issue598_a_paste_right_after_another_paste_is_not_dropped() {
+    let mut g: super::PasteGesture = Default::default();
+    assert!(issue598_paste_event(&mut g, "first clipboard"));
+    assert!(
+        issue598_paste_event(&mut g, "second clipboard"),
+        "a different paste inside the window is still a new paste"
+    );
+}
+
+#[test]
+fn issue598_the_host_forwarding_the_paste_as_characters_still_blocks_its_event() {
+    // The duplicate this check exists for: the characters of the paste went
+    // out first, in bursts, and the event for the same paste follows.
+    let mut g: super::PasteGesture = Default::default();
+    g.record("C2");
+    g.record("单元格应显示");
+    assert!(super::paste_event_is_duplicate(&g, "C2单元格应显示"));
+
+    let mut g: super::PasteGesture = Default::default();
+    g.record("=");
+    g.record("(B3-B2)/B2");
+    assert!(super::paste_event_is_duplicate(&g, "=(B3-B2)/B2"));
+
+    // A key typed before those bursts does not hide them.
+    let mut g: super::PasteGesture = Default::default();
+    g.record("x");
+    g.record("line one\rline two");
+    assert!(
+        super::paste_event_is_duplicate(&g, "line one\r\nline two"),
+        "line endings do not make the same paste a different one"
+    );
+}
+
+#[test]
+fn issue598_forwarded_characters_expire_with_the_gesture_window() {
+    let mut g: super::PasteGesture = Default::default();
+    g.record("same text");
+    std::thread::sleep(super::PASTE_GESTURE_WINDOW + std::time::Duration::from_millis(50));
+    assert!(
+        !super::paste_event_is_duplicate(&g, "same text"),
+        "pasting the same text again later is a deliberate repeat"
+    );
+}

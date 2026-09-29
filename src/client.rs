@@ -5654,12 +5654,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             pane_renaming, &mut pane_title_buf,
                             window_idx_input, &mut window_idx_buf,
                         );
-                        let duplicate = !consumed && paste_gesture.blocks(&data);
+                        let duplicate = !consumed && paste_event_is_duplicate(&paste_gesture, &data);
                         if duplicate {
                             // Windows crossterm can emit Event::Paste *and* the
                             // per-character key events for one Ctrl+V.  When the
                             // characters were delivered first, forwarding this
-                            // event too pastes the same text twice.
+                            // event too pastes the same text twice.  Only the
+                            // text itself decides that: a paste after a key the
+                            // user typed, or after an earlier paste, is a new
+                            // paste (issue #598).
                             if input_log_enabled() {
                                 input_log("paste", &format!(
                                     "Event::Paste: dropping duplicate of {} char(s) already sent as characters",
@@ -8815,6 +8818,12 @@ impl ClipboardHeadCache {
 struct PasteGesture {
     /// Text of the bursts forwarded so far, with the time the last one went out.
     delivered: Option<(String, Instant)>,
+    /// Every character forwarded in the current run of bursts, a run being
+    /// bursts that follow each other within [`PASTE_GESTURE_WINDOW`].  This is
+    /// what a bracketed paste event is compared against (issue #598): the
+    /// event repeats the characters only when its whole text is what just
+    /// went out, never merely because some key was typed a moment earlier.
+    forwarded: String,
     /// True once any of this gesture's characters have been forwarded.
     injected: bool,
     /// When the Ctrl+V press that opened this gesture was seen.  The host's
@@ -8830,10 +8839,26 @@ struct PasteGesture {
 /// released has no lasting effect on typing.
 const PASTE_GESTURE_WINDOW: Duration = Duration::from_millis(300);
 
+/// The decision the `Event::Paste` arm makes: drop a bracketed paste event only
+/// when it repeats characters this client has just forwarded for the same
+/// paste.  Before issue #598 this asked [`PasteGesture::blocks`], whose
+/// "already forwarded" latch was set by the paste event's own `send-paste` and
+/// by every typed key, and only a Ctrl+V press or release cleared it.  A client
+/// behind ssh never sees that keystroke, so after its first paste every later
+/// one was dropped as "a duplicate of N char(s) already sent as characters".
+fn paste_event_is_duplicate(gesture: &PasteGesture, text: &str) -> bool {
+    gesture.repeats_forwarded(text)
+}
+
+/// Upper bound on [`PasteGesture::forwarded`], so a long run of fast typing
+/// cannot grow it without limit.  Far above any paste the host splits.
+const PASTE_FORWARDED_MAX: usize = 1 << 20;
+
 impl PasteGesture {
     /// A new Ctrl+V started: nothing of this gesture has been forwarded yet.
     fn start(&mut self) {
         self.delivered = None;
+        self.forwarded.clear();
         self.injected = false;
         self.opened_at = Some(Instant::now());
     }
@@ -8841,6 +8866,7 @@ impl PasteGesture {
     /// The gesture is over, however it ended.
     fn finish(&mut self) {
         self.delivered = None;
+        self.forwarded.clear();
         self.injected = false;
         self.opened_at = None;
     }
@@ -8856,9 +8882,46 @@ impl PasteGesture {
     /// Remember `text` as forwarded on behalf of this gesture.
     fn record(&mut self, text: &str) {
         if !text.is_empty() {
+            let same_run = self
+                .recent()
+                .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+            if !same_run {
+                self.forwarded.clear();
+            }
+            self.forwarded.push_str(text);
+            if self.forwarded.len() > PASTE_FORWARDED_MAX {
+                let mut cut = self.forwarded.len() - PASTE_FORWARDED_MAX;
+                while !self.forwarded.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                self.forwarded.drain(..cut);
+            }
             self.injected = true;
             self.delivered = Some((text.to_string(), Instant::now()));
         }
+    }
+
+    /// True when a bracketed paste event carrying `text` repeats characters
+    /// this client has just forwarded: the host delivered the same paste as
+    /// key events first, so sending the event too would paste it twice.
+    ///
+    /// Unlike [`PasteGesture::blocks`], which guards the clipboard read-back of
+    /// a Ctrl+V the client saw, this looks at the content.  A terminal that
+    /// pastes without a Ctrl+V keystroke (iTerm2 over ssh, issue #598) sends
+    /// ordinary typing right before its pastes, and a key typed a moment
+    /// earlier must never swallow the paste that follows it.  Line endings are
+    /// ignored because a forwarded CR or LF and the event's CRLF are the same
+    /// paste.
+    fn repeats_forwarded(&self, text: &str) -> bool {
+        let recent = self
+            .recent()
+            .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+        if !recent {
+            return false;
+        }
+        let strip = |s: &str| s.chars().filter(|c| *c != '\r' && *c != '\n').collect::<String>();
+        let pasted = strip(text);
+        !pasted.is_empty() && strip(&self.forwarded).ends_with(&pasted)
     }
 
     /// The last forwarded burst and how long ago it went out.
@@ -8872,7 +8935,25 @@ impl PasteGesture {
     /// characters were already forwarded (whatever they were split into), or
     /// the same text went out a moment ago.
     fn blocks(&self, text: &str) -> bool {
-        self.injected || duplicates_recent_paste(text, self.recent())
+        // "Already forwarded" covers the read-back of a paste whose characters
+        // went out as typing in pieces (`C2` then the CJK part), where the text
+        // no longer compares equal even though it is the whole paste: whatever
+        // comes back right after a burst of this gesture's characters is that
+        // paste, not typing the user did.
+        //
+        // The window runs from that burst, not from the Ctrl+V press, and it
+        // expires.  A client that pastes without a Ctrl+V keystroke (a mobile
+        // terminal, a paste button) sets `injected` too, and the old unbounded
+        // latch -- cleared only by `start()` / `finish()`, a press and its
+        // release -- made it drop every paste after the first as a duplicate of
+        // it, whatever the content.
+        let injected_recently = self.injected
+            && self
+                .recent()
+                .map_or(false, |(_, age)| age < PASTE_GESTURE_WINDOW);
+        injected_recently
+            || (self.is_open() && self.injected)
+            || duplicates_recent_paste(text, self.recent())
     }
 }
 
