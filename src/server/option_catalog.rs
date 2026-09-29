@@ -355,6 +355,14 @@ pub fn validate_option_value(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// True for every name psmux recognises as an option: a catalog entry or a
+/// validation only name. The config parser uses it to tell an option its own
+/// match does not route (hand it to the runtime setter) from a genuine typo.
+pub fn is_known_option(name: &str) -> bool {
+    option_definition(name).is_some()
+        || VALIDATION_ONLY_OPTIONS.iter().any(|definition| definition.name == name)
+}
+
 pub fn validate_option_append(name: &str) -> Result<(), String> {
     option_definition(name).map_or(Ok(()), OptionDef::validate_append)
 }
