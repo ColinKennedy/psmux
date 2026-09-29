@@ -637,6 +637,10 @@ fn drain_plugin_req(
                     "codepoint-widths" => {
                         crate::server::options::append_codepoint_widths(app, &value);
                     }
+                    "terminal-overrides" => {
+                        app.terminal_overrides
+                            .extend(crate::terminal_overrides::split_array(&value));
+                    }
                     "status-left" => app.status_left.push_str(&value),
                     "status-right" => app.status_right.push_str(&value),
                     "status-style" => app.status_style.push_str(&value),
@@ -3211,14 +3215,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::PrefixBegin => { app.client_prefix_active = true; app.current_key_table = None; state_dirty = true; }
                 CtrlReq::PrefixEnd => { app.client_prefix_active = false; state_dirty = true; }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); hook_event = Some("pane-mode-changed"); }
-                CtrlReq::CopyEnterPageUp => {
-                    if crate::copy_mode::enter_copy_mode_page_up(&mut app) {
-                        hook_event = Some("pane-mode-changed");
-                    } else {
-                        // scroll-enter-copy-mode is off: forward PageUp to the
-                        // active pane so apps like less/vim/WSL receive it (#284).
-                        send_text_to_active(&mut app, "\x1b[5~")?;
-                        echo_pending_until = Some(Instant::now());
+                CtrlReq::CopyModeCmd(flags) => {
+                    match crate::copy_mode::run_copy_mode_command(&mut app, flags) {
+                        crate::copy_mode::CopyModeOutcome::ModeChanged => {
+                            state_dirty = true;
+                            hook_event = Some("pane-mode-changed");
+                        }
+                        crate::copy_mode::CopyModeOutcome::Nothing => {}
+                        crate::copy_mode::CopyModeOutcome::ForwardPageUp => {
+                            // scroll-enter-copy-mode is off: forward PageUp to the
+                            // active pane so apps like less/vim/WSL receive it (#284).
+                            send_text_to_active(&mut app, "\x1b[5~")?;
+                            echo_pending_until = Some(Instant::now());
+                        }
                     }
                 }
                 CtrlReq::ClockMode => { app.mode = Mode::ClockMode; state_dirty = true; hook_event = Some("pane-mode-changed"); }
@@ -3926,6 +3935,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // tmux 3.3 calls this refresh-toggle; older tables and
                         // the #498 report use refresh-from-pane for the same key.
                         "refresh-from-pane" | "refresh-toggle" => { crate::copy_mode::toggle_refresh(&mut app); }
+                        "toggle-position" => { crate::copy_mode::toggle_position(&mut app); }
                         "next-paragraph" => {
                             crate::copy_mode::move_next_paragraph(&mut app);
                         }
@@ -5271,6 +5281,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             // sibling arm in the main request loop).
                             "codepoint-widths" => {
                                 crate::server::options::append_codepoint_widths(&mut app, &value);
+                            }
+                            "terminal-overrides" => {
+                                app.terminal_overrides
+                                    .extend(crate::terminal_overrides::split_array(&value));
                             }
                             "status-left" => { app.status_left.push_str(&value); }
                             "status-right" => { app.status_right.push_str(&value); }
@@ -7647,6 +7661,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
             }
             if mutates_state {
+                state_dirty = true;
+            }
+            // A copy-mode command that changed only how the mode is drawn asks
+            // for its frame here. `SendText` and `SendKey` are left out of
+            // `mutates_state` because an ordinary keystroke's frame comes from
+            // the pty echo, and a copy-mode key has no echo to ride on (#704).
+            if app.copy_needs_redraw {
+                app.copy_needs_redraw = false;
                 state_dirty = true;
             }
         }

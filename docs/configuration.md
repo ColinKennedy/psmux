@@ -197,6 +197,7 @@ Details worth knowing:
 | `warm` | Bool | `on` | Pre-spawn shells for instant window/pane creation (see [warm-sessions.md](warm-sessions.md)) |
 | `copy-command` | Str | | Shell command for clipboard pipe |
 | `codepoint-widths` | Str | | Comma separated overrides for how many columns Unicode codepoints occupy (see [Codepoint widths](#codepoint-widths)) |
+| `terminal-overrides` | Str | | Array of `pattern:cap:cap` entries matched against the client's `TERM`. `smcup@` and `rmcup@` keep the attached client off the host terminal's alternate screen (see [Terminal overrides](#terminal-overrides)) |
 | `set-clipboard` | Str | `on` | Clipboard interaction (`on`/`off`/`external`) |
 | `main-pane-width` | Int | `0` | Main pane width in main-vertical layout |
 | `main-pane-height` | Int | `0` | Main pane height in main-horizontal layout |
@@ -830,7 +831,6 @@ setting that was never wired up.
 
 | Option | Status |
 |---|---|
-| `terminal-overrides` | An explicit no-op. The config file path parses it and throws the value away; the runtime `set-option` path keeps it in the user options map. Neither is ever read, because terminfo overrides have no meaning on Windows, where psmux talks to ConPTY rather than to a terminfo database. Use `default-terminal` to control the `TERM` value panes see |
 | `lock-after-time` | Accepted and stored. Session locking is not implemented, so the timer never runs. `lock-client`, `lock-server` and `lock-session` exist as commands but nothing locks on a timer |
 | `lock-command` | Accepted and stored. Never read, for the same reason |
 | `popup-style` | Accepted and stored. Popup borders are styled by `popup-border-style`; the popup body itself is not styled yet |
@@ -1262,3 +1262,55 @@ If you are unsure whether your terminal treats a character as one column or
 two, print a row of them and see where it wraps: in an 80 column window, 80 of
 them filling exactly one line means one column each, and wrapping after 40
 means two.
+
+## Terminal overrides
+
+`terminal-overrides` is the tmux option for adjusting what psmux assumes about
+the terminal a client is attached from. psmux has no terminfo database: the
+client writes VT sequences directly. So of all the capabilities tmux knows,
+psmux honours the two that change what the client sends on its own account:
+
+| Capability | Effect |
+|---|---|
+| `smcup` | Entering the host terminal's alternate screen (`ESC[?1049h`) when a client attaches |
+| `rmcup` | Leaving it again (`ESC[?1049l`) when the client detaches or exits |
+
+Every other capability is accepted, kept, shown by `show-options`, and ignored.
+
+The common use is keeping the client on the host terminal's main screen, for
+example an SSH client on a phone where the alternate screen cannot be scrolled:
+
+```tmux
+set -ga terminal-overrides ',*:smcup@:rmcup@'
+```
+
+With that set the client never sends `ESC[?1049h` or `ESC[?1049l`. Like tmux,
+it clears the screen when it starts drawing and again when it detaches, so the
+prompt comes back on a clean screen. psmux redraws the screen in place, so
+pane output does not pile up in the host terminal's scrollback; use copy mode
+for a pane's history.
+
+How entries are read, the same way tmux reads them:
+
+- It is an array option. Each element is `pattern:cap:cap...`. `set -g`
+  replaces the whole array, `set -ga` adds elements (a leading comma is
+  optional), and `set -gu` empties it.
+- The pattern is matched against the `TERM` of the attaching client with
+  shell style wildcards (`*`, `?`, `[...]`). Elements are applied in order, so
+  a later element wins over an earlier one.
+- `cap@` removes a capability, `cap=value` sets it, and `::` is a literal colon
+  inside a field. A capability set to an empty value counts as removed.
+- Native Windows consoles usually have no `TERM` at all. An unset `TERM` is
+  matched as the empty string, which is what tmux's own client sends, so `*`
+  applies to it and a pattern such as `xterm*` does not.
+
+The option is read by the server, from the config file or from a `set` at
+runtime, and each client decides when it attaches. A change made while a
+client is attached applies from the next attach.
+
+Read it back with:
+
+```powershell
+psmux show-options -g terminal-overrides
+# terminal-overrides[0] *:smcup@:rmcup@
+```

@@ -45,6 +45,7 @@ mod timer_res;
 mod pty_trace;
 mod startup_trace;
 mod wsl_path;
+mod terminal_overrides;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -53,7 +54,7 @@ use std::env;
 #[allow(unused_imports)]
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use crossterm::terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
 use crossterm::{execute};
 use crossterm::cursor::{EnableBlinking, DisableBlinking};
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
@@ -5267,7 +5268,12 @@ fn run_main() -> io::Result<()> {
         crate::platform::disable_vti_on_stdin();
     }
 
-    execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
+    // The alternate screen is entered by the first frame instead of here
+    // (issue #700): whether to enter it at all depends on the server's
+    // `terminal-overrides` (`*:smcup@:rmcup@` keeps the host terminal on its
+    // main screen), and that value arrives with the first frame.
+    crate::terminal_overrides::arm_client_screen();
+    execute!(stdout, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
     apply_cursor_style(&mut stdout)?;
 
     let input = if pipe_vt {
@@ -5369,7 +5375,9 @@ fn run_main() -> io::Result<()> {
     let _ = execute!(out, crossterm::style::Print("\x1b[0m"));
     // Reset cursor style to terminal default (\x1b[0 q)
     let _ = execute!(out, crossterm::style::Print("\x1b[0 q"));
-    let _ = execute!(out, DisableBlinking, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(out, DisableBlinking, DisableMouseCapture, DisableBracketedPaste);
+    // Leaves the alternate screen, or with `rmcup@` clears the main one (#700).
+    crate::terminal_overrides::client_screen_stop(out);
     let _ = terminal.show_cursor();
     result
 }
