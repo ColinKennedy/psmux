@@ -268,6 +268,11 @@ pub(crate) fn expand_status_formats(
             } else {
                 Some(app.codepoint_widths.clone())
             },
+            terminal_overrides: if app.terminal_overrides.is_empty() {
+                None
+            } else {
+                Some(app.terminal_overrides.clone())
+            },
         },
         status_format_json: {
             let mut sf = String::from("[");

@@ -1013,6 +1013,7 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "monitor-silence" => Some(app.monitor_silence.to_string()),
         "bell-action" => Some(app.bell_action.clone()),
         "visual-bell" => Some(if app.visual_bell { "on".into() } else { "off".into() }),
+        "terminal-overrides" => Some(app.terminal_overrides.join(",")),
         "claude-code-fix-tty" => Some(if app.claude_code_fix_tty { "on".into() } else { "off".into() }),
         "claude-code-force-interactive" => Some(if app.claude_code_force_interactive { "on".into() } else { "off".into() }),
         _ => {

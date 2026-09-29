@@ -36,4 +36,10 @@ pub(crate) struct ClientRenderOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "cpw")]
     pub codepoint_widths: Option<Vec<String>>,
+    /// `terminal-overrides` entries (issue #700). The client matches them
+    /// against its own TERM to decide whether to enter the alternate screen.
+    /// Skipped on the wire while the option is empty (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "tov")]
+    pub terminal_overrides: Option<Vec<String>>,
 }

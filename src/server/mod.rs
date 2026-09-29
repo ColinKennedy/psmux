@@ -637,6 +637,10 @@ fn drain_plugin_req(
                     "codepoint-widths" => {
                         crate::server::options::append_codepoint_widths(app, &value);
                     }
+                    "terminal-overrides" => {
+                        app.terminal_overrides
+                            .extend(crate::terminal_overrides::split_array(&value));
+                    }
                     "status-left" => app.status_left.push_str(&value),
                     "status-right" => app.status_right.push_str(&value),
                     "status-style" => app.status_style.push_str(&value),
@@ -5271,6 +5275,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             // sibling arm in the main request loop).
                             "codepoint-widths" => {
                                 crate::server::options::append_codepoint_widths(&mut app, &value);
+                            }
+                            "terminal-overrides" => {
+                                app.terminal_overrides
+                                    .extend(crate::terminal_overrides::split_array(&value));
                             }
                             "status-left" => { app.status_left.push_str(&value); }
                             "status-right" => { app.status_right.push_str(&value); }
