@@ -947,6 +947,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char(';') => { for _ in 0..copy_repeat { crate::copy_mode::jump_again(app); } }
                 KeyCode::Char(',') => { for _ in 0..copy_repeat { crate::copy_mode::jump_reverse(app); } }
                 KeyCode::Char('r') => { crate::copy_mode::toggle_refresh(app); }
+                KeyCode::Char('P') => { crate::copy_mode::toggle_position(app); }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
                 KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
                 KeyCode::Char('$') => { crate::copy_mode::move_to_line_end(app); }
@@ -3265,6 +3266,9 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         ';' => { for _ in 0..n { crate::copy_mode::jump_again(app); } }
         ',' => { for _ in 0..n { crate::copy_mode::jump_reverse(app); } }
         'r' => { crate::copy_mode::toggle_refresh(app); }
+        // tmux binds P to toggle-position in BOTH default copy-mode tables
+        // (`key-bindings.c`), so it is not gated on mode-keys here either.
+        'P' => { crate::copy_mode::toggle_position(app); }
         // Preserve the count so e.g. "3fx" finds the 3rd 'x' (consumed above).
         'f' => { app.copy_find_char_pending = Some(0); app.copy_count = Some(n); }
         'F' => { app.copy_find_char_pending = Some(1); app.copy_count = Some(n); }

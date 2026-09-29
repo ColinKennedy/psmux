@@ -595,7 +595,11 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "next-window" | "next" => Some(Action::NextWindow),
         "previous-window" | "prev" => Some(Action::PrevWindow),
         "copy-mode" => {
-            if parts.iter().any(|p| *p == "-u") {
+            // Any flag that changes what the command does keeps the whole
+            // command line, or a binding such as tmux's own
+            // `DoubleClick1Pane { copy-mode -H; ... }` or a menu's
+            // `copy-mode -q` would lose it and become a plain entry (#704).
+            if crate::copy_mode::CopyModeFlags::parse(&parts[1..]) != crate::copy_mode::CopyModeFlags::default() {
                 Some(Action::Command(cmd.to_string()))
             } else {
                 Some(Action::CopyMode)
@@ -1611,19 +1615,16 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             toggle_zoom(app);
         }
         "copy-mode" => {
-            if parts.iter().any(|a| *a == "-u") {
-                if crate::copy_mode::enter_copy_mode_page_up(app) {
-                    // entered copy mode and paged up
-                } else {
-                    // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
-                    if let Some(win) = app.windows.get_mut(app.active_idx) {
-                        if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                            let _ = pane.writer.write_all(b"\x1b[5~");
-                        }
+            let flags = crate::copy_mode::CopyModeFlags::parse(&parts[1..]);
+            if crate::copy_mode::run_copy_mode_command(app, flags)
+                == crate::copy_mode::CopyModeOutcome::ForwardPageUp
+            {
+                // scroll-enter-copy-mode off: forward PageUp to PTY (#284)
+                if let Some(win) = app.windows.get_mut(app.active_idx) {
+                    if let Some(pane) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+                        let _ = pane.writer.write_all(b"\x1b[5~");
                     }
                 }
-            } else {
-                enter_copy_mode(app);
             }
         }
         "display-panes" | "displayp" => {

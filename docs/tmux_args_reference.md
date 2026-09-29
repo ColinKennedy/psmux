@@ -392,7 +392,8 @@ A psmux extension that creates a pane floating above the tiled layout.
 ### Copy and paste commands
 
 **copy-mode**
-- Boolean: `-u` (scroll up one page on entry), `-d` (scroll down), `-e` (exit at the bottom), `-H` (hide the position indicator), `-q` (quit copy mode)
+- Boolean: `-u` (scroll up one page on entry), `-H` (hide the position indicator on a fresh entry; `P` or `send-keys -X toggle-position` flips it inside copy mode), `-q` (leave copy mode or clock mode instead of entering)
+- Accepted but ignored: `-d`, `-e`
 - Value: `-t` (target pane)
 - Not accepted: `-M`, `-S`, `-s`
 - In control mode `copy-mode` is a success returning no-op, because iTerm2 implements copy mode locally on captured content.
