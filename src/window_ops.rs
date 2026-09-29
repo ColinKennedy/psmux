@@ -3516,7 +3516,7 @@ pub fn clear_active_pane_history(app: &mut AppState) {
     }
 }
 
-pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool, command: Option<&str>, empty: bool) -> io::Result<()> {
+pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool, command: Option<&str>, empty: bool, extra_env: &[(String, String)]) -> io::Result<()> {
     // tmux semantics: without -k, respawn only works on dead panes.
     // With -k, kill the running process first and respawn.
     {
@@ -3542,6 +3542,20 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
             }
         }
     }
+    // tmux spawn.c runs window_pane_reset_mode_all before screen_reinit: a
+    // pane in copy mode leaves it on respawn. Leaving it here also puts the
+    // LIVE parser back in `pane.term` (copy mode shows a snapshot), which is
+    // the one whose history the new process inherits below.
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+        exit_copy_mode(app);
+    }
+    {
+        let win = &mut app.windows[app.active_idx];
+        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+            pane.copy_state = None;
+            pane.leave_copy_snapshot();
+        }
+    }
     // If -k and pane is alive, kill the child process first
     if kill {
         let win = &mut app.windows[app.active_idx];
@@ -3561,6 +3575,9 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
             let (r, c, id, title) = (pane.last_rows, pane.last_cols, pane.id, pane.title.clone());
             if let Some(mut ep) = crate::popup::create_empty_pane(r.max(1), c.max(1), id) {
                 ep.title = title;
+                // -E goes through the same spawn_pane/screen_reinit in tmux,
+                // so the history stays here too (#708).
+                ep.term = Arc::new(Mutex::new(reinit_parser_keep_history(&pane.term, r, c, app.history_limit, app.allow_alternate_screen)));
                 *pane = ep;
             }
         }
@@ -3612,6 +3629,12 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     crate::pane::set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
+    // respawn-pane / respawn-window -e KEY=VALUE (#708): applied last so it
+    // overrides the global and session environment, the order tmux spawn.c
+    // builds the child's environment in (environ_for_session, then
+    // environ_copy(sc->environ, child)). Like tmux it is for THIS process
+    // only; a later respawn without -e does not inherit it.
+    for (k, v) in extra_env { shell_cmd.env(k, v); }
     if let Some(dir) = workdir {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -3623,7 +3646,15 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     // Close the slave handle immediately – required for ConPTY.
     drop(pair.slave);
-    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
+    // #708: tmux keeps the pane's history across a respawn. spawn.c reuses
+    // the pane and calls screen_reinit (screen.c), which clears the visible
+    // rows, homes the cursor and resets the modes but leaves the history
+    // above them alone. A fresh parser here threw the dead process's
+    // scrollback away. The screen moves into a NEW Arc so the old reader
+    // thread, which still holds the old one until its pipe drains, can only
+    // ever write into the empty parser left behind, never into the history
+    // the new process now owns.
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(reinit_parser_keep_history(&pane.term, size.rows, size.cols, app.history_limit, app.allow_alternate_screen)));
     let term_reader = term.clone();
     let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
@@ -3679,6 +3710,42 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.spawned_at = Some(std::time::Instant::now());
 
     Ok(())
+}
+
+/// The parser a respawned pane starts from (#708): the pane's own screen put
+/// through tmux's `screen_reinit`, so the history survives and everything
+/// else (visible rows, cursor, modes, alternate screen) starts over.
+///
+/// The screen is MOVED out of `old`, which keeps an empty parser: the dead
+/// process's reader thread may still hold `old` and flush a last read into it,
+/// and that must not land in the history the new process now owns.  A
+/// poisoned lock (its reader panicked) has nothing trustworthy to keep, so the
+/// pane starts empty, as it did before.  The size follows the pane in case it
+/// changed while the process was dead.
+pub(crate) fn reinit_parser_keep_history(
+    old: &Arc<Mutex<vt100::Parser>>,
+    rows: u16,
+    cols: u16,
+    history_limit: usize,
+    allow_alternate_screen: bool,
+) -> vt100::Parser {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let mut parser = match old.lock() {
+        // What is left behind is a full screen at the pane's size (no
+        // history), so a late flush from the old reader is processed exactly
+        // as it would have been before. A 1x1 placeholder panicked the server
+        // on the first wrapped line (see Grid::col_wrap).
+        Ok(mut guard) => std::mem::replace(&mut *guard, vt100::Parser::new(rows, cols, 0)),
+        Err(_) => vt100::Parser::new(rows, cols, history_limit),
+    };
+    let screen = parser.screen_mut();
+    screen.reinit_keep_history();
+    if screen.size() != (rows, cols) {
+        screen.set_size(rows, cols);
+    }
+    screen.set_allow_alternate_screen(allow_alternate_screen);
+    parser
 }
 
 /// Respawn a fresh default shell into a SPECIFIC pane (by window index + tree
@@ -3819,3 +3886,7 @@ mod test_issue669_border_status_mouse_rows;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue689_break_swap_pane.rs"]
 mod tests_issue689_break_swap_pane;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue708_respawn_history_env.rs"]
+mod test_issue708_respawn_history_env;

@@ -2877,7 +2877,9 @@ pub enum CtrlReq {
     /// event loop on a `?` and terminate the whole server — every window and
     /// pane destroyed — while the client still exited 0 with empty output.
     /// tmux answers `respawn pane failed: <cause>` at exit 1 and keeps running.
-    RespawnPane(Option<String>, bool, Option<String>, bool, mpsc::Sender<Result<(), String>>),
+    /// Fields: workdir (-c), kill (-k), command, empty (-E), reply, and the
+    /// `-e KEY=VALUE` pairs for the new process (#708).
+    RespawnPane(Option<String>, bool, Option<String>, bool, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
     /// set-option -p (issue #580): pane-scoped option. Fields: raw -t pane
     /// target ("" = active pane), option name, value ("" = unset via -u/-U),
     /// reply ("" on success, "ERROR: ..." otherwise). Unwired pane options
@@ -3194,7 +3196,8 @@ pub enum CtrlReq {
     /// `RespawnPane` and therefore shared its server-killing `?`; the spawn
     /// failures (bad `-c`, unspawnable command) are routine and belong to the
     /// requesting client. tmux: `respawn window failed: <cause>`, exit 1.
-    RespawnWindow(Option<String>, Option<String>, mpsc::Sender<Result<(), String>>),
+    /// The last field is the `-e KEY=VALUE` environment (#708).
+    RespawnWindow(Option<String>, Option<String>, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
     FocusIn,
     FocusOut,
     CommandPrompt(String),

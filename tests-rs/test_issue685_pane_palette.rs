@@ -127,9 +127,9 @@ fn already_painted_cells_follow_a_later_palette_change() {
 
 #[test]
 fn ris_puts_the_index_back() {
-    // A respawned pane gets a brand new vt100::Parser (window_ops.rs
-    // respawn_active_pane), so its palette starts empty; RIS is the in band
-    // equivalent and tmux clears the palette there too (input.c:1407).
+    // RIS clears the palette, as tmux does (input.c:1407). A respawn does
+    // NOT: tmux keeps the palette on the window_pane across spawn_pane, and
+    // so does psmux since #708 (Screen::reinit_keep_history).
     let rows = rows_for(b"\x1b]4;4;rgb:00/00/80\x1b\\\x1bc\x1b[44mAAA");
     assert_eq!(run_with(&rows, "AAA").bg, "idx:4");
 }
@@ -217,7 +217,7 @@ fn publishing_and_withdrawing_a_mirrored_palette() {
     entries[4] = Some((0, 0, 128));
     crate::types::publish_pane_palette(id, entries);
     assert_eq!(crate::types::pane_palette(id).and_then(|p| p[4]), Some((0, 0, 128)));
-    // An all-None publish is how a respawn or an OSC 104 withdraws the entry.
+    // An all-None publish is how an OSC 104 withdraws the entry.
     crate::types::publish_pane_palette(id, [None; 16]);
     assert_eq!(crate::types::pane_palette(id).and_then(|p| p[4]), None);
 }

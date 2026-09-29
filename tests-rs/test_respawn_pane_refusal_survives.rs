@@ -145,7 +145,7 @@ fn active_pane_is_dead(app: &AppState) -> bool {
 #[test]
 fn live_pane_without_k_is_refused_as_a_value() {
     let mut app = app_with_windows("rsp_unit", 2);
-    let err = crate::window_ops::respawn_active_pane(&mut app, None, None, false, None, false)
+    let err = crate::window_ops::respawn_active_pane(&mut app, None, None, false, None, false, &[])
         .expect_err("a live pane without -k must be refused");
     // tmux spawn.c: xasprintf(cause, "pane %s:%d.%u still active", ...)
     assert_eq!(
@@ -164,7 +164,7 @@ fn a_refusal_leaves_the_session_untouched() {
     let mut app = app_with_windows("rsp_unit", 2);
     let before_windows = app.windows.len();
     let before_active = app.active_idx;
-    assert!(crate::window_ops::respawn_active_pane(&mut app, None, None, false, None, false).is_err());
+    assert!(crate::window_ops::respawn_active_pane(&mut app, None, None, false, None, false, &[]).is_err());
     assert_eq!(app.windows.len(), before_windows, "no window may be lost to a refusal");
     assert_eq!(app.active_idx, before_active);
     assert!(!active_pane_is_dead(&app), "the refused pane must still be running");
@@ -178,7 +178,7 @@ fn k_on_a_live_pane_and_a_bare_respawn_of_a_dead_pane_both_pass_the_guard() {
     // -k on a live pane: allowed. `-E` keeps this unit test from spawning a
     // real shell; the shell path is covered end to end by the .ps1.
     let mut app = app_with_windows("rsp_unit", 1);
-    crate::window_ops::respawn_active_pane(&mut app, None, None, true, None, true)
+    crate::window_ops::respawn_active_pane(&mut app, None, None, true, None, true, &[])
         .expect("-k on a live pane must be allowed");
 
     // A dead pane, no -k: allowed.
@@ -189,7 +189,7 @@ fn k_on_a_live_pane_and_a_bare_respawn_of_a_dead_pane_both_pass_the_guard() {
             p.dead = true;
         }
     }
-    crate::window_ops::respawn_active_pane(&mut app, None, None, false, None, true)
+    crate::window_ops::respawn_active_pane(&mut app, None, None, false, None, true, &[])
         .expect("a dead pane must be respawnable without -k");
 }
 

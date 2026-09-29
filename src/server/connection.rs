@@ -276,6 +276,16 @@ fn respawn_positional_command(args: &[&str]) -> Option<String> {
     None
 }
 
+/// Every `-e KEY=VALUE` of a spawning command, in order. Like tmux's
+/// `environ_put`, a value without `=` is ignored. Used by respawn-pane and
+/// respawn-window (#708); new-window and split-window collect theirs inline.
+pub(crate) fn env_flag_values(args: &[&str]) -> Vec<(String, String)> {
+    args.windows(2)
+        .filter(|w| w[0] == "-e")
+        .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect()
+}
+
 fn without_outer_target<'a>(cmd: &str, args: &[&'a str]) -> Vec<&'a str> {
     let scan_end = crate::cli::outer_target_scan_end(cmd, args);
     let mut filtered = Vec::with_capacity(args.len());
@@ -2814,7 +2824,10 @@ match cmd {
         // command). Fire-and-forget here meant the CLI exited 0 with empty
         // output for a refusal that had just taken the whole server down.
         let (resp_s, resp_r) = mpsc::channel();
-        let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty, resp_s));
+        // -e KEY=VALUE for the new process (#708). It was parsed (and kept
+        // out of the command operand) but never sent, so it was dropped.
+        let env_sets = env_flag_values(&args);
+        let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty, resp_s, env_sets));
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
             if !persistent {
                 let _ = writeln!(write_stream, "ERROR: {}", e);
@@ -4593,7 +4606,8 @@ match cmd {
             .or_else(|| respawn_positional_command(&args));
         let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
         let (resp_s, resp_r) = mpsc::channel();
-        let _ = tx.send(CtrlReq::RespawnWindow(workdir, command, resp_s));
+        let env_sets = env_flag_values(&args);
+        let _ = tx.send(CtrlReq::RespawnWindow(workdir, command, resp_s, env_sets));
         if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
             if !persistent {
                 let _ = writeln!(write_stream, "ERROR: {}", e);
@@ -5754,7 +5768,8 @@ fn dispatch_control_command(
             // Control mode: a refused respawn must come back as %error, not as
             // a successful %end (the refusal used to kill the server outright).
             let (resp_s, resp_r) = mpsc::channel();
-            let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty, resp_s));
+            let env_sets = env_flag_values(&args);
+            let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty, resp_s, env_sets));
             match resp_r.recv_timeout(Duration::from_secs(5)) {
                 Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
                 _ => { let _ = resp_tx.send(String::new()); }

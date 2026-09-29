@@ -299,6 +299,39 @@ impl Screen {
         self.grid.history_bytes()
     }
 
+    /// Reset the screen for a new process while KEEPING the main grid's
+    /// history, the way tmux's `screen_reinit` (screen.c) does when
+    /// `respawn-pane` / `respawn-window` reuse a pane (spawn.c, psmux issue
+    /// #708).
+    ///
+    /// Exactly what tmux resets goes: the visible rows are cleared WITHOUT
+    /// being pushed into history (`grid_clear_lines(hsize, sy)`), the cursor
+    /// goes home, the scroll region, saved cursor, modes (cursor keys, keypad,
+    /// mouse, bracketed paste, ...), attributes, title and progress are reset,
+    /// and the alternate screen is left.  The history above the visible rows
+    /// survives, still under the grid's own limit, and so does the hyperlink
+    /// table those history cells point into, plus the `alternate-screen`
+    /// option, which belongs to the pane rather than to the process.
+    ///
+    /// The OSC 4 palette survives as well: tmux keeps it on the
+    /// `window_pane` and clears it only on RIS, OSC 104 and `send-keys -R`
+    /// (input.c, cmd-send-keys.c), never on a respawn.
+    pub fn reinit_keep_history(&mut self) {
+        let size = self.grid.size();
+        let scrollback_len = self.grid.scrollback_len();
+        let history = self.grid.take_scrollback();
+        let hyperlinks = std::mem::take(&mut self.hyperlinks);
+        let palette = self.palette.take();
+        let palette_generation = self.palette_generation;
+        let allow_alternate_screen = self.allow_alternate_screen;
+        *self = Self::new(size, scrollback_len);
+        self.grid.put_scrollback(history);
+        self.hyperlinks = hyperlinks;
+        self.palette = palette;
+        self.palette_generation = palette_generation;
+        self.allow_alternate_screen = allow_alternate_screen;
+    }
+
     /// Updates the maximum scrollback buffer size for the main grid.  Rows
     /// in excess of the new limit are trimmed from the oldest end.  The
     /// alternate grid is intentionally left at zero scrollback (apps like
