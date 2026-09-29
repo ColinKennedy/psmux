@@ -185,6 +185,18 @@ impl CounterLock {
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // Windows reports a lock file that another process is in the
+                // middle of deleting as PermissionDenied (delete pending), not
+                // AlreadyExists: measured at about 1 in 18 contended attempts with
+                // 8 processes. It is contention, so it waits like AlreadyExists.
+                // Proceeding here let two processes read the same counter, and
+                // this caller's Drop then removed the real holder's lock file:
+                // 8 processes x 150 allocations handed out as few as 677 unique
+                // ids of 1200. A directory that is genuinely denied spends the
+                // budget and proceeds, which is what every failure did before.
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 // The data directory is not there yet, which is what a first run
                 // on a machine looks like. Create it once and try again: no
                 // amount of waiting makes a missing directory appear, and the

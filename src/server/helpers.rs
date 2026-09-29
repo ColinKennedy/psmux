@@ -83,18 +83,26 @@ pub(crate) fn serialize_bindings_json(app: &AppState) -> String {
 /// currently ends with `}`. Emits nothing when the option is unset or `off`.
 /// Ships the option value, the active pane's scrollback size (for absolute /
 /// hybrid numbering), and the optional gutter styles.
+///
+/// The scrollback size also ships whenever the client is in copy mode with the
+/// option off, because the position indicator needs it as
+/// `copy_position_limit` (tmux `window_copy_formats`, #702).
 pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
-    let Some(cln) = app.user_options.get("copy-mode-line-numbers") else { return; };
-    if cln == "off" || !buf.ends_with('}') { return; }
+    if !buf.ends_with('}') { return; }
+    let cln = app.user_options.get("copy-mode-line-numbers").filter(|v| v.as_str() != "off");
+    let in_copy = matches!(app.mode, crate::types::Mode::CopyMode | crate::types::Mode::CopySearch { .. });
+    if cln.is_none() && !in_copy { return; }
     let hsize = app.windows.get(app.active_idx)
         .and_then(|win| crate::tree::active_pane(&win.root, &win.active_path))
         .and_then(|p| p.term.lock().ok().map(|g| g.screen().scrollback_filled()))
         .unwrap_or(0);
     buf.pop();
+    buf.push_str(",\"copy_hsize\":");
+    buf.push_str(&hsize.to_string());
+    let Some(cln) = cln else { buf.push('}'); return; };
     buf.push_str(",\"copy_mode_line_numbers\":\"");
     buf.push_str(&json_escape_string(cln));
-    buf.push_str("\",\"copy_hsize\":");
-    buf.push_str(&hsize.to_string());
+    buf.push('"');
     if let Some(st) = app.user_options.get("copy-mode-line-number-style") {
         buf.push_str(",\"copy_mode_line_number_style\":\"");
         buf.push_str(&json_escape_string(st));

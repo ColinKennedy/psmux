@@ -58,6 +58,33 @@ $previousEchoLog = $env:PSMUX_MOUSE_ECHO_LOG
 $previousMoveLog = $env:PSMUX_MOUSE_MOVE_LOG
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $clientProcess = $null
+# Sweep 2026-09-27_02-44-24: this suite failed 3 of 3 with the physical pointer at
+# the screen centre and passed 3 of 3 with it parked in a corner. Windows sends a
+# WM_MOUSEMOVE to a window that appears under the pointer, conhost turns it into a
+# MOUSE_MOVED record, and psmux forwards it as an any-motion hover, which is
+# correct (tmux does the same under 1003) but lands in the child before the
+# injected record and breaks the "exactly one record" assertion. So the pointer
+# is parked in the bottom right corner for the length of the test and put back
+# afterwards. If the desktop refuses the move the assertion falls back to "the
+# injected record arrived" and says so.
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public struct HoverPt { public int X; public int Y; }
+public static class HoverCursor {
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out HoverPt p);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);
+}
+"@
+$pointerSaved = New-Object HoverPt
+$pointerParked = $false
+try {
+    if ([HoverCursor]::GetCursorPos([ref]$pointerSaved)) {
+        $w = [HoverCursor]::GetSystemMetrics(0); $h = [HoverCursor]::GetSystemMetrics(1)
+        $pointerParked = [HoverCursor]::SetCursorPos($w - 2, $h - 2)
+    }
+} catch { $pointerParked = $false }
+Write-Host "  [INFO] pointer was at $($pointerSaved.X),$($pointerSaved.Y); parked in the corner: $pointerParked"
 
 try {
     $env:PSMUX_MOUSE_ECHO_LOG = $mouseLog
@@ -139,10 +166,29 @@ try {
             break
         }
     }
-    $hoverDelivered = $receiveLines.Count -eq 1 -and $receiveLines[0] -eq $expectedRecord
-    Test "Attached-client hover produces exactly $expectedRecord" $hoverDelivered
+    if ($pointerParked) {
+        $hoverDelivered = $receiveLines.Count -eq 1 -and $receiveLines[0] -eq $expectedRecord
+        Test "Attached-client hover produces exactly $expectedRecord" $hoverDelivered
+    } else {
+        # The physical pointer could not be moved, so real motion over the new
+        # window may precede the injected record. Require the injected record
+        # and nothing that is not a hover.
+        $hoverDelivered = ($receiveLines -contains $expectedRecord) -and
+            (@($receiveLines | Where-Object { $_ -notmatch "^RECV (<ESC>\[<35;\d+;\d+M)+  \|" }).Count -eq 0)
+        Test "Attached-client hover delivers $expectedRecord (pointer not parked, real motion tolerated)" $hoverDelivered
+    }
+    if (-not $hoverDelivered) {
+        # Sweep 2026-09-27_02-44-24 failed this assertion and the log carried no
+        # evidence of what the child saw, so the artifacts were gone before anyone
+        # could look. Print the whole child log and the injector log on failure.
+        Write-Host "  [INFO] child received $($receiveLines.Count) RECV line(s):"
+        foreach ($line in $receiveLines) { Write-Host "         $line" }
+        if (Test-Path $mouseLog) { Write-Host "  [INFO] child log:"; Get-Content $mouseLog | ForEach-Object { Write-Host "         $_" } }
+        if (Test-Path $injectorLog) { Write-Host "  [INFO] injector log:"; Get-Content $injectorLog | ForEach-Object { Write-Host "         $_" } }
+    }
 }
 finally {
+    if ($pointerParked) { [void][HoverCursor]::SetCursorPos($pointerSaved.X, $pointerSaved.Y) }
     & $psmux.Source -L $namespace kill-server 2>$null
     if ($null -ne $clientProcess -and -not $clientProcess.HasExited) {
         Stop-Process -Id $clientProcess.Id -Force -ErrorAction SilentlyContinue
