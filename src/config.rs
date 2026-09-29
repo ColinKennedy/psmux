@@ -1506,6 +1506,24 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
                     return true;
                 }
             }
+            // A catalog option this match does not route is still a real
+            // option: hand it to the runtime setter so `set -g NAME VALUE` in
+            // a config file lands exactly where the same command typed at
+            // runtime does. Before this, such an option (alternate-screen,
+            // message-limit, history-file-limit) warned "unknown option" and
+            // was parked in user_options where nothing reads it, so
+            // `set -g alternate-screen off` in psmux.conf left the pane
+            // honouring the alternate screen. The value was already
+            // validated against the catalog at the top of this function.
+            if crate::server::option_catalog::is_known_option(key) {
+                if let Err(error) =
+                    crate::server::options::apply_set_option(app, key, value, false)
+                {
+                    warn_config(app, error);
+                    return false;
+                }
+                return true;
+            }
             // Store @-prefixed user/plugin options separately from environment
             // so they don't leak into child shells (#105).
             if key.starts_with('@') {
@@ -2809,3 +2827,7 @@ mod tests_issue619_set_option_unset_only;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue619_set_option_already_set.rs"]
 mod tests_issue619_set_option_already_set;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_config_option_parity.rs"]
+mod tests_config_option_parity;
