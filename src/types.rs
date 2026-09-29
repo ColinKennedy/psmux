@@ -1157,6 +1157,9 @@ pub struct CopyModeState {
     /// Mark and last-jump are pane-local like the rest of copy state (#498)
     pub mark: Option<(usize, u16, u16)>,
     pub last_jump: Option<(u8, char)>,
+    /// `toggle-position` is pane-local too, so a pane parked in copy mode keeps
+    /// its own answer while another pane is focused (#704)
+    pub hide_position: bool,
     /// true when the pane was in CopySearch (not CopyMode)
     pub in_search: bool,
     /// search input buffer (only meaningful when in_search == true)
@@ -1349,6 +1352,16 @@ pub struct AppState {
     /// When true the pane keeps following live output while in copy mode
     /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
     pub copy_refresh_live: bool,
+    /// When true the copy-mode position indicator is not drawn. Toggled by `P`
+    /// (`toggle-position`) and set on entry by `copy-mode -H` (#704). It lives
+    /// on the mode the way tmux's `hide_position` does, so leaving copy mode
+    /// and coming back shows the indicator again.
+    pub copy_hide_position: bool,
+    /// Set by a copy-mode command that changes only how the mode is drawn, with
+    /// nothing in the pane or the layout to notice. The server loop turns it
+    /// into one frame and clears it. tmux says the same thing by returning
+    /// `WINDOW_COPY_CMD_REDRAW` from the command (#704).
+    pub copy_needs_redraw: bool,
     /// Named registers a-z for copy-mode yank/paste
     pub named_registers: std::collections::HashMap<char, String>,
     pub display_map: Vec<(usize, Vec<usize>)>,
@@ -1569,6 +1582,10 @@ pub struct AppState {
     /// lookup table lives in the vt100 crate, which is where every width
     /// decision is made.
     pub codepoint_widths: Vec<String>,
+    /// terminal-overrides: server-scope ARRAY of `pattern:cap...` entries,
+    /// raw strings in tmux order. The attach client honours smcup/rmcup from
+    /// it (issue #700, see crate::terminal_overrides).
+    pub terminal_overrides: Vec<String>,
     /// Config parse warnings (unknown command/option, malformed value, missing
     /// args) collected during a config load or source-file, surfaced to the
     /// user instead of being silently ignored (issue #370 follow-up).
@@ -1786,6 +1803,19 @@ impl AppState {
             self.current_key_table = None;
             if self.latest_client_id == Some(cid) {
                 self.latest_client_id = self.client_registry.keys().max().copied();
+            }
+            // Record whether the connection was still tracked at reap time.
+            // That is the normal order for a detach the client asked for
+            // (`client-detach` on its own connection, prefix d): the registry
+            // entry goes first and the client closes the socket itself right
+            // after. It is only a fault when no such request precedes it and
+            // no `client-reader` line follows, which is the deaf client that
+            // `teardown_client_connection` exists to prevent.
+            if has_persistent_stream(cid) {
+                crate::debug_log::server_log(
+                    "client-reap",
+                    &format!("client {cid}: registry entry reaped, stream still registered (expected for a client initiated detach)"),
+                );
             }
             true
         } else {
@@ -2247,6 +2277,8 @@ impl AppState {
             copy_mark: None,
             copy_last_jump: None,
             copy_refresh_live: false,
+            copy_hide_position: false,
+            copy_needs_redraw: false,
             named_registers: std::collections::HashMap::new(),
             display_map: Vec::new(),
             key_tables: std::collections::HashMap::new(),
@@ -2361,6 +2393,7 @@ impl AppState {
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
             codepoint_widths: Vec::new(),
+            terminal_overrides: Vec::new(),
             config_warnings: Vec::new(),
             config_warn_line: None,
             set_clipboard: "on".to_string(),
@@ -2626,7 +2659,9 @@ pub enum CtrlReq {
     PrefixBegin,
     PrefixEnd,
     CopyEnter,
-    CopyEnterPageUp,
+    /// A `copy-mode` command with its flags: `-q` leaves the mode, `-H`
+    /// hides the position indicator on a fresh entry, `-u` pages up (#704).
+    CopyModeCmd(crate::copy_mode::CopyModeFlags),
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
@@ -2842,7 +2877,9 @@ pub enum CtrlReq {
     /// event loop on a `?` and terminate the whole server — every window and
     /// pane destroyed — while the client still exited 0 with empty output.
     /// tmux answers `respawn pane failed: <cause>` at exit 1 and keeps running.
-    RespawnPane(Option<String>, bool, Option<String>, bool, mpsc::Sender<Result<(), String>>),
+    /// Fields: workdir (-c), kill (-k), command, empty (-E), reply, and the
+    /// `-e KEY=VALUE` pairs for the new process (#708).
+    RespawnPane(Option<String>, bool, Option<String>, bool, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
     /// set-option -p (issue #580): pane-scoped option. Fields: raw -t pane
     /// target ("" = active pane), option name, value ("" = unset via -u/-U),
     /// reply ("" on success, "ERROR: ..." otherwise). Unwired pane options
@@ -3159,7 +3196,8 @@ pub enum CtrlReq {
     /// `RespawnPane` and therefore shared its server-killing `?`; the spawn
     /// failures (bad `-c`, unspawnable command) are routine and belong to the
     /// requesting client. tmux: `respawn window failed: <cause>`, exit 1.
-    RespawnWindow(Option<String>, Option<String>, mpsc::Sender<Result<(), String>>),
+    /// The last field is the `-e KEY=VALUE` environment (#708).
+    RespawnWindow(Option<String>, Option<String>, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
     FocusIn,
     FocusOut,
     CommandPrompt(String),
@@ -3628,6 +3666,36 @@ pub fn deregister_persistent_stream(client_id: u64) {
     }
 }
 
+/// True when a persistent stream is still tracked for this client id.
+///
+/// The reaper logs it so a registry entry removed while the connection is
+/// still open can be told apart in the debug log.
+pub fn has_persistent_stream(client_id: u64) -> bool {
+    PERSISTENT_STREAMS
+        .lock()
+        .map(|v| v.iter().any(|(cid, _)| *cid == client_id))
+        .unwrap_or(false)
+}
+
+/// Close everything a client's connection owns: the tracked TCP stream, its
+/// frame-push slot, its directive channel and its frame channel.
+///
+/// The client registry and the connection are two different things, and
+/// dropping one without the other leaves a client that keeps *receiving*
+/// frames (its writer thread and persistent stream are untouched) while
+/// nothing ever reads its input again (the reader that just ended was the only
+/// reader there is). That client is invisible in `list-clients` and completely
+/// dead to the user: clicks, wheel and keystrokes do nothing while the screen
+/// keeps updating, and the only way out is to restart the client by hand.
+///
+/// Closing the connection instead makes the client see EOF, so it reconnects
+/// under a fresh client id and its input works again.
+pub fn teardown_client_connection(client_id: u64) {
+    shutdown_client_stream(client_id);
+    deregister_persistent_stream(client_id);
+    deregister_frame_channel(client_id);
+}
+
 /// Shut down all tracked persistent client streams so their readers get EOF.
 pub fn shutdown_persistent_streams() {
     if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
@@ -3838,6 +3906,10 @@ pub struct ParsedTarget {
 #[cfg(test)]
 #[path = "../tests-rs/test_pr267_backpressure_proof.rs"]
 mod tests_pr267_backpressure;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_client_connection_teardown.rs"]
+mod tests_client_connection_teardown;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue434_reap_client.rs"]

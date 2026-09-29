@@ -90,8 +90,8 @@ This is the reference for the commands **psmux itself** accepts and the flags **
 | `rename-window` | `renamew` | none, takes the new name as a positional argument | CLI, SRV, CFG, CTL |
 | `resize-pane` | `resizep` | `UDLRZx:y:t:` | CLI, SRV, CFG, CTL |
 | `resize-window` | `resizew` | `aADLRUx:y:t:` | CLI, SRV, CFG, CTL |
-| `respawn-pane` | `respawnp`, `resp` | `kc:t:` plus `-- <command>` | CLI, SRV, CFG, CTL |
-| `respawn-window` | `respawnw` | none | CLI, SRV, CFG |
+| `respawn-pane` | `respawnp`, `resp` | `Ekc:e:t:` plus `-- <command>` | CLI, SRV, CFG, CTL |
+| `respawn-window` | `respawnw` | `kc:e:t:` plus a command | CLI, SRV, CFG |
 | `rotate-window` | `rotatew` | `UDt:` | CLI, SRV, CFG, CTL |
 | `run-command` | `runcmd` | none, takes the command line as positional arguments | SRV, CTL |
 | `run-shell` | `run` | `b` | CLI, SRV, CFG |
@@ -277,7 +277,9 @@ Five mouse wire commands are an exception and are genuinely usable for scripting
 - Accepted but ignored: `-C`, `-N`, `-T`, `-i`, `-r`, `-Z`, `-t`
 
 **respawn-window** (`respawnw`)
-- No flags. Respawns the active pane of the window.
+- Boolean: `-k`
+- Value: `-c` (start directory), `-e` (`KEY=VALUE`, repeatable), `-t` (target window)
+- Respawns the active pane of the window, keeping its history like `respawn-pane`.
 
 **list-windows** (`lsw`)
 - Boolean: `-a` (all sessions), `-J` (JSON output, a psmux extension)
@@ -345,9 +347,14 @@ A psmux extension that creates a pane floating above the tiled layout.
 
 **respawn-pane** (`respawnp`, `resp`)
 - Boolean: `-k` (kill the existing process first)
-- Value: `-c` (start directory), `-t` (target pane)
+- Boolean: `-E` (respawn as an empty pane with no process)
+- Value: `-c` (start directory), `-e` (`KEY=VALUE` for the new process, repeatable,
+  applied over the global and session environment; later respawns do not
+  inherit it), `-t` (target pane)
 - `-- <command>` is honored and replaces the pane command.
-- Not accepted: `-e`
+- The pane keeps its history. As in tmux (`screen_reinit`), only the visible
+  rows are cleared, the cursor is homed, and copy mode and the alternate screen
+  are left.
 - Without `-k`, a pane whose process is still running is refused, like tmux:
   `respawn pane failed: pane <session>:<window>.<pane> still active` on stderr
   at exit 1. The session and the pane are left exactly as they were.
@@ -392,7 +399,8 @@ A psmux extension that creates a pane floating above the tiled layout.
 ### Copy and paste commands
 
 **copy-mode**
-- Boolean: `-u` (scroll up one page on entry), `-d` (scroll down), `-e` (exit at the bottom), `-H` (hide the position indicator), `-q` (quit copy mode)
+- Boolean: `-u` (scroll up one page on entry), `-H` (hide the position indicator on a fresh entry; `P` or `send-keys -X toggle-position` flips it inside copy mode), `-q` (leave copy mode or clock mode instead of entering)
+- Accepted but ignored: `-d`, `-e`
 - Value: `-t` (target pane)
 - Not accepted: `-M`, `-S`, `-s`
 - In control mode `copy-mode` is a success returning no-op, because iTerm2 implements copy mode locally on captured content.

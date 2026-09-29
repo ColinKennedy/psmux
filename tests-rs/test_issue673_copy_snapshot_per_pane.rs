@@ -164,6 +164,7 @@ fn parked_copy_state(offset: usize) -> CopyModeState {
         register: None,
         mark: None,
         last_jump: None,
+        hide_position: false,
         in_search: false,
         search_input: String::new(),
         search_input_forward: true,

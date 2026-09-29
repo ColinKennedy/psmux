@@ -471,6 +471,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "main-pane-width" => app.main_pane_width.to_string(),
         "main-pane-height" => app.main_pane_height.to_string(),
         "codepoint-widths" => app.codepoint_widths.join(","),
+        "terminal-overrides" => app.terminal_overrides.join(","),
         "command-alias" => {
             app.command_aliases.iter()
                 .map(|(k, v)| format!("{}={}", k, v))
@@ -802,6 +803,9 @@ pub(crate) fn apply_set_option(
             }
         }
         "codepoint-widths" => { set_codepoint_widths(app, value); }
+        "terminal-overrides" => {
+            app.terminal_overrides = crate::terminal_overrides::split_array(value);
+        }
         "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1" || value == "yes"; }
         "bold-is-bright" => {
             app.bold_is_bright = matches!(value, "on" | "true" | "1" | "yes");
