@@ -312,6 +312,33 @@ try {
         else { Write-Fail "client live view: $((($live | Where-Object { $_.Trim() }) | Select-Object -First 3) -join ' | ')" }
         if ((Run-P @('has-session', '-t', $tuiSess)).Code -eq 0) { Write-Pass "attached client session alive after the respawns" } else { Write-Fail "attached session died" }
     }
+
+    # ---- 7. respawn of a ONE row pane that prints long lines -----------------
+    # Found while fixing #708. A respawn opens a new ConPTY at the pane's size;
+    # born at one row, it leaves long lines to the terminal's autowrap, and
+    # vt100 Grid::col_wrap computed `0 - 1` for the row that wrapped and
+    # panicked the server (master 39ac085: died at the first respawn in 4 of
+    # 5 runs; crash.log `grid.rs:813 unwrap on None`).
+    Write-Head "7. respawn-pane -k of a one row pane printing long lines"
+    $FLOOD = Join-Path $TMP "flood.cmd"
+    Set-Content -Path $FLOOD -Encoding ASCII -Value @(
+        '@echo off',
+        ('for /L %%n in (1,1,20000) do @echo flood_%1_%%n_' + ('x' * 140))
+    )
+    $fa = ((P new-window -d -P -F '#{pane_id}' -t "${SESS}:" "$FLOOD A") -join '').Trim()
+    $fb = ((P split-window -d -P -F '#{pane_id}' -t $fa "$FLOOD B") -join '').Trim()
+    P resize-pane -t $fb -y 1 | Out-Null
+    Write-Info "one row pane $fb height: $(Field $fb '#{pane_height}')"
+    $diedAt = -1
+    for ($i = 0; $i -lt 8; $i++) {
+        foreach ($t in @($fa, $fb)) {
+            Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 250)
+            P respawn-pane -k -t $t "$FLOOD R$i" | Out-Null
+        }
+        if ((Run-P @('has-session', '-t', $SESS)).Code -ne 0) { $diedAt = $i; break }
+    }
+    if ($diedAt -lt 0) { Write-Pass "server alive after 16 respawns of flooding panes, one of them a single row" }
+    else { Write-Fail "server died at respawn round $diedAt (one row pane, long lines)" }
 }
 finally {
     & $PSMUX -L $NS kill-server 2>&1 | Out-Null
