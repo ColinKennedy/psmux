@@ -3211,18 +3211,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::PrefixBegin => { app.client_prefix_active = true; app.current_key_table = None; state_dirty = true; }
                 CtrlReq::PrefixEnd => { app.client_prefix_active = false; state_dirty = true; }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); hook_event = Some("pane-mode-changed"); }
-                CtrlReq::CopyEnterHidden => {
-                    crate::copy_mode::enter_copy_mode_hidden(&mut app);
-                    hook_event = Some("pane-mode-changed");
-                }
-                CtrlReq::CopyEnterPageUp => {
-                    if crate::copy_mode::enter_copy_mode_page_up(&mut app) {
-                        hook_event = Some("pane-mode-changed");
-                    } else {
-                        // scroll-enter-copy-mode is off: forward PageUp to the
-                        // active pane so apps like less/vim/WSL receive it (#284).
-                        send_text_to_active(&mut app, "\x1b[5~")?;
-                        echo_pending_until = Some(Instant::now());
+                CtrlReq::CopyModeCmd(flags) => {
+                    match crate::copy_mode::run_copy_mode_command(&mut app, flags) {
+                        crate::copy_mode::CopyModeOutcome::ModeChanged => {
+                            state_dirty = true;
+                            hook_event = Some("pane-mode-changed");
+                        }
+                        crate::copy_mode::CopyModeOutcome::Nothing => {}
+                        crate::copy_mode::CopyModeOutcome::ForwardPageUp => {
+                            // scroll-enter-copy-mode is off: forward PageUp to the
+                            // active pane so apps like less/vim/WSL receive it (#284).
+                            send_text_to_active(&mut app, "\x1b[5~")?;
+                            echo_pending_until = Some(Instant::now());
+                        }
                     }
                 }
                 CtrlReq::ClockMode => { app.mode = Mode::ClockMode; state_dirty = true; hook_event = Some("pane-mode-changed"); }

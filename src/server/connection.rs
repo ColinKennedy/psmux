@@ -4027,15 +4027,11 @@ match cmd {
         if !persistent { break; }
     }
     "copy-mode" => {
-        if args.iter().any(|a| *a == "-u") {
-            let _ = tx.send(CtrlReq::CopyEnterPageUp);
-        } else if args.iter().any(|a| *a == "-H") {
-            // tmux hides the position indicator for this entry only
-            // (`window-copy.c` `window_copy_init` reads the flag), #704.
-            let _ = tx.send(CtrlReq::CopyEnterHidden);
-        } else {
-            let _ = tx.send(CtrlReq::CopyEnter);
-        }
+        // `-q` leaves, `-H` hides the position indicator for this entry only
+        // (`window-copy.c` `window_copy_init` reads the flag), `-u` pages up,
+        // and they combine the way tmux's `cmd_copy_mode_exec` combines them
+        // (#704).
+        let _ = tx.send(CtrlReq::CopyModeCmd(crate::copy_mode::CopyModeFlags::parse(&args)));
     }
     "clock-mode" => { let _ = tx.send(CtrlReq::ClockMode); }
     // Overlay interaction commands (sent by client during active overlays)

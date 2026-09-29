@@ -186,3 +186,109 @@ fn the_client_draws_nothing_when_the_flag_is_set() {
     assert!(!row.contains('['), "the indicator must be gone, row was {row:?}");
     assert!(!row.contains('/'), "row was {row:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Follow up: the rest of `cmd_copy_mode_exec` (cmd-copy-mode.c).
+//
+// `window_pane_set_mode` returns 1 when the pane is already in copy mode, so
+// `window_copy_init` does not run again and `-H` is read only on a fresh
+// entry. `-q` runs `window_pane_reset_mode_all` before anything else, and `-u`
+// pages up after the entry, so `-u -H` is both.
+// ---------------------------------------------------------------------------
+
+use crate::copy_mode::{CopyModeFlags, CopyModeOutcome};
+
+fn flags(args: &[&str]) -> CopyModeFlags { CopyModeFlags::parse(args) }
+
+#[test]
+fn copy_mode_flags_parse_like_getopt() {
+    assert_eq!(flags(&[]), CopyModeFlags::default());
+    assert_eq!(flags(&["-H"]), CopyModeFlags { hide_position: true, ..Default::default() });
+    assert_eq!(flags(&["-q"]), CopyModeFlags { quit: true, ..Default::default() });
+    assert_eq!(flags(&["-u", "-H"]), CopyModeFlags { page_up: true, hide_position: true, ..Default::default() });
+    assert_eq!(flags(&["-uH"]), CopyModeFlags { page_up: true, hide_position: true, ..Default::default() });
+    // A target is a value, never flags: `-t -Hq` names a pane.
+    assert_eq!(flags(&["-t", "-Hq"]), CopyModeFlags::default());
+    assert_eq!(flags(&["-t%3", "-H"]), CopyModeFlags { hide_position: true, ..Default::default() });
+    assert_eq!(flags(&["-ut", "x", "-q"]), CopyModeFlags { page_up: true, quit: true, ..Default::default() });
+    // Flags that change neither the indicator nor the mode leave it plain.
+    assert_eq!(flags(&["-e", "-t", "s:0.1"]), CopyModeFlags::default());
+}
+
+#[test]
+fn plain_copy_mode_inside_copy_mode_keeps_the_hidden_indicator() {
+    let mut app = app_with_pane();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    crate::copy_mode::toggle_position(&mut app);
+    crate::copy_mode::run_copy_mode_command(&mut app, flags(&[]));
+    assert!(app.copy_hide_position, "tmux does not re-create the mode, so the toggle stands");
+    assert_eq!(parked_flag(&app), Some(true));
+}
+
+#[test]
+fn dash_h_inside_copy_mode_does_not_hide() {
+    let mut app = app_with_pane();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    crate::copy_mode::run_copy_mode_command(&mut app, flags(&["-H"]));
+    assert!(!app.copy_hide_position, "-H is read only when the mode is created");
+}
+
+#[test]
+fn dash_u_dash_h_enters_hidden_and_pages_up() {
+    let mut app = app_with_pane();
+    let out = crate::copy_mode::run_copy_mode_command(&mut app, flags(&["-u", "-H"]));
+    assert_eq!(out, CopyModeOutcome::ModeChanged);
+    assert!(matches!(app.mode, Mode::CopyMode));
+    assert!(app.copy_hide_position, "-u did not swallow -H");
+}
+
+#[test]
+fn dash_q_leaves_copy_mode() {
+    let mut app = app_with_pane();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    let out = crate::copy_mode::run_copy_mode_command(&mut app, flags(&["-q"]));
+    assert_eq!(out, CopyModeOutcome::ModeChanged);
+    assert!(matches!(app.mode, Mode::Passthrough), "-q leaves, it does not enter");
+    assert_eq!(parked_flag(&app), None, "and the pane forgets its copy state");
+}
+
+#[test]
+fn dash_q_leaves_clock_mode_too() {
+    let mut app = app_with_pane();
+    app.mode = Mode::ClockMode;
+    let out = crate::copy_mode::run_copy_mode_command(&mut app, flags(&["-q"]));
+    assert_eq!(out, CopyModeOutcome::ModeChanged);
+    assert!(matches!(app.mode, Mode::Passthrough));
+}
+
+#[test]
+fn dash_q_outside_a_mode_does_nothing() {
+    let mut app = app_with_pane();
+    let out = crate::copy_mode::run_copy_mode_command(&mut app, flags(&["-q"]));
+    assert_eq!(out, CopyModeOutcome::Nothing);
+    assert!(matches!(app.mode, Mode::Passthrough), "-q never enters copy mode");
+}
+
+#[test]
+fn a_bound_copy_mode_keeps_its_flags() {
+    // A binding goes through parse_command_to_action, and a plain
+    // Action::CopyMode would drop -H and -q on the way to the server.
+    use crate::types::Action;
+    for cmd in ["copy-mode -H", "copy-mode -q", "copy-mode -u", "copy-mode -uH"] {
+        match crate::commands::parse_command_to_action(cmd) {
+            Some(Action::Command(c)) => assert_eq!(c, cmd),
+            _ => panic!("{cmd} lost its flags"),
+        }
+    }
+    assert!(matches!(crate::commands::parse_command_to_action("copy-mode"), Some(Action::CopyMode)));
+}
+
+#[test]
+fn execute_command_string_honours_dash_h_and_dash_q() {
+    let mut app = app_with_pane();
+    crate::commands::execute_command_string(&mut app, "copy-mode -H").unwrap();
+    assert!(matches!(app.mode, Mode::CopyMode));
+    assert!(app.copy_hide_position, "the command path hides it too");
+    crate::commands::execute_command_string(&mut app, "copy-mode -q").unwrap();
+    assert!(matches!(app.mode, Mode::Passthrough), "the command path leaves on -q");
+}

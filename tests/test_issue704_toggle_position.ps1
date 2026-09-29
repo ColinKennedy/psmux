@@ -92,6 +92,9 @@ if ($proc.HasExited) {
 }
 
 Invoke-Psmux @('set-option','-g','copy-mode-line-numbers','off') | Out-Null
+# The speed check below scrolls with K, which only the vi table binds. Set it
+# here so the check runs on a default config instead of being skipped.
+Invoke-Psmux @('set-option','-g','mode-keys','vi') | Out-Null
 Invoke-Psmux @('send-keys','-t',$SESSION,'1..200 | ForEach-Object { "line$_" }','Enter') | Out-Null
 Start-Sleep -Seconds 3
 
@@ -217,6 +220,76 @@ if ($ind -ne "") {
 } else {
     Write-Fail "the hidden flag survived into a new copy mode entry"
 }
+
+# --- 6. copy-mode again inside copy mode keeps the toggle ------------------
+# tmux's window_pane_set_mode returns early for a pane already in copy mode, so
+# window_copy_init does not run and neither a plain entry nor -H touches the
+# flag (cmd-copy-mode.c).
+Write-Host ""
+Write-Host "--- copy-mode run again inside copy mode ---" -ForegroundColor Yellow
+Invoke-Psmux @('send-keys','-t',$SESSION,'-X','toggle-position') | Out-Null
+Start-Sleep -Milliseconds 1200
+Invoke-Psmux @('copy-mode','-t',$SESSION) | Out-Null
+Start-Sleep -Milliseconds 1200
+$ind = Get-Indicator
+if ($ind -eq "") { Write-Pass "a plain copy-mode inside copy mode keeps the indicator hidden" }
+else { Write-Fail "a plain copy-mode inside copy mode brought the indicator back ('$ind')" }
+Invoke-Psmux @('send-keys','-t',$SESSION,'-X','toggle-position') | Out-Null
+Start-Sleep -Milliseconds 1200
+Invoke-Psmux @('copy-mode','-H','-t',$SESSION) | Out-Null
+Start-Sleep -Milliseconds 1200
+$ind = Get-Indicator
+if ($ind -ne "") { Write-Pass "copy-mode -H inside copy mode leaves a shown indicator alone ('$ind')" }
+else { Write-Fail "copy-mode -H inside copy mode hid the indicator" }
+
+# --- 7. -u and -H together -------------------------------------------------
+Write-Host ""
+Write-Host "--- copy-mode -u -H ---" -ForegroundColor Yellow
+Invoke-Psmux @('send-keys','-t',$SESSION,'-X','cancel') | Out-Null
+Start-Sleep -Milliseconds 1000
+Invoke-Psmux @('copy-mode','-u','-H','-t',$SESSION) | Out-Null
+Start-Sleep -Milliseconds 1500
+$ind = Get-Indicator
+$sp = ((Invoke-Psmux @('display-message','-t',$SESSION,'-p','#{scroll_position}')) | Out-String).Trim()
+if ($ind -eq "" -and [int]$sp -gt 0) { Write-Pass "copy-mode -u -H pages up ($sp) with the indicator hidden" }
+else { Write-Fail "copy-mode -u -H gave scroll_position=$sp indicator='$ind'" }
+
+# --- 8. a key bound to copy-mode -H ----------------------------------------
+# tmux's own DoubleClick1Pane and TripleClick1Pane bindings use copy-mode -H,
+# so the flag has to survive the binding path, not just the CLI.
+Write-Host ""
+Write-Host "--- a key bound to copy-mode -H ---" -ForegroundColor Yellow
+Invoke-Psmux @('send-keys','-t',$SESSION,'-X','cancel') | Out-Null
+Start-Sleep -Milliseconds 1000
+if (-not (Test-Path $INJ)) {
+    Write-Skip "the key injector could not be built"
+} else {
+    Invoke-Psmux @('bind-key','-n','F5','copy-mode','-H') | Out-Null
+    & $INJ $proc.Id "{F5}" | Out-Null
+    Start-Sleep -Milliseconds 1500
+    $inMode = Get-InMode
+    $ind = Get-Indicator
+    if ($inMode -eq "1" -and $ind -eq "") { Write-Pass "F5 bound to copy-mode -H enters with the indicator hidden" }
+    else { Write-Fail "F5 bound to copy-mode -H gave in_mode=$inMode indicator='$ind'" }
+    Invoke-Psmux @('unbind-key','-n','F5') | Out-Null
+}
+
+# --- 9. copy-mode -q -------------------------------------------------------
+# tmux: `-q` runs window_pane_reset_mode_all and returns before any entry.
+Write-Host ""
+Write-Host "--- copy-mode -q ---" -ForegroundColor Yellow
+Invoke-Psmux @('copy-mode','-t',$SESSION) | Out-Null
+Start-Sleep -Milliseconds 1000
+Invoke-Psmux @('copy-mode','-q','-t',$SESSION) | Out-Null
+Start-Sleep -Milliseconds 1200
+$inMode = Get-InMode
+if ($inMode -eq "0" -and (Get-Indicator) -eq "") { Write-Pass "copy-mode -q leaves copy mode" }
+else { Write-Fail "copy-mode -q left in_mode=$inMode" }
+Invoke-Psmux @('copy-mode','-q','-t',$SESSION) | Out-Null
+Start-Sleep -Milliseconds 1200
+$inMode = Get-InMode
+if ($inMode -eq "0") { Write-Pass "copy-mode -q outside copy mode does not enter it" }
+else { Write-Fail "copy-mode -q outside copy mode entered it" }
 
 Write-Host ""
 Write-Host "=== Results ===" -ForegroundColor Magenta

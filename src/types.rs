@@ -2641,9 +2641,9 @@ pub enum CtrlReq {
     PrefixBegin,
     PrefixEnd,
     CopyEnter,
-    CopyEnterPageUp,
-    /// `copy-mode -H`: enter with the position indicator hidden.
-    CopyEnterHidden,
+    /// A `copy-mode` command with its flags: `-q` leaves the mode, `-H`
+    /// hides the position indicator on a fresh entry, `-u` pages up (#704).
+    CopyModeCmd(crate::copy_mode::CopyModeFlags),
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
