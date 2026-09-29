@@ -838,13 +838,23 @@ fn validate_dangling_flag_values(args: &[String]) {
 /// Call it only where a server was actually started or claimed. Attaching to a
 /// server that is already running reloads no config, so there is nothing new to
 /// report and the previous run's log is not this client's to print.
+///
+/// The round trip itself carries the warnings, asked of the server this client
+/// started, rather than reading them back from `config-warnings.log`. That file
+/// is one name for every server sharing the data directory, so another server
+/// loading or sourcing a config at the same moment could overwrite it between
+/// this server's write and this client's read, and the client printed the
+/// other server's warnings or lost its own (#706, second symptom). The log is
+/// only read when the server does not understand the request, which is a
+/// server built before it existed.
 fn surface_config_warnings(since_epoch: u64, detached: bool) {
-    if !detached {
-        let _ = send_control_with_response("list-windows\n".to_string());
-    }
-    let cfg_warnings = crate::server::read_fresh_config_warnings(since_epoch);
+    let reply = send_control_with_response("__config-warnings\n".to_string()).ok();
+    let (cfg_warnings, source) = match reply.as_deref().and_then(crate::server::parse_config_warnings_reply) {
+        Some(w) => (w, "server"),
+        None => (crate::server::read_fresh_config_warnings(since_epoch), "log"),
+    };
     crate::startup_trace::mark_detail("cli.cfgwarn",
-        &format!("found={} since={} detached={}", cfg_warnings.len(), since_epoch, detached));
+        &format!("found={} since={} detached={} from={}", cfg_warnings.len(), since_epoch, detached, source));
     if cfg_warnings.is_empty() {
         return;
     }

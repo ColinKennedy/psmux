@@ -230,6 +230,66 @@ if ($out -match 'config warning') {
     Write-Pass "a clean config prints nothing"
 }
 
+# --- 6. another server writing the shared log at the same time -------------
+Write-Host ""
+Write-Host "--- a second server writes config-warnings.log throughout ---" -ForegroundColor Yellow
+# config-warnings.log is one name for every server in the data directory. A
+# second server that sources a config while this one starts overwrites it, and
+# a client that reads the file back prints that server's warnings instead of its
+# own, or prints a warning for a clean config. The warnings have to come from
+# the server the client started. Here a second server re-sources its own bad
+# config every few ms for the whole run, which is the widest form of the window
+# two servers starting or reloading together open.
+if (-not (Test-Path $CONREAD)) {
+    Write-Skip "conread.exe could not be built, so the drawn screen cannot be read"
+} else {
+    New-DataDir "shared"
+    $cfgOther = Join-Path $root "other.conf"
+    $cfgMine = Join-Path $root "mine.conf"
+    Set-Content -Path $cfgOther -Encoding UTF8 -Value "set -g other-servers-option-zzz on"
+    Set-Content -Path $cfgMine -Encoding UTF8 -Value "set -g my-own-option-mmm on"
+    $nsO = "${NS}O"
+    Stop-Ns $nsO
+    & $PSMUX -L $nsO -f $cfgOther new-session -d -s o 2>&1 | Out-Null
+    $writer = Start-Job -ScriptBlock {
+        param($exe, $ns, $cfg, $dataDir)
+        $env:PSMUX_DATA_DIR = $dataDir
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 120) { & $exe -L $ns source-file $cfg 2>&1 | Out-Null; Start-Sleep -Milliseconds 20 }
+    } -ArgumentList $PSMUX, $nsO, $cfgOther, $env:PSMUX_DATA_DIR
+    Start-Sleep -Seconds 2
+    $runs = 5
+    $foreign = 0; $missing = 0; $cleanForeign = 0
+    for ($i = 1; $i -le $runs; $i++) {
+        foreach ($case in 'mine','clean') {
+            $cfg = if ($case -eq 'mine') { $cfgMine } else { $cfgOk }
+            $nsR = "${NS}R$i$case"
+            Stop-Ns $nsR
+            $cmd = "& '$PSMUX' -L $nsR -f '$cfg' new-session -s s"
+            $shell = Start-Process -FilePath "pwsh.exe" -ArgumentList "-NoExit","-NoProfile","-Command",$cmd -PassThru
+            Start-Sleep -Seconds 4
+            Stop-Ns $nsR
+            Start-Sleep -Seconds 2
+            $screen = (& $CONREAD $shell.Id 2>&1 | Out-String)
+            Stop-Process -Id $shell.Id -Force -EA SilentlyContinue
+            $sawOther = $screen -match 'other-servers-option-zzz'
+            if ($case -eq 'mine') {
+                if ($sawOther) { $foreign++ }
+                if ($screen -notmatch 'my-own-option-mmm') { $missing++ }
+            } elseif ($sawOther) { $cleanForeign++ }
+        }
+    }
+    Stop-Job $writer -EA SilentlyContinue; Remove-Job $writer -Force -EA SilentlyContinue
+    Stop-Ns $nsO
+    Write-Info "runs=$runs  printed the other server's warning: $foreign  lost its own: $missing  clean config printed the other's: $cleanForeign"
+    if ($foreign -eq 0) { Write-Pass "never printed another server's warning ($runs runs)" }
+    else { Write-Fail "printed another server's warning in $foreign of $runs runs" }
+    if ($missing -eq 0) { Write-Pass "never lost its own warning ($runs runs)" }
+    else { Write-Fail "lost its own warning in $missing of $runs runs" }
+    if ($cleanForeign -eq 0) { Write-Pass "a clean config never reported another server's warning ($runs runs)" }
+    else { Write-Fail "a clean config reported another server's warning in $cleanForeign of $runs runs" }
+}
+
 Write-Host ""
 Write-Host "=== Results ===" -ForegroundColor Magenta
 Write-Host "  Passed:  $script:TestsPassed" -ForegroundColor Green
