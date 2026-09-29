@@ -6944,6 +6944,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             vt100::set_codepoint_widths(codepoint_widths);
             last_codepoint_widths = codepoint_widths.to_vec();
         }
+        // Issue #700: the first frame decides the host screen. The server's
+        // `terminal-overrides` ride on it, and `smcup@` for this client's TERM
+        // keeps the host terminal on its main screen. A no-op after the first.
+        crate::terminal_overrides::client_screen_start(
+            terminal.backend_mut(),
+            state.client_render_options.terminal_overrides.as_deref().unwrap_or(&[]),
+        );
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             // Pass full string — visual truncation is handled by ratatui

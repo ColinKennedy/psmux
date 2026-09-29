@@ -1582,6 +1582,10 @@ pub struct AppState {
     /// lookup table lives in the vt100 crate, which is where every width
     /// decision is made.
     pub codepoint_widths: Vec<String>,
+    /// terminal-overrides: server-scope ARRAY of `pattern:cap...` entries,
+    /// raw strings in tmux order. The attach client honours smcup/rmcup from
+    /// it (issue #700, see crate::terminal_overrides).
+    pub terminal_overrides: Vec<String>,
     /// Config parse warnings (unknown command/option, malformed value, missing
     /// args) collected during a config load or source-file, surfaced to the
     /// user instead of being silently ignored (issue #370 follow-up).
@@ -2376,6 +2380,7 @@ impl AppState {
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
             codepoint_widths: Vec::new(),
+            terminal_overrides: Vec::new(),
             config_warnings: Vec::new(),
             config_warn_line: None,
             set_clipboard: "on".to_string(),

@@ -198,6 +198,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "default-terminal", scope: Server, option_type: OptionType::String, default: "xterm-256color", description: "TERM value for new panes" },
     OptionDef { name: "copy-command", scope: Server, option_type: OptionType::String, default: "", description: "External copy command (pipe selection)" },
     OptionDef { name: "codepoint-widths", scope: Server, option_type: OptionType::String, default: "", description: "Array of override widths for Unicode codepoints, e.g. U+2500-U+257F=2 (comma separated; widths 0, 1 or 2)" },
+    OptionDef { name: "terminal-overrides", scope: Server, option_type: OptionType::String, default: "", description: "Array of pattern:cap overrides matched against the client TERM; smcup@/rmcup@ keep the attached client off the host's alternate screen (#700)" },
     OptionDef { name: "exit-empty", scope: Server, option_type: Boolean, default: "on", description: "Exit server when no sessions remain" },
     OptionDef { name: "priority", scope: Server, option_type: Choice(Priority), default: "above-normal", description: "Scheduling class for psmux's own server and client processes (normal/above-normal/high). Pane children are never raised" },
     // ── Session options ──

@@ -3276,7 +3276,9 @@ match cmd {
                 let (rtx, rrx) = mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
                 if let Ok(v) = rrx.recv_timeout(Duration::from_millis(2000)) {
-                    if values_only {
+                    if let Some(text) = crate::terminal_overrides::show_array_lines(name, &v, values_only) {
+                        out.push_str(&text);
+                    } else if values_only {
                         out.push_str(&format!("{}\n", v));
                     } else {
                         out.push_str(&format!("{} {}\n", name, v));
@@ -3379,7 +3381,14 @@ match cmd {
                         text
                     };
                     if !(has_q && resolved.is_empty()) {
-                        let output = if has_v {
+                        let array_text = if window_scope {
+                            None
+                        } else {
+                            crate::terminal_overrides::show_array_lines(name, &resolved, has_v)
+                        };
+                        let output = if let Some(text) = array_text {
+                            text
+                        } else if has_v {
                             format!("{}\n", resolved)
                         } else {
                             format!("{} {}\n", name, resolved)
@@ -5210,7 +5219,9 @@ fn dispatch_control_command(
                     let (srtx, srrx) = mpsc::channel::<String>();
                     let _ = tx.send(CtrlReq::ShowOptionValue(srtx, name.to_string()));
                     if let Ok(v) = srrx.recv_timeout(Duration::from_millis(2000)) {
-                        if value_only {
+                        if let Some(t) = crate::terminal_overrides::show_array_lines(name, &v, value_only) {
+                            text.push_str(&t);
+                        } else if value_only {
                             text.push_str(&format!("{}\n", v));
                         } else {
                             text.push_str(&format!("{} {}\n", name, v));
@@ -5220,6 +5231,8 @@ fn dispatch_control_command(
                 let _ = resp_tx.send(text);
                 return true;
             }
+            // Array options print one `name[i] value` line per element (#700).
+            let array_name = opt_name.clone().filter(|n| !window_scope2 && n == "terminal-overrides");
             if let Some(name) = opt_name {
                 // #648: `-wv <name>` used to fall into the plain
                 // ShowOptionValue arm because `value_only` was tested first,
@@ -5266,6 +5279,11 @@ fn dispatch_control_command(
                         .collect::<Vec<_>>()
                         .join("\n");
                     let _ = resp_tx.send(values_only);
+                } else if let Some(t) = array_name
+                    .as_deref()
+                    .and_then(|n| crate::terminal_overrides::show_array_lines(n, &text, value_only))
+                {
+                    let _ = resp_tx.send(t.trim_end_matches('\n').to_string());
                 } else {
                     let _ = resp_tx.send(text);
                 }
