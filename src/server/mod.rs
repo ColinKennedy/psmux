@@ -186,6 +186,11 @@ fn should_spawn_warm_server(app: &AppState) -> bool {
 fn ensure_session_registry_files(app: &AppState) {
     let Some(port) = app.control_port else { return; };
     let dir = crate::paths::psmux_dir();
+    // An unclaimed standby never rebuilds a deleted data directory: nothing is
+    // waiting for it there, and its watchdog ends it on the next tick.
+    if app.is_warm_server() && !std::path::Path::new(&dir).is_dir() {
+        return;
+    }
     let _ = std::fs::create_dir_all(&dir);
 
     let base = app.port_file_base();
@@ -442,6 +447,52 @@ fn ensure_warm_standby(app: &AppState) {
     spawn_warm_server(app);
 }
 
+/// The server that spawned this standby, as `(pid, creation FILETIME)`, from
+/// the `--spawner` argument. Unset for a standby started by `psmux
+/// start-server` (a CLI process that exits at once) and for every non standby.
+static WARM_SPAWNER: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+
+/// Record the spawner named by `--spawner pid:creation`. Called once, from the
+/// `server` argument parser, before `run_server`.
+pub fn set_warm_spawner(spec: &str) {
+    if let Some((pid, Some(creation))) = crate::session::parse_pid_file_contents(spec) {
+        if pid != 0 && creation != 0 {
+            let _ = WARM_SPAWNER.set((pid, creation));
+        }
+    }
+}
+
+fn warm_spawner() -> Option<(u32, u64)> {
+    WARM_SPAWNER.get().copied()
+}
+
+/// How often an unclaimed standby asks whether it has been orphaned.
+const WARM_ORPHAN_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether this unclaimed standby must end, and why. See
+/// `session::warm_standby_verdict` for the rule and why it closes the
+/// kill-server race; this only gathers the facts.
+fn check_warm_standby_orphaned(app: &AppState) -> crate::session::WarmStandbyVerdict {
+    let dir = crate::paths::psmux_dir();
+    let dir_path = std::path::Path::new(&dir);
+    let spawner = warm_spawner();
+    let facts = crate::session::WarmStandbyFacts {
+        own_creation: crate::platform::process_kill::process_creation_time(std::process::id()),
+        spawner_creation: spawner.map(|(_, c)| c),
+        // Creation time alone is not liveness (an exited process whose object
+        // is still held open answers GetProcessTimes), hence both checks.
+        spawner_alive: spawner
+            .map(|(pid, c)| {
+                crate::platform::process_is_alive(pid)
+                    && crate::platform::process_kill::process_creation_time(pid) == Some(c)
+            })
+            .unwrap_or(false),
+        kill_marker: crate::session::read_kill_marker(dir_path, app.socket_name.as_deref()),
+        data_dir_present: dir_path.is_dir(),
+    };
+    crate::session::warm_standby_verdict(&facts)
+}
+
 /// Spawn a standby "warm server" process that pre-loads config + shell.
 /// When `psmux new-session` is run later, the CLI claims this warm server
 /// via `claim-session` instead of cold-spawning, making session creation
@@ -537,6 +588,14 @@ fn spawn_warm_server(app: &AppState) {
         args.push(area.width.to_string());
         args.push("-y".into());
         args.push(area.height.to_string());
+    }
+    // Tell the standby who spawned it, so that a kill-server which ends this
+    // server before the standby has registered still reaches the standby
+    // (`check_warm_standby_orphaned`).
+    let self_pid = std::process::id();
+    if let Some(creation) = crate::platform::process_kill::process_creation_time(self_pid) {
+        args.push("--spawner".into());
+        args.push(crate::session::format_pid_file_contents(self_pid, creation));
     }
     #[cfg(windows)]
     {
@@ -1408,7 +1467,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // port file to discover the server, and the client polls for it to know
     // the server is ready.
     let dir = crate::paths::psmux_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    // A standby spawned by a server was spawned into a data directory that
+    // existed; if it is gone now somebody deleted it, and recreating it would
+    // resurrect a namespace that was removed on purpose. The standby's
+    // watchdog ends it instead (`check_warm_standby_orphaned`).
+    if !(app.is_warm_server() && warm_spawner().is_some()) {
+        let _ = std::fs::create_dir_all(&dir);
+    }
 
     // Generate a random session key for security
     let session_key: String = {
@@ -1771,6 +1836,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Staggered off the registry tick so the two file passes do not land on the
     // same iteration.
     let mut last_warm_standby_check = Instant::now();
+    let mut last_warm_orphan_check = Instant::now();
 
     // #559: alert detection (activity/bell/monitor-silence) used to run only
     // inside DumpState handling and the server-push path, both of which need a
@@ -1903,6 +1969,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         if last_warm_standby_check.elapsed() >= WARM_STANDBY_CHECK_INTERVAL {
             last_warm_standby_check = Instant::now();
             ensure_warm_standby(&app);
+        }
+        // An unclaimed standby that a kill-server missed (it registered after
+        // the kill had enumerated the namespace) or whose data directory was
+        // deleted ends itself. Checked on this thread so a claim, which is
+        // handled here too, can never be undone halfway by the watchdog.
+        if app.is_warm_server() && last_warm_orphan_check.elapsed() >= WARM_ORPHAN_CHECK_INTERVAL {
+            last_warm_orphan_check = Instant::now();
+            let verdict = check_warm_standby_orphaned(&app);
+            if verdict != crate::session::WarmStandbyVerdict::Keep {
+                warm_debug(&format!("standby orphaned ({:?}) -- exiting", verdict));
+                crate::session::remove_session_registry_files(std::path::Path::new(
+                    &crate::paths::port_file(&app.port_file_base()),
+                ));
+                shutdown_this_server(&mut app);
+            }
         }
 
         // Adaptive timeout: ramps from 1ms (active typing/echo) through
