@@ -4512,7 +4512,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             "CLAIM: shell changed since standby boot ({:?} -> {:?}); respawning window 0 and the pool",
                             shell_at_boot, shell_now
                         ));
-                        if let Err(e) = respawn_active_pane(&mut app, Some(&*pty_system), None, true, None, false) {
+                        if let Err(e) = respawn_active_pane(&mut app, Some(&*pty_system), None, true, None, false, &[]) {
                             warm_debug(&format!("CLAIM: window 0 respawn failed: {}", e));
                         }
                     }
@@ -5089,7 +5089,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     };
                     let _ = resp.send(reply);
                 }
-                CtrlReq::RespawnPane(workdir, kill, command, empty, resp) => {
+                CtrlReq::RespawnPane(workdir, kill, command, empty, resp, env_sets) => {
                     // A refused respawn is a COMMAND error, not a server fault.
                     // The `?` that used to sit here carried "pane ... still
                     // active" (respawn-pane on a live pane without -k, the
@@ -5097,7 +5097,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // `run_server`, so the server exited and every window and
                     // pane in the session died — while the client, which never
                     // read a reply, printed nothing and exited 0.
-                    match respawn_active_pane(&mut app, Some(&*pty_system), workdir.as_deref(), kill, command.as_deref(), empty) {
+                    match respawn_active_pane(&mut app, Some(&*pty_system), workdir.as_deref(), kill, command.as_deref(), empty, &env_sets) {
                         Ok(()) => {
                             hook_event = Some("after-respawn-pane");
                             let _ = resp.send(Ok(()));
@@ -7151,12 +7151,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::RespawnWindow(workdir, command, resp) => {
+                CtrlReq::RespawnWindow(workdir, command, resp, env_sets) => {
                     // Kill all panes in the active window and respawn. Same
                     // rule as RespawnPane above: a spawn refusal here (bad -c
                     // directory, unspawnable command) is the caller's error and
                     // must not unwind the event loop.
-                    match respawn_active_pane(&mut app, Some(&*pty_system), workdir.as_deref(), true, command.as_deref(), false) {
+                    match respawn_active_pane(&mut app, Some(&*pty_system), workdir.as_deref(), true, command.as_deref(), false, &env_sets) {
                         Ok(()) => {
                             state_dirty = true;
                             let _ = resp.send(Ok(()));

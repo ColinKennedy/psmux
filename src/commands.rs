@@ -1815,7 +1815,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     .map(|i| parts[i + 1..].join(" "))
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
-                crate::window_ops::respawn_active_pane(app, None, None, kill, command.as_deref(), empty)?;
+                let env_sets = crate::server::connection::env_flag_values(&parts);
+                crate::window_ops::respawn_active_pane(app, None, None, kill, command.as_deref(), empty, &env_sets)?;
             }
         }
         "toggle-sync" => {

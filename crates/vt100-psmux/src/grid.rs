@@ -277,6 +277,29 @@ impl Grid {
 
     /// Updates the scrollback buffer's maximum size.  When `new_len` is
     /// smaller than the current fill, the oldest rows are trimmed away.
+    /// Move the retained history out of this grid, leaving it empty.  The
+    /// rows are shared (`Arc`), so this moves pointers, never cells.
+    pub fn take_scrollback(
+        &mut self,
+    ) -> std::collections::VecDeque<std::sync::Arc<crate::row::Row>> {
+        self.scrollback_offset = 0;
+        std::mem::take(&mut self.scrollback)
+    }
+
+    /// Install history taken from another grid with `take_scrollback`,
+    /// replacing whatever this grid held and trimming the oldest rows to this
+    /// grid's limit.
+    pub fn put_scrollback(
+        &mut self,
+        history: std::collections::VecDeque<std::sync::Arc<crate::row::Row>>,
+    ) {
+        self.scrollback = history;
+        self.scrollback_offset = 0;
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+        }
+    }
+
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.scrollback_len = new_len;
         while self.scrollback.len() > self.scrollback_len {
