@@ -71,6 +71,10 @@ if ($out -match 'copy-mode-line-numbers' -and $out -match 'bogus' -and $out -not
     Write-Fail "bad value report: '$($out.Trim())'"
 }
 & $PSMUX -L $NS kill-server 2>&1 | Out-Null
+# A kill-server right after a start can miss the standby the server spawns a
+# moment later; sweep again before the data directory goes.
+Start-Sleep -Seconds 2
+& $PSMUX -L $NS kill-server 2>&1 | Out-Null
 
 Remove-Item -Recurse -Force $root -EA SilentlyContinue
 if ($null -ne $savedDataDir) { $env:PSMUX_DATA_DIR = $savedDataDir } else { Remove-Item env:PSMUX_DATA_DIR -EA SilentlyContinue }

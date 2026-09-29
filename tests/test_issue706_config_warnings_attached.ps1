@@ -64,9 +64,21 @@ Write-Host ""
 Write-Host "=== Issue #706: config warnings on an attached start ===" -ForegroundColor Magenta
 Write-Info "Binary: $PSMUX"
 
-function Stop-Ns([string]$ns) { & $PSMUX -L $ns kill-server 2>&1 | Out-Null }
+# Every namespace used, with the data directory it lived in. A kill-server that
+# lands right after a start can miss the standby the server spawns a moment
+# later, so the exit sweeps each one again before the data directories go.
+$script:UsedNs = New-Object System.Collections.Generic.List[object]
+function Stop-Ns([string]$ns) {
+    $script:UsedNs.Add([pscustomobject]@{ ns = $ns; data = $env:PSMUX_DATA_DIR })
+    & $PSMUX -L $ns kill-server 2>&1 | Out-Null
+}
 
 function Exit-Test([int]$code) {
+    Start-Sleep -Seconds 2
+    foreach ($u in $script:UsedNs) {
+        $env:PSMUX_DATA_DIR = $u.data
+        & $PSMUX -L $u.ns kill-server 2>&1 | Out-Null
+    }
     Remove-Item -Recurse -Force $root -EA SilentlyContinue
     if ($null -ne $savedDataDir) { $env:PSMUX_DATA_DIR = $savedDataDir } else { Remove-Item env:PSMUX_DATA_DIR -EA SilentlyContinue }
     if ($null -ne $savedNoWarm)  { $env:PSMUX_NO_WARM  = $savedNoWarm }  else { Remove-Item env:PSMUX_NO_WARM  -EA SilentlyContinue }
