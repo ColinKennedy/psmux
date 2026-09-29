@@ -45,9 +45,12 @@ psmux send-keys -p
 # Repeat a key N times
 psmux send-keys -N 5 Up
 
-# Send a copy mode command by name (see "Copy Mode Commands (send-keys -X)")
+# Send a copy mode command by name (see "Copy Mode Commands (send-keys -X)").
+# The pane must already be in copy mode; otherwise, as in tmux, the command
+# fails with "not in a mode" (exit 1). -N repeats a motion.
+psmux copy-mode
 psmux send-keys -X begin-selection
-psmux send-keys -X cursor-up
+psmux send-keys -X -N 5 cursor-up
 psmux send-keys -X copy-selection-and-cancel
 
 # Send a dash-leading operand: `--` ends option parsing (#562)
@@ -1265,6 +1268,17 @@ bind-key -T copy-mode-vi v send-keys -X begin-selection
 bind-key -T copy-mode-vi y send-keys -X copy-selection-and-cancel
 bind-key -T copy-mode-vi C-v send-keys -X rectangle-toggle
 ```
+
+`send-keys -X` needs a pane that is already in copy mode, exactly as in tmux: on
+any other pane it prints `not in a mode` and exits 1. `-N <count>` repeats the
+commands that take a count (cursor, word, page and scroll motions, search
+again); the rest run once.
+
+`list-keys -T copy-mode-vi` (or `-T copy-mode` for `mode-keys emacs`) prints
+the keys the built-in copy mode handles, as the `send-keys -X` command each one
+runs, together with your own bindings in those tables. `unbind-key -T
+copy-mode-vi <key>` takes a built-in key away (it then does nothing, as in
+tmux), and `unbind-key -a -T copy-mode-vi` takes all of them.
 
 ### Movement
 

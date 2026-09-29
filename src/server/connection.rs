@@ -2159,8 +2159,20 @@ match cmd {
             let cmd_parts: Vec<&str> = args.iter().enumerate()
                 .filter(|(i, a)| is_operand(*i, a))
                 .map(|(_, a)| *a).collect();
-            for _ in 0..repeat_count {
-                let _ = tx.send(CtrlReq::SendKeysX(cmd_parts.join(" ")));
+            // One request carrying the count: tmux hands -N to the copy
+            // command as its repeat (`wme->prefix`), and refuses -X outside
+            // a mode with "not in a mode" (cmd-send-keys.c).
+            let (rtx, rrx) = mpsc::channel();
+            let _ = tx.send(CtrlReq::SendKeysXRun {
+                cmd: cmd_parts.join(" "),
+                count: repeat_count,
+                resp: Some(rtx),
+            });
+            if let Ok(Err(e)) = rrx.recv_timeout(Duration::from_secs(5)) {
+                if !persistent {
+                    let _ = writeln!(write_stream, "ERROR: {}", e);
+                    let _ = write_stream.flush();
+                }
             }
         } else {
             let keys: Vec<String> = args.iter()

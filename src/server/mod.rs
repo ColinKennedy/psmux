@@ -38,7 +38,7 @@ use crate::window_ops::{toggle_zoom, remote_mouse_down, remote_mouse_drag, remot
     handle_pane_mouse, handle_pane_scroll, copy_drag_begin, handle_split_set_sizes, handle_split_resize_done};
 use crate::config::{load_config, parse_key_string, format_key_binding, normalize_key_for_binding,
     parse_config_content};
-use crate::commands::{parse_command_to_action, format_action, parse_menu_definition, execute_command_string};
+use crate::commands::{parse_command_to_action, parse_menu_definition, execute_command_string};
 use crate::util::{list_windows_json, list_tree_json, list_windows_tmux, base64_encode};
 use crate::control;
 use crate::format::{expand_format, format_list_windows, format_list_panes, set_buffer_idx_override, set_named_buffer_override};
@@ -761,17 +761,12 @@ fn drain_plugin_req(
             app.defaults_suppressed = true;
         }
         CtrlReq::UnbindAllInTable(table) => {
-            if let Some(binds) = app.key_tables.get_mut(&table) {
-                binds.clear();
-            }
+            crate::config::unbind_all_in_table(app, &table);
         }
         CtrlReq::UnbindKey(key, table) => {
             if let Some(kc) = parse_key_string(&key) {
-                let kc = normalize_key_for_binding(kc);
                 let target = table.unwrap_or_else(|| "prefix".to_string());
-                if let Some(binds) = app.key_tables.get_mut(&target) {
-                    binds.retain(|b| b.key != kc);
-                }
+                crate::config::unbind_key_in_table(app, &target, kc);
             }
         }
         // Ignore other request types during plugin drain
@@ -1285,6 +1280,282 @@ pub(crate) fn apply_initial_window_name(app: &mut AppState, window_name: Option<
         None => false,
     }
 }
+
+/// Copy-mode commands that take the `send-keys -N` repeat count, the ones
+/// whose tmux implementation loops over `wme->prefix` (window-copy.c). Every
+/// other command runs once whatever the count, as in tmux.
+fn send_keys_x_takes_count(name: &str) -> bool {
+    matches!(name,
+        "cursor-up" | "cursor-down" | "cursor-left" | "cursor-right"
+        | "halfpage-up" | "halfpage-down" | "page-up" | "page-down"
+        | "scroll-up" | "scroll-down"
+        | "next-word" | "next-word-end" | "previous-word"
+        | "next-space" | "next-space-end" | "previous-space"
+        | "next-paragraph" | "previous-paragraph" | "next-matching-bracket"
+        | "jump-again" | "jump-reverse"
+        | "search-again" | "search-reverse"
+        | "other-end")
+}
+
+/// `send-keys -X [-N count] <command>`, tmux cmd-send-keys.c: refused with
+/// "not in a mode" unless the pane is in copy mode (tmux never enters a mode
+/// for -X), then the command runs, repeated `count` times when it is one
+/// that takes a repeat count. A command that leaves copy mode ends the
+/// repeat.
+fn run_send_keys_x(app: &mut AppState, cmd: &str, count: usize) -> Result<(), String> {
+    if !matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+        return Err("not in a mode".to_string());
+    }
+    let name = cmd.split_whitespace().next().unwrap_or("");
+    let count = count.max(1);
+    if matches!(name, "jump-forward" | "jump-backward" | "jump-to-forward" | "jump-to-backward") {
+        // The jump waits for its character; the count rides along the way a
+        // typed `3f` does, and the find-char handler consumes it (#413).
+        app.copy_count = Some(count);
+    }
+    let reps = if send_keys_x_takes_count(name) { count } else { 1 };
+    for _ in 0..reps {
+        if !matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) { break; }
+        run_copy_mode_command_by_name(app, cmd);
+    }
+    Ok(())
+}
+
+/// Run one copy-mode command by name (the `send-keys -X` vocabulary). This is
+/// the primary mechanism used by tmux-yank and other plugins.
+fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
+    match cmd {
+        "cancel" => {
+            // Use the canonical exit: it also clears the
+            // pane-local `copy_state`.  Hand-rolling the exit
+            // here left that behind, and the next focus change
+            // (`select-pane`, which every mouse click sends)
+            // restored it through `switch_with_copy_save`, so a
+            // plain click after an external `send-keys -X
+            // cancel` silently re-entered copy mode.
+            crate::copy_mode::exit_copy_mode(app);
+            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+        }
+        "begin-selection" => {
+            if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r,c));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+                app.copy_pos = Some((r,c));
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
+            }
+        }
+        "select-line" => {
+            if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r,c));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+                app.copy_pos = Some((r,c));
+                app.copy_selection_mode = crate::types::SelectionMode::Line;
+            }
+        }
+        "rectangle-toggle" => {
+            crate::copy_mode::toggle_rectangle(app);
+        }
+        "copy-selection" => {
+            let _ = yank_selection(app);
+            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+        }
+        "copy-selection-and-cancel" => {
+            let _ = yank_selection(app);
+            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+            crate::copy_mode::exit_copy_mode(app);
+            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+        }
+        "copy-selection-no-clear" => {
+            let _ = yank_selection(app);
+            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+        }
+        s if s.starts_with("copy-pipe-and-cancel") || s.starts_with("copy-pipe") => {
+            // copy-pipe[-and-cancel] [command] — yank + pipe to command
+            let _ = yank_selection(app);
+            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+            // Extract pipe command from argument if present
+            let cancel = s.contains("cancel");
+            let pipe_cmd = cmd.strip_prefix("copy-pipe-and-cancel")
+                .or_else(|| cmd.strip_prefix("copy-pipe"))
+                .unwrap_or("")
+                .trim();
+            if !pipe_cmd.is_empty() {
+                if let Some(text) = app.paste_buffers.first().cloned() {
+                    // Pipe yanked text to the command's stdin
+                    let mut copy_pipe_cmd = std::process::Command::new(if cfg!(windows) { "pwsh" } else { "sh" });
+                    copy_pipe_cmd.args(if cfg!(windows) { vec!["-NoProfile", "-Command", pipe_cmd] } else { vec!["-c", pipe_cmd] })
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
+                    { use crate::platform::HideWindowCommandExt; copy_pipe_cmd.hide_window(); }
+                    if let Ok(mut child) = copy_pipe_cmd.spawn() {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            use std::io::Write;
+                            let _ = stdin.write_all(text.as_bytes());
+                        }
+                        let _ = child.wait();
+                    }
+                }
+            }
+            if cancel {
+                crate::copy_mode::exit_copy_mode(app);
+                if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+            }
+        }
+        "cursor-up" => { move_copy_cursor(app, 0, -1); }
+        "cursor-down" => { move_copy_cursor(app, 0, 1); }
+        "cursor-left" => { move_copy_cursor(app, -1, 0); }
+        "cursor-right" => { move_copy_cursor(app, 1, 0); }
+        "start-of-line" => { crate::copy_mode::move_to_line_start(app); }
+        "end-of-line" => { crate::copy_mode::move_to_line_end(app); }
+        "back-to-indentation" => { crate::copy_mode::move_to_first_nonblank(app); }
+        "next-word" => { crate::copy_mode::move_word_forward(app); }
+        "previous-word" => { crate::copy_mode::move_word_backward(app); }
+        "next-word-end" => { crate::copy_mode::move_word_end(app); }
+        "next-space" => { crate::copy_mode::move_word_forward_big(app); }
+        "previous-space" => { crate::copy_mode::move_word_backward_big(app); }
+        "next-space-end" => { crate::copy_mode::move_word_end_big(app); }
+        "top-line" => { crate::copy_mode::move_to_screen_top(app); }
+        "middle-line" => { crate::copy_mode::move_to_screen_middle(app); }
+        "bottom-line" => { crate::copy_mode::move_to_screen_bottom(app); }
+        "history-top" => { crate::copy_mode::scroll_to_top(app); }
+        "history-bottom" => { crate::copy_mode::scroll_to_bottom(app); }
+        "halfpage-up" => { crate::copy_mode::page_scroll(app, true, true); }
+        "halfpage-down" => { crate::copy_mode::page_scroll(app, false, true); }
+        "page-up" => { crate::copy_mode::page_scroll(app, true, false); }
+        "page-down" => { crate::copy_mode::page_scroll(app, false, false); }
+        "scroll-up" => { scroll_copy_up(app, 1); }
+        "scroll-down" => { scroll_copy_down(app, 1); }
+        "scroll-middle" => { crate::copy_mode::scroll_middle(app); }
+        // tmux takes an optional search term argument on all
+        // four verbs (cmd-queue "send-keys -X search-backward
+        // foo"). Without the argument the interactive prompt
+        // opens, exactly as pressing `/` or `?` does.
+        s if s == "search-forward" || s == "search-backward"
+            || s == "search-forward-incremental"
+            || s == "search-backward-incremental"
+            || s.starts_with("search-forward ")
+            || s.starts_with("search-backward ")
+            || s.starts_with("search-forward-incremental ")
+            || s.starts_with("search-backward-incremental ") =>
+        {
+            let fwd = s.starts_with("search-forward");
+            let term = match s.find(' ') {
+                Some(i) => s[i + 1..].trim().to_string(),
+                None => String::new(),
+            };
+            if term.is_empty() {
+                app.mode = Mode::CopySearch { input: String::new(), forward: fwd };
+                let prompt = if fwd { "(search down) " } else { "(search up) " };
+                app.status_message = Some((prompt.to_string(), std::time::Instant::now(), Some(0)));
+            } else {
+                app.copy_search_query = term.clone();
+                app.copy_search_forward = fwd;
+                crate::copy_mode::search_copy_mode(app, &term, fwd);
+                app.mode = Mode::CopyMode;
+            }
+        }
+        "search-again" => { crate::copy_mode::search_next(app); }
+        "search-reverse" => { crate::copy_mode::search_prev(app); }
+        // The -and-cancel spellings are tmux's names for what the built-in `D`
+        // key does (key-bindings.c binds D to copy-pipe-end-of-line-and-cancel),
+        // so the name `list-keys` shows for `D` is one this table runs.
+        "copy-end-of-line" | "copy-end-of-line-and-cancel" | "copy-pipe-end-of-line-and-cancel" => { let _ = crate::copy_mode::copy_end_of_line(app); crate::copy_mode::exit_copy_mode(app); }
+        "select-word" => {
+            // Select the word under cursor
+            crate::copy_mode::move_word_backward(app);
+            if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r,c));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+                app.copy_selection_mode = crate::types::SelectionMode::Char;
+            }
+            crate::copy_mode::move_word_end(app);
+        }
+        "other-end" => {
+            if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
+                app.copy_anchor = Some(p);
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+                app.copy_pos = Some(a);
+            }
+        }
+        "clear-selection" => {
+            app.copy_anchor = None;
+            app.copy_selection_mode = crate::types::SelectionMode::Char;
+        }
+        "append-selection" => {
+            // Append to existing buffer instead of replacing
+            let _ = yank_selection(app);
+            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+            if app.paste_buffers.len() >= 2 {
+                let appended = format!("{}{}", app.paste_buffers[1], app.paste_buffers[0]);
+                app.paste_buffers[0] = appended;
+            }
+        }
+        "append-selection-and-cancel" => {
+            let _ = yank_selection(app);
+            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+            if app.paste_buffers.len() >= 2 {
+                let appended = format!("{}{}", app.paste_buffers[1], app.paste_buffers[0]);
+                app.paste_buffers[0] = appended;
+            }
+            app.mode = Mode::Passthrough;
+            app.copy_scroll_offset = 0;
+            app.copy_pos = None;
+            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+        }
+        "copy-line" => {
+            // Select entire current line and yank
+            if let Some((r, _)) = crate::copy_mode::get_copy_pos(app) {
+                app.copy_anchor = Some((r, 0));
+                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+                app.copy_selection_mode = crate::types::SelectionMode::Line;
+                let cols = app.windows.get(app.active_idx)
+                    .and_then(|w| active_pane(&w.root, &w.active_path))
+                    .map(|p| p.last_cols).unwrap_or(80);
+                app.copy_pos = Some((r, cols.saturating_sub(1)));
+                let _ = yank_selection(app);
+                if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+            }
+            app.mode = Mode::Passthrough;
+            app.copy_scroll_offset = 0;
+            app.copy_pos = None;
+            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
+        }
+        s if s.starts_with("goto-line") => {
+            // goto-line <N> — jump to line N in scrollback
+            let n = s.strip_prefix("goto-line").unwrap_or("").trim()
+                .parse::<u16>().unwrap_or(0);
+            app.copy_pos = Some((n, 0));
+        }
+        "jump-forward" => { app.copy_find_char_pending = Some(0); }
+        "jump-backward" => { app.copy_find_char_pending = Some(1); }
+        "jump-to-forward" => { app.copy_find_char_pending = Some(2); }
+        "jump-to-backward" => { app.copy_find_char_pending = Some(3); }
+        "jump-again" => { crate::copy_mode::jump_again(app); }
+        "jump-reverse" => { crate::copy_mode::jump_reverse(app); }
+        "set-mark" => { crate::copy_mode::set_mark(app); }
+        "jump-to-mark" => { crate::copy_mode::jump_to_mark(app); }
+        // tmux 3.3 calls this refresh-toggle; older tables and
+        // the #498 report use refresh-from-pane for the same key.
+        "refresh-from-pane" | "refresh-toggle" => { crate::copy_mode::toggle_refresh(app); }
+        "toggle-position" => { crate::copy_mode::toggle_position(app); }
+        "next-paragraph" => {
+            crate::copy_mode::move_next_paragraph(app);
+        }
+        "previous-paragraph" => {
+            crate::copy_mode::move_prev_paragraph(app);
+        }
+        "next-matching-bracket" => {
+            crate::copy_mode::move_matching_bracket(app);
+        }
+        "stop-selection" => {
+            // Keep cursor position but stop extending selection
+            app.copy_anchor = None;
+        }
+        _ => {} // ignore unknown copy-mode commands
+    }
+}
+
 
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     crate::startup_trace::mark("srv.entry");
@@ -3761,240 +4032,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     echo_pending_until = Some(Instant::now());
                 }
                 CtrlReq::SendKeysX(cmd) => {
-                    // send-keys -X: dispatch copy-mode commands by name
-                    // This is the primary mechanism used by tmux-yank and other plugins
-                    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
-                    if !in_copy {
-                        // Auto-enter copy mode for commands that require it
-                        enter_copy_mode(&mut app);
-                    }
-                    match cmd.as_str() {
-                        "cancel" => {
-                            // Use the canonical exit: it also clears the
-                            // pane-local `copy_state`.  Hand-rolling the exit
-                            // here left that behind, and the next focus change
-                            // (`select-pane`, which every mouse click sends)
-                            // restored it through `switch_with_copy_save`, so a
-                            // plain click after an external `send-keys -X
-                            // cancel` silently re-entered copy mode.
-                            crate::copy_mode::exit_copy_mode(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                        }
-                        "begin-selection" => {
-                            if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
-                                app.copy_anchor = Some((r,c));
-                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                                app.copy_pos = Some((r,c));
-                                app.copy_selection_mode = crate::types::SelectionMode::Char;
-                            }
-                        }
-                        "select-line" => {
-                            if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
-                                app.copy_anchor = Some((r,c));
-                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                                app.copy_pos = Some((r,c));
-                                app.copy_selection_mode = crate::types::SelectionMode::Line;
-                            }
-                        }
-                        "rectangle-toggle" => {
-                            crate::copy_mode::toggle_rectangle(&mut app);
-                        }
-                        "copy-selection" => {
-                            let _ = yank_selection(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                        }
-                        "copy-selection-and-cancel" => {
-                            let _ = yank_selection(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                            crate::copy_mode::exit_copy_mode(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                        }
-                        "copy-selection-no-clear" => {
-                            let _ = yank_selection(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                        }
-                        s if s.starts_with("copy-pipe-and-cancel") || s.starts_with("copy-pipe") => {
-                            // copy-pipe[-and-cancel] [command] — yank + pipe to command
-                            let _ = yank_selection(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                            // Extract pipe command from argument if present
-                            let cancel = s.contains("cancel");
-                            let pipe_cmd = cmd.strip_prefix("copy-pipe-and-cancel")
-                                .or_else(|| cmd.strip_prefix("copy-pipe"))
-                                .unwrap_or("")
-                                .trim();
-                            if !pipe_cmd.is_empty() {
-                                if let Some(text) = app.paste_buffers.first().cloned() {
-                                    // Pipe yanked text to the command's stdin
-                                    let mut copy_pipe_cmd = std::process::Command::new(if cfg!(windows) { "pwsh" } else { "sh" });
-                                    copy_pipe_cmd.args(if cfg!(windows) { vec!["-NoProfile", "-Command", pipe_cmd] } else { vec!["-c", pipe_cmd] })
-                                        .stdin(std::process::Stdio::piped())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null());
-                                    { use crate::platform::HideWindowCommandExt; copy_pipe_cmd.hide_window(); }
-                                    if let Ok(mut child) = copy_pipe_cmd.spawn() {
-                                        if let Some(mut stdin) = child.stdin.take() {
-                                            use std::io::Write;
-                                            let _ = stdin.write_all(text.as_bytes());
-                                        }
-                                        let _ = child.wait();
-                                    }
-                                }
-                            }
-                            if cancel {
-                                crate::copy_mode::exit_copy_mode(&mut app);
-                                if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                            }
-                        }
-                        "cursor-up" => { move_copy_cursor(&mut app, 0, -1); }
-                        "cursor-down" => { move_copy_cursor(&mut app, 0, 1); }
-                        "cursor-left" => { move_copy_cursor(&mut app, -1, 0); }
-                        "cursor-right" => { move_copy_cursor(&mut app, 1, 0); }
-                        "start-of-line" => { crate::copy_mode::move_to_line_start(&mut app); }
-                        "end-of-line" => { crate::copy_mode::move_to_line_end(&mut app); }
-                        "back-to-indentation" => { crate::copy_mode::move_to_first_nonblank(&mut app); }
-                        "next-word" => { crate::copy_mode::move_word_forward(&mut app); }
-                        "previous-word" => { crate::copy_mode::move_word_backward(&mut app); }
-                        "next-word-end" => { crate::copy_mode::move_word_end(&mut app); }
-                        "next-space" => { crate::copy_mode::move_word_forward_big(&mut app); }
-                        "previous-space" => { crate::copy_mode::move_word_backward_big(&mut app); }
-                        "next-space-end" => { crate::copy_mode::move_word_end_big(&mut app); }
-                        "top-line" => { crate::copy_mode::move_to_screen_top(&mut app); }
-                        "middle-line" => { crate::copy_mode::move_to_screen_middle(&mut app); }
-                        "bottom-line" => { crate::copy_mode::move_to_screen_bottom(&mut app); }
-                        "history-top" => { crate::copy_mode::scroll_to_top(&mut app); }
-                        "history-bottom" => { crate::copy_mode::scroll_to_bottom(&mut app); }
-                        "halfpage-up" => { crate::copy_mode::page_scroll(&mut app, true, true); }
-                        "halfpage-down" => { crate::copy_mode::page_scroll(&mut app, false, true); }
-                        "page-up" => { crate::copy_mode::page_scroll(&mut app, true, false); }
-                        "page-down" => { crate::copy_mode::page_scroll(&mut app, false, false); }
-                        "scroll-up" => { scroll_copy_up(&mut app, 1); }
-                        "scroll-down" => { scroll_copy_down(&mut app, 1); }
-                        "scroll-middle" => { crate::copy_mode::scroll_middle(&mut app); }
-                        // tmux takes an optional search term argument on all
-                        // four verbs (cmd-queue "send-keys -X search-backward
-                        // foo"). Without the argument the interactive prompt
-                        // opens, exactly as pressing `/` or `?` does.
-                        s if s == "search-forward" || s == "search-backward"
-                            || s == "search-forward-incremental"
-                            || s == "search-backward-incremental"
-                            || s.starts_with("search-forward ")
-                            || s.starts_with("search-backward ")
-                            || s.starts_with("search-forward-incremental ")
-                            || s.starts_with("search-backward-incremental ") =>
-                        {
-                            let fwd = s.starts_with("search-forward");
-                            let term = match s.find(' ') {
-                                Some(i) => s[i + 1..].trim().to_string(),
-                                None => String::new(),
-                            };
-                            if term.is_empty() {
-                                app.mode = Mode::CopySearch { input: String::new(), forward: fwd };
-                                let prompt = if fwd { "(search down) " } else { "(search up) " };
-                                app.status_message = Some((prompt.to_string(), std::time::Instant::now(), Some(0)));
-                            } else {
-                                app.copy_search_query = term.clone();
-                                app.copy_search_forward = fwd;
-                                crate::copy_mode::search_copy_mode(&mut app, &term, fwd);
-                                app.mode = Mode::CopyMode;
-                            }
-                        }
-                        "search-again" => { crate::copy_mode::search_next(&mut app); }
-                        "search-reverse" => { crate::copy_mode::search_prev(&mut app); }
-                        "copy-end-of-line" => { let _ = crate::copy_mode::copy_end_of_line(&mut app); crate::copy_mode::exit_copy_mode(&mut app); }
-                        "select-word" => {
-                            // Select the word under cursor
-                            crate::copy_mode::move_word_backward(&mut app);
-                            if let Some((r,c)) = crate::copy_mode::get_copy_pos(&mut app) {
-                                app.copy_anchor = Some((r,c));
-                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                                app.copy_selection_mode = crate::types::SelectionMode::Char;
-                            }
-                            crate::copy_mode::move_word_end(&mut app);
-                        }
-                        "other-end" => {
-                            if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
-                                app.copy_anchor = Some(p);
-                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                                app.copy_pos = Some(a);
-                            }
-                        }
-                        "clear-selection" => {
-                            app.copy_anchor = None;
-                            app.copy_selection_mode = crate::types::SelectionMode::Char;
-                        }
-                        "append-selection" => {
-                            // Append to existing buffer instead of replacing
-                            let _ = yank_selection(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                            if app.paste_buffers.len() >= 2 {
-                                let appended = format!("{}{}", app.paste_buffers[1], app.paste_buffers[0]);
-                                app.paste_buffers[0] = appended;
-                            }
-                        }
-                        "append-selection-and-cancel" => {
-                            let _ = yank_selection(&mut app);
-                            if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                            if app.paste_buffers.len() >= 2 {
-                                let appended = format!("{}{}", app.paste_buffers[1], app.paste_buffers[0]);
-                                app.paste_buffers[0] = appended;
-                            }
-                            app.mode = Mode::Passthrough;
-                            app.copy_scroll_offset = 0;
-                            app.copy_pos = None;
-                            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                        }
-                        "copy-line" => {
-                            // Select entire current line and yank
-                            if let Some((r, _)) = crate::copy_mode::get_copy_pos(&mut app) {
-                                app.copy_anchor = Some((r, 0));
-                                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                                app.copy_selection_mode = crate::types::SelectionMode::Line;
-                                let cols = app.windows.get(app.active_idx)
-                                    .and_then(|w| active_pane(&w.root, &w.active_path))
-                                    .map(|p| p.last_cols).unwrap_or(80);
-                                app.copy_pos = Some((r, cols.saturating_sub(1)));
-                                let _ = yank_selection(&mut app);
-                                if let Some(cmds) = app.hooks.get("pane-set-clipboard") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                            }
-                            app.mode = Mode::Passthrough;
-                            app.copy_scroll_offset = 0;
-                            app.copy_pos = None;
-                            if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                        }
-                        s if s.starts_with("goto-line") => {
-                            // goto-line <N> — jump to line N in scrollback
-                            let n = s.strip_prefix("goto-line").unwrap_or("").trim()
-                                .parse::<u16>().unwrap_or(0);
-                            app.copy_pos = Some((n, 0));
-                        }
-                        "jump-forward" => { app.copy_find_char_pending = Some(0); }
-                        "jump-backward" => { app.copy_find_char_pending = Some(1); }
-                        "jump-to-forward" => { app.copy_find_char_pending = Some(2); }
-                        "jump-to-backward" => { app.copy_find_char_pending = Some(3); }
-                        "jump-again" => { crate::copy_mode::jump_again(&mut app); }
-                        "jump-reverse" => { crate::copy_mode::jump_reverse(&mut app); }
-                        "set-mark" => { crate::copy_mode::set_mark(&mut app); }
-                        "jump-to-mark" => { crate::copy_mode::jump_to_mark(&mut app); }
-                        // tmux 3.3 calls this refresh-toggle; older tables and
-                        // the #498 report use refresh-from-pane for the same key.
-                        "refresh-from-pane" | "refresh-toggle" => { crate::copy_mode::toggle_refresh(&mut app); }
-                        "toggle-position" => { crate::copy_mode::toggle_position(&mut app); }
-                        "next-paragraph" => {
-                            crate::copy_mode::move_next_paragraph(&mut app);
-                        }
-                        "previous-paragraph" => {
-                            crate::copy_mode::move_prev_paragraph(&mut app);
-                        }
-                        "next-matching-bracket" => {
-                            crate::copy_mode::move_matching_bracket(&mut app);
-                        }
-                        "stop-selection" => {
-                            // Keep cursor position but stop extending selection
-                            app.copy_anchor = None;
-                        }
-                        _ => {} // ignore unknown copy-mode commands
-                    }
+                    // A copy-mode key binding's `send-keys -X` (queued by
+                    // input::run_copy_mode_binding, so the pane is in copy mode).
+                    let _ = run_send_keys_x(&mut app, &cmd, 1);
+                }
+                CtrlReq::SendKeysXRun { cmd, count, resp } => {
+                    let outcome = run_send_keys_x(&mut app, &cmd, count);
+                    if let Some(resp) = resp { let _ = resp.send(outcome); }
                 }
                 CtrlReq::SelectPane(dir, keep_zoom) => {
                     if let Some(cmds) = app.hooks.get("before-select-pane") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
@@ -5191,11 +5235,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::UnbindKey(key, table) => {
                     if let Some(kc) = parse_key_string(&key) {
-                        let kc = normalize_key_for_binding(kc);
                         let target = table.unwrap_or_else(|| "prefix".to_string());
-                        if let Some(binds) = app.key_tables.get_mut(&target) {
-                            binds.retain(|b| b.key != kc);
-                        }
+                        crate::config::unbind_key_in_table(&mut app, &target, kc);
                     }
                     meta_dirty = true;
                     state_dirty = true;
@@ -5207,21 +5248,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     state_dirty = true;
                 }
                 CtrlReq::UnbindAllInTable(table) => {
-                    if let Some(binds) = app.key_tables.get_mut(&table) {
-                        binds.clear();
-                    }
+                    crate::config::unbind_all_in_table(&mut app, &table);
                     meta_dirty = true;
                     state_dirty = true;
                 }
                 CtrlReq::ListKeys(resp) => {
-                    // Build list-keys output from the canonical help module
-                    let user_iter = app.key_tables.iter().flat_map(|(table_name, binds)| {
-                        binds.iter().map(move |bind| {
-                            let key_str = format_key_binding(&bind.key);
-                            let action_str = format_action(&bind.action);
-                            (table_name.as_str(), key_str, action_str, bind.repeat)
-                        })
-                    });
+                    // Key tables plus the built-in copy-mode keys (tmux lists
+                    // its copy-mode defaults, key-bindings.c).
+                    let entries = crate::config::list_keys_entries(&app);
+                    let user_iter = entries.iter().map(|(t, k, c, r)| (t.as_str(), k.clone(), c.clone(), *r));
                     let output = help::build_list_keys_output(user_iter, app.defaults_suppressed);
                     let _ = resp.send(output);
                 }
@@ -8302,3 +8337,7 @@ mod test_issue677_warm_spawn_lock;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue706_config_warnings_reply.rs"]
 mod test_issue706_config_warnings_reply;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_copy_mode_parity_send_keys_x.rs"]
+mod tests_copy_mode_parity_send_keys_x;

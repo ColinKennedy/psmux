@@ -245,11 +245,14 @@ Write-Host "`n=== TEST 6: send-keys -X ===" -ForegroundColor Cyan
 
 # 6a: send-keys -X should NOT send literal "-X" to the pane
 Write-Host "[6a] CLI: send-keys -X cancel" -ForegroundColor Yellow
-& $PSMUX send-keys -t $SESSION -X cancel 2>&1 | Out-Null
+# The pane is in no mode here, so tmux (cmd-send-keys.c) answers
+# "not in a mode" at exit 1; psmux does the same since the copy mode parity
+# batch. Before that it silently entered copy mode and exited 0.
+$err6a = (& $PSMUX send-keys -t $SESSION -X cancel 2>&1 | Out-String).Trim()
 $rc = $LASTEXITCODE
-Write-Host "     Exit code: $rc"
-if ($rc -eq 0) { Write-Pass "send-keys -X exits cleanly" }
-else { Write-Fail "send-keys -X exited with $rc" }
+Write-Host "     Exit code: $rc  stderr: $err6a"
+if ($rc -eq 1 -and $err6a -match 'not in a mode') { Write-Pass "send-keys -X outside a mode is refused like tmux" }
+else { Write-Fail "send-keys -X outside a mode: rc $rc '$err6a' (tmux: 1 'not in a mode')" }
 
 # 6b: Verify -X didn't type literal "-X" into the pane
 Write-Host "[6b] Proof: capture-pane should not have literal '-X'" -ForegroundColor Yellow

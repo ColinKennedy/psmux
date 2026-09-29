@@ -147,12 +147,18 @@ fn showb_alias_same_as_show_buffer() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn list_keys_empty_says_no_bindings() {
+fn list_keys_with_empty_tables_lists_only_the_copy_mode_keys() {
+    // The built-in copy-mode keys are listed like tmux lists its copy-mode
+    // tables (key-bindings.c), so empty key tables leave just those.
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "list-keys").unwrap();
     let (cmd, out) = extract_popup(&app);
     assert_eq!(cmd, "list-keys");
-    assert_eq!(out.trim(), "(no bindings)");
+    assert!(!out.trim().is_empty());
+    assert!(
+        out.lines().all(|l| l.starts_with("bind-key -T copy-mode ") || l.starts_with("bind-key -T copy-mode-vi ")),
+        "only copy-mode tables expected, got:\n{}", out
+    );
 }
 
 #[test]
@@ -179,7 +185,8 @@ fn list_keys_shows_bound_keys_with_table_key_command() {
     app.key_tables.insert("prefix".to_string(), binds);
     execute_command_string(&mut app, "list-keys").unwrap();
     let (_, out) = extract_popup(&app);
-    let lines: Vec<&str> = out.lines().collect();
+    // The copy-mode tables are listed as well; count the prefix table only.
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("bind-key -T prefix ")).collect();
     assert_eq!(lines.len(), 3, "should list 3 bindings");
     // Verify table name, key format, and command string for each binding
     assert!(lines.iter().any(|l| l.contains("prefix") && l.contains("c") && l.contains("new-window")),

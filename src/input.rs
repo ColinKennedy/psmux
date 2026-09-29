@@ -68,17 +68,29 @@ pub fn run_copy_mode_binding(app: &mut AppState, action: &crate::types::Action) 
             // into a string literal pwsh evaluates and discards.
             let mut rest: Vec<&str> = Vec::new();
             let mut skip_operand = false;
-            for p in parts.iter().skip(1) {
+            let mut count: usize = 1;
+            let mut iter = parts.iter().skip(1);
+            while let Some(p) = iter.next() {
                 if skip_operand { skip_operand = false; continue; }
                 match p.as_str() {
-                    "-t" | "-N" => { skip_operand = true; }
+                    "-t" => { skip_operand = true; }
+                    // `send-keys -X -N 5 scroll-up` (tmux's own WheelUpPane
+                    // binding) repeats the command, as it does from the CLI.
+                    "-N" => {
+                        count = iter.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
+                    }
                     s if s.starts_with('-') => {}
                     s => rest.push(s),
                 }
             }
             if !rest.is_empty() {
                 if let Some(tx) = app.control_tx.as_ref() {
-                    let _ = tx.send(crate::types::CtrlReq::SendKeysX(rest.join(" ")));
+                    let req = if count > 1 {
+                        crate::types::CtrlReq::SendKeysXRun { cmd: rest.join(" "), count, resp: None }
+                    } else {
+                        crate::types::CtrlReq::SendKeysX(rest.join(" "))
+                    };
+                    let _ = tx.send(req);
                     return true;
                 }
             }
@@ -134,7 +146,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
             if let Some(bind) = app.key_tables.get("root").and_then(|t| t.iter().find(|b| b.key == key_tuple)).cloned() {
                 // Skip scroll-triggered copy mode entry when the option is
                 // off so the key (PageUp) reaches the PTY instead (#284).
-                let is_scroll_copy = matches!(&bind.action, crate::types::Action::Command(cmd) if cmd.starts_with("copy-mode") && cmd.contains("-u"));
+                let is_scroll_copy = matches!(&bind.action, crate::types::Action::Command(cmd) if crate::copy_mode::is_page_up_copy_mode_command(cmd));
                 if is_scroll_copy && !app.scroll_enter_copy_mode {
                     forward_key_to_active(app, key)?;
                     return Ok(false);
@@ -824,8 +836,12 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
             }
             let copy_repeat = app.copy_count.take().unwrap_or(1);
+            // A built-in key the user unbound does nothing, as in tmux.
+            if crate::config::copy_mode_default_unbound(app, (key.code, key.modifiers)) {
+                return Ok(false);
+            }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => { 
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => {
                     exit_copy_mode(app);
                 }
                 // Ctrl+C exits copy mode (tmux parity, fixes #25)
@@ -3226,6 +3242,10 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
     }
     // Any non-digit key consumes the pending count (default 1).
     let n = app.copy_count.take().unwrap_or(1);
+    // A built-in key the user unbound does nothing, as in tmux.
+    if crate::config::copy_mode_default_unbound(app, (KeyCode::Char(c), KeyModifiers::NONE)) {
+        return Ok(());
+    }
     match c {
         'q' | ']' | '\x1b' => {
             exit_copy_mode(app);
@@ -3469,6 +3489,12 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         // `handle_key` has done this since #413 while this route never did:
         // `3` then `C-b` paged once and then moved the NEXT motion three lines.
         let copy_repeat = app.copy_count.take().unwrap_or(1);
+        // A built-in key the user unbound does nothing, as in tmux.
+        if let Some(key) = crate::config::parse_key_string(k) {
+            if crate::config::copy_mode_default_unbound(app, key) {
+                return Ok(());
+            }
+        }
         match k {
             "esc" | "q" => {
                 exit_copy_mode(app);
@@ -3923,3 +3949,7 @@ mod tests_issue623_ctrl_digit;
 #[cfg(all(test, windows))]
 #[path = "../tests-rs/test_issue623_far_fkeys.rs"]
 mod tests_issue623_far_fkeys;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_copy_mode_parity_keys.rs"]
+mod tests_copy_mode_parity_keys;

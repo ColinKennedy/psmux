@@ -2202,12 +2202,9 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "list-keys" | "lsk" => {
             let mut output = String::new();
-            for (table_name, binds) in &app.key_tables {
-                for bind in binds {
-                    let key_str = crate::config::format_key_binding(&bind.key);
-                    let cmd_str = format_action(&bind.action);
-                    output.push_str(&format!("bind-key -T {} {} {}\n", table_name, key_str, cmd_str));
-                }
+            for (table_name, key_str, cmd_str, repeat) in crate::config::list_keys_entries(app) {
+                let r = if repeat { " -r" } else { "" };
+                output.push_str(&format!("bind-key{} -T {} {} {}\n", r, table_name, key_str, cmd_str));
             }
             if output.is_empty() { output.push_str("(no bindings)\n"); }
             show_output_popup(app, "list-keys", output);

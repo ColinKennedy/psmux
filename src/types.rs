@@ -1661,6 +1661,13 @@ pub struct AppState {
     pub session_group: Option<String>,
     /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a).
     pub defaults_suppressed: bool,
+    /// Built-in copy-mode keys the user took away with `unbind -T copy-mode-vi
+    /// <key>` (or `-T copy-mode`, or `unbind -a -T` on either table), keyed by
+    /// table name and normalised key. tmux holds its copy-mode defaults in real
+    /// key tables, so unbinding one leaves the key doing nothing; psmux's
+    /// built-in handlers consult this set to do the same, and `list-keys` leaves
+    /// these keys out. Cleared whenever the default bindings are re-seeded.
+    pub copy_mode_defaults_unbound: std::collections::HashSet<(String, (KeyCode, KeyModifiers))>,
     /// Panes extracted for cross-session forwarding, keyed by forward_id.
     /// The source server keeps these alive so the real ConPTY continues running.
     pub forwarded_panes: HashMap<u64, ForwardedPane>,
@@ -2415,6 +2422,7 @@ impl AppState {
             control_clients: HashMap::new(),
             session_group: None,
             defaults_suppressed: false,
+            copy_mode_defaults_unbound: std::collections::HashSet::new(),
             forwarded_panes: HashMap::new(),
             next_forward_id: 1,
         }
@@ -2736,6 +2744,11 @@ pub enum CtrlReq {
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
     SendKeysX(String),  // send-keys -X copy-mode-command
+    /// `send-keys -X [-N count] <command>` from a client. Like tmux
+    /// (cmd-send-keys.c) it fails with "not in a mode" when the pane is not in
+    /// copy mode, and `count` is the repeat the copy command takes
+    /// (`wme->prefix`). `resp` carries that outcome back to a one-shot client.
+    SendKeysXRun { cmd: String, count: usize, resp: Option<mpsc::Sender<Result<(), String>>> },
     SelectPane(String, bool),
     SelectWindow(usize),
     /// `select-window -t <spec>` where the spec is anything but a plain index:
