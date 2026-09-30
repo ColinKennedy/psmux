@@ -1687,6 +1687,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     }
     app.socket_name = socket_name;
     app.session_group = group_target;
+    // The session id belongs to a server, so it is allocated here rather than in
+    // `AppState::new`: the counter lives in the data directory, and building a
+    // state object is not a reason to write to it. This is the first point where
+    // `socket_name` above is known, and it is still before the first read of
+    // `session_id`, which is the `.sid` write in `ensure_session_registry_files`.
+    app.session_id = crate::session::allocate_session_id();
     // Server starts detached with a reasonable default window size
     app.attached_clients = 0;
 
