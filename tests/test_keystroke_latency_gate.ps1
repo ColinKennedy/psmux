@@ -42,9 +42,17 @@
 #   character 15.2ms, and every hop after it (parse, frame build, socket,
 #   client parse, client pick up) 0.34ms in total
 #
-# So the shell cell is gated on psmux's OVERHEAD ABOVE THAT FLOOR, with the floor
-# measured by conpty_echolat in the same run on the same machine. That is the
-# part psmux owns, and it is the part a regression would move.
+# So the shell cell is gated on psmux's OWN HOPS, the last row above, split out
+# of every keystroke with the server's pty trace in the same run (see
+# Get-PerfShellSplit in perf_metrics_common.ps1). That is the part psmux owns,
+# and it is the part a regression would move. Until 2026-09-30 the gate took
+# end to end minus the conpty_echolat floor instead, which was the same thing
+# while both sat at ~15.7ms; that day the standalone floor fell to ~11.1ms
+# while pwsh in a psmux pane stayed at ~15 for an old and a new build alike,
+# and the subtraction started charging psmux ~4.5ms of timer state. The floor
+# is still measured and still judged, against the pane shell's own echo time,
+# so psmux making the SHELL wait (a reply it answers late) cannot hide inside
+# the split.
 #
 # WHY A GATE AND NOT A BENCHMARK
 # ------------------------------
@@ -142,8 +150,23 @@ param(
     # the pane, which is the kind that costs whole 15.6ms ticks: a coalescing tick
     # per chunk, a cursor position report answered on a poll, a second 15ms wait
     # per keystroke.
+    #
+    # Since 2026-09-30 these two budgets are applied to psmux's OWN hops per
+    # shell keystroke, split out of the end to end number with the server's
+    # pty trace in the same run (Get-PerfShellSplit in perf_metrics_common),
+    # not to end to end minus a floor taken in another pseudoconsole host. The
+    # standalone floor dropped from ~15.7 to ~11.1ms on this machine while pwsh
+    # in a psmux pane stayed at ~15, for both an old and a new build, so the old
+    # subtraction charged psmux ~4.5ms it never spent. The hops read 1.5 to
+    # 1.8ms median, the same as the 0.7ms over floor era plus the echo cell's
+    # own path, so the budgets keep their meaning.
     [double]$PwshMedianDeltaMaxMs = 2.5,
     [double]$PwshP99DeltaMaxMs = 6.0,
+    # The pane shell's own echo time (pty write to the read carrying the char)
+    # against the standalone floor. Wider than the ~4.5ms the two timer states
+    # sit apart, narrower than the one extra 15.6ms tick a late reply to a
+    # shell query costs.
+    [double]$PwshShellOverFloorMaxMs = 7.0,
     # Sanity ceiling in case the floor measurement itself fails or the machine is
     # pathological: a shell keystroke must land inside this no matter what.
     [double]$PwshAbsMedianMaxMs = 30.0,
@@ -242,12 +265,23 @@ function Invoke-Run([int]$idx, [string]$cell = "echo", [bool]$withResources = $f
     $client = $null
     $resAtPrompt = $null; $resAfterKeys = $null; $resIdle = $null; $keyCpu = $null
     $paneCmd = if ($cell -eq "pwsh") { @("pwsh", "-NoLogo", "-NoProfile") } else { @($EchoChild) }
+    # The shell cell traces the keystroke path so every key can be split into
+    # the pane shell's own echo time and psmux's hops (Get-PerfShellSplit). The
+    # variable is set only around this launch: the client inherits it and the
+    # server it spawns inherits it from the client. The echo cell stays
+    # untraced, so its number is exactly the shipped path.
+    $traceBase = Join-Path $OutDir "ptrace_${cell}_$idx"
+    Get-ChildItem -Path $OutDir -Filter "ptrace_${cell}_$idx.*" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     try {
+        if ($cell -eq "pwsh") { $env:PSMUX_PTY_TRACE = $traceBase }
         $client = Start-Process -FilePath $Binary `
             -ArgumentList (@("-L", $ns, "new-session", "-s", "g") + $paneCmd) -PassThru
     } catch {
         Write-Info "run $idx could not launch the client: $_"
         return $null
+    } finally {
+        Remove-Item Env:\PSMUX_PTY_TRACE -ErrorAction SilentlyContinue
     }
 
     $deadline = (Get-Date).AddSeconds(25)
@@ -344,7 +378,12 @@ function Invoke-Run([int]$idx, [string]$cell = "echo", [bool]$withResources = $f
     Start-Sleep -Milliseconds 400
 
     if ($samples.Count -eq 0) { return $null }
+    $split = $null
+    if ($cell -eq "pwsh") {
+        $split = Get-PerfShellSplit -KeylatOut (Join-Path $OutDir "gate_${cell}_$idx.txt") -TraceBase $traceBase
+    }
     return [pscustomobject]@{
+        Split = $split
         Run = $idx
         N = $samples.Count
         Min = (Pct $samples 0)
@@ -510,17 +549,64 @@ if (-not $SkipPwsh) {
             Write-Fail ("pwsh keystroke to screen median {0:N2}ms exceeds the {1:N1}ms ceiling" -f $pMedian, $PwshAbsMedianMaxMs)
         }
         if ($floorMedian -ge 0) {
-            $dMed = $pMedian - $floorMedian
-            $dP99 = $pP99 - $floorMedian
-            if ($dMed -lt $PwshMedianDeltaMaxMs) {
-                Write-Pass ("psmux adds {0:N2}ms to the median over the {1:N2}ms ConPTY floor, under the {2:N1}ms budget" -f $dMed, $floorMedian, $PwshMedianDeltaMaxMs)
+            # Kept as information: this is the number the gate used to judge,
+            # and it is only right when the pane and the standalone host happen
+            # to share a timer state (see Get-PerfShellSplit).
+            Write-Info ("end to end minus the standalone floor: median {0:N2}ms, p99 {1:N2}ms (not judged, see the split below)" -f `
+                ($pMedian - $floorMedian), ($pP99 - $floorMedian))
+        }
+
+        # The judged numbers: every keystroke split, from the server's own trace
+        # in the same run, into the pane shell's echo time and psmux's hops.
+        $shellAll = @(); $ownAll = @()
+        foreach ($r in $pwshRuns) {
+            if ($r.Split) { $shellAll += $r.Split.ShellMs; $ownAll += $r.Split.PsmuxMs }
+        }
+        $coverage = if ($pwshAll.Count -gt 0) { $ownAll.Count / $pwshAll.Count } else { 0 }
+        if ($ownAll.Count -eq 0 -or $coverage -lt 0.8) {
+            Write-Fail ("the keystroke trace split only {0} of {1} shell keystrokes into shell and psmux time, so psmux's share of the shell path was not verified" -f $ownAll.Count, $pwshAll.Count)
+        } else {
+            $oMed = Pct $ownAll 50; $oP90 = Pct $ownAll 90; $oP99 = Pct $ownAll 99
+            $sMed = Pct $shellAll 50; $sP99 = Pct $shellAll 99
+            Write-Info ("split n={0}: pane shell echo median {1:N2} p99 {2:N2} ms | psmux hops median {3:N2} p90 {4:N2} p99 {5:N2} ms" -f `
+                $ownAll.Count, $sMed, $sP99, $oMed, $oP90, $oP99)
+            $pwshStats | Add-Member -NotePropertyName split -NotePropertyValue ([pscustomobject]@{
+                n = $ownAll.Count
+                shellMedian = $sMed; shellP99 = $sP99
+                psmuxMedian = $oMed; psmuxP90 = $oP90; psmuxP99 = $oP99
+                shellOverFloor = $(if ($floorMedian -ge 0) { $sMed - $floorMedian } else { $null })
+                psmuxSamplesMs = $ownAll
+                shellSamplesMs = $shellAll
+            })
+            # Same load policy as the echo cell, for the same reason: under load
+            # a healthy median rises onto the budget (2.25ms measured with other
+            # agents busy, against 1.75 quiet) while the p99 still discriminates.
+            if ($oMed -lt $PwshMedianDeltaMaxMs) {
+                Write-Pass ("psmux's own hops cost {0:N2}ms median per shell keystroke, under the {1:N1}ms budget" -f $oMed, $PwshMedianDeltaMaxMs)
+            } elseif (-not $wasQuiet) {
+                Write-Warn ("psmux's own hops cost {0:N2}ms median per shell keystroke, over the {1:N1}ms budget, but the machine was at {2}% of total cpu, over the {3}% quiet mark; the p99 assertion below still holds" -f $oMed, $PwshMedianDeltaMaxMs, $loadSummary.p50_pct, $QuietLoadPct)
             } else {
-                Write-Fail ("psmux adds {0:N2}ms to the median over the {1:N2}ms ConPTY floor, over the {2:N1}ms budget - the shell path has picked up a hop the echo cell does not exercise" -f $dMed, $floorMedian, $PwshMedianDeltaMaxMs)
+                Write-Fail ("psmux's own hops cost {0:N2}ms median per shell keystroke, over the {1:N1}ms budget; the shell path has picked up a hop the echo cell does not exercise" -f $oMed, $PwshMedianDeltaMaxMs)
             }
-            if ($dP99 -lt $PwshP99DeltaMaxMs) {
-                Write-Pass ("psmux adds {0:N2}ms to the p99 over the ConPTY floor, under the {1:N1}ms budget" -f $dP99, $PwshP99DeltaMaxMs)
+            if ($oP99 -lt $PwshP99DeltaMaxMs) {
+                Write-Pass ("psmux's own hops cost {0:N2}ms p99 per shell keystroke, under the {1:N1}ms budget" -f $oP99, $PwshP99DeltaMaxMs)
             } else {
-                Write-Fail ("psmux adds {0:N2}ms to the p99 over the ConPTY floor, over the {1:N1}ms budget - some shell keystrokes are waiting out a timer inside psmux" -f $dP99, $PwshP99DeltaMaxMs)
+                Write-Fail ("psmux's own hops cost {0:N2}ms p99 per shell keystroke, over the {1:N1}ms budget; some shell keystrokes are waiting out a timer inside psmux" -f $oP99, $PwshP99DeltaMaxMs)
+            }
+            # What the split cannot see by itself: psmux making the SHELL slower,
+            # for instance a query the shell blocks on (a cursor position report,
+            # a device attributes reply) that psmux answers on a poll. That lands
+            # inside r - w. So the pane's echo time is held against the standalone
+            # floor with a margin wider than the two timer states apart (about
+            # 4.5ms, see Get-PerfShellSplit) and narrower than the one extra
+            # 15.6ms tick such a defect costs.
+            if ($floorMedian -ge 0) {
+                $over = $sMed - $floorMedian
+                if ($over -lt $PwshShellOverFloorMaxMs) {
+                    Write-Pass ("the pane shell echoes in {0:N2}ms median under psmux, {1:N2}ms from the {2:N2}ms standalone floor, inside the {3:N1}ms margin" -f $sMed, $over, $floorMedian, $PwshShellOverFloorMaxMs)
+                } else {
+                    Write-Fail ("the pane shell echoes in {0:N2}ms median under psmux, {1:N2}ms over the {2:N2}ms standalone floor, past the {3:N1}ms margin; psmux is making the shell itself wait, most likely a reply it answers late" -f $sMed, $over, $floorMedian, $PwshShellOverFloorMaxMs)
+                }
             }
         }
     }
@@ -532,6 +618,7 @@ if (-not $SkipPwsh) {
             medianDeltaMaxMs = $PwshMedianDeltaMaxMs
             p99DeltaMaxMs    = $PwshP99DeltaMaxMs
             absMedianMaxMs   = $PwshAbsMedianMaxMs
+            shellOverFloorMaxMs = $PwshShellOverFloorMaxMs
             pwsh      = $pwshStats
         })
         if ($pwshJson) { Write-Info "pwsh cell samples written to $pwshJson" }
