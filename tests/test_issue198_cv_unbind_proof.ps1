@@ -79,9 +79,14 @@ Write-Host "`n[TUI 2] Unbind C-v and v from all tables + disable paste-detection
 & $PSMUX unbind-key v -t $SESSION 2>&1 | Out-Null
 & $PSMUX set-option -g paste-detection off -t $SESSION 2>&1 | Out-Null
 Start-Sleep -Milliseconds 500
+# The unbinds above only touch the prefix and root tables (unbind-key without
+# -T targets prefix, -n targets root; tmux cmd-unbind-key.c). copy-mode-vi
+# keeps `v`/`C-v` rectangle-toggle and copy-mode keeps `C-v` page-down, as in
+# tmux 3.4, and list-keys without -T prints those tables too, so the C-v check
+# looks at prefix/root lines only.
 $keys = & $PSMUX list-keys -t $SESSION 2>&1 | Out-String
 $stillHasV = $keys -match "prefix\s+v\s"
-$stillHasCv = $keys -match "C-v"
+$stillHasCv = [bool]($keys -split "`n" | Where-Object { $_ -match '-T\s+(prefix|root)\s+C-v\s' })
 $pdOpt = (& $PSMUX show-options -t $SESSION 2>&1 | Out-String)
 $pdOff = $pdOpt -match "paste-detection off"
 if (-not $stillHasV -and -not $stillHasCv -and $pdOff) {

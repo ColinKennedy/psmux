@@ -25,6 +25,20 @@ function Cleanup {
     Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
 }
 
+# tmux parity (cmd-unbind-key.c): `unbind-key -a` without -T removes ONLY the
+# prefix table (-n: root). The copy-mode and copy-mode-vi tables keep their
+# built in keys, and list-keys without -T prints every table, so in tmux 3.4
+# `unbind -a; list-keys | wc -l` is 175, not 0. Counts that measure what
+# `unbind-key -a` removed therefore look at the prefix and root tables only.
+function Get-PrefixRootKeyCount {
+    $out = & $PSMUX list-keys 2>&1 | Out-String
+    return @($out.Split("`n") | Where-Object { $_ -match '^bind-key\s+(-r\s+)?-T\s+(prefix|root)\s' }).Count
+}
+function Get-CopyTableKeyCount {
+    $out = & $PSMUX list-keys 2>&1 | Out-String
+    return @($out.Split("`n") | Where-Object { $_ -match '^bind-key\s+(-r\s+)?-T\s+copy-mode(-vi)?\s' }).Count
+}
+
 function Get-WindowCount {
     $out = & $PSMUX list-windows 2>&1 | Out-String
     return ($out.Trim().Split("`n") | Where-Object { $_.Trim() -ne "" }).Count
@@ -291,12 +305,19 @@ if ($linesBefore -gt 40) {
 Start-Sleep -Milliseconds 500
 
 Write-Test "After runtime unbind-key -a, prefix defaults gone"
-$keys = & $PSMUX list-keys 2>&1 | Out-String
-$linesAfter = ($keys.Trim().Split("`n") | Where-Object { $_.Trim() -ne "" }).Count
+$linesAfter = Get-PrefixRootKeyCount
 if ($linesAfter -eq 0) {
-    Write-Pass "After: 0 bindings (all cleared)"
+    Write-Pass "After: 0 prefix/root bindings (prefix table cleared)"
 } else {
-    Write-Fail "After: $linesAfter bindings remaining"
+    Write-Fail "After: $linesAfter prefix/root bindings remaining"
+}
+
+Write-Test "unbind-key -a without -T leaves the copy mode tables (tmux parity)"
+$copyAfter = Get-CopyTableKeyCount
+if ($copyAfter -gt 40) {
+    Write-Pass "copy-mode/copy-mode-vi keep $copyAfter built in keys, as in tmux"
+} else {
+    Write-Fail "copy tables have only $copyAfter keys after unbind-key -a (tmux keeps them)"
 }
 
 Write-Test "defaults_suppressed is true after runtime unbind"
@@ -342,7 +363,7 @@ Start-Process -FilePath $PSMUX -ArgumentList "new-session -d" -WindowStyle Hidde
 Start-Sleep -Seconds 3
 
 Write-Test "Initial: defaults suppressed after unbind-key -a"
-$c1 = (& $PSMUX list-keys 2>&1 | Measure-Object -Line).Lines
+$c1 = Get-PrefixRootKeyCount
 if ($c1 -eq 2) {
     Write-Pass "Initial: $c1 bindings (only user)"
 } else {
@@ -388,7 +409,7 @@ bind-key C-r source-file ~/.tmux.conf
 Start-Sleep -Milliseconds 500
 
 Write-Test "Re-suppressed after reload WITH unbind-key -a"
-$c3 = (& $PSMUX list-keys 2>&1 | Measure-Object -Line).Lines
+$c3 = Get-PrefixRootKeyCount
 if ($c3 -eq 2) {
     Write-Pass "Re-suppressed: $c3 bindings"
 } else {
