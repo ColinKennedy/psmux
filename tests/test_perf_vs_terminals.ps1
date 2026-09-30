@@ -83,9 +83,10 @@
 # So the psmux rows are judged against the floor, not against the host rows and
 # not against a number invented in a brief: tests/conpty_echolat.cs hosts a
 # pseudoconsole with the same shell and the same key record and no psmux at all,
-# it runs in the SAME run on the SAME machine, and T3a and T3c assert how far
-# above its median and p99 psmux sits. Measured overhead on this build is 0.74 ms
-# median and 1.57 ms p99 against budgets of 2.5 and 6.
+# it runs in the SAME run on the SAME machine. T3a and T3c used to assert how far
+# above its median and p99 psmux sits (0.74 ms median, 1.57 ms p99 at the time);
+# they now judge psmux's own hops split out per keystroke (1.7 to 1.8 ms median
+# on 2026-10-01), and the floor is held against the pane shell's echo time (T3d).
 #
 # MEMORY AND CPU ride along with the keystroke section, because that is the only
 # section that holds one cell alive long enough to watch it. For every cell the
@@ -161,11 +162,14 @@
 #       the day additionally pays a cold server spawn (about 215 ms measured
 #       separately in docs/performance.md). So 300 ms is applied to the steady
 #       state and the cold case gets its own budget, T2b at 700 ms.
-#   T3  psmux keystroke to screen, judged against the ConPTY floor measured in
-#       the same run. T3a: median minus the floor's median <= 2.5 ms. T3c: p99
-#       minus the floor's p99 <= 6 ms. T3b keeps an ABSOLUTE p99 ceiling of
-#       25 ms so the total a user waits is still bounded, and if the floor probe
-#       itself fails T3a falls back to an absolute 30 ms median ceiling.
+#   T3  psmux keystroke to screen. T3a: psmux's own hops per keystroke, median
+#       <= 2.5 ms, T3c: their p99 <= 6 ms, both split out of end to end with
+#       the server's pty trace in the same run (since 2026-10-01; before that
+#       they were end to end minus the standalone ConPTY floor, which broke when
+#       the floor moved with the machine's timer state, see section 2). T3d:
+#       the pane shell's own echo time under psmux at most 7 ms over the floor.
+#       T3b keeps an ABSOLUTE p99 ceiling of 25 ms so the total a user waits is
+#       still bounded. A cell whose trace does not split is reported only.
 #       The old absolute 10 ms median could not pass with a shell in the pane
 #       and no psmux change could make it: 15.8 of those 18 ms are conhost's
 #       pseudoconsole serializer. The budgets are about three times the measured
@@ -351,6 +355,7 @@ $script:Launch   = [ordered]@{}
 $script:Key      = [ordered]@{}
 $script:Create   = [ordered]@{}
 $script:Resource = [ordered]@{}                            # per cell memory and CPU
+$script:KeySplit = [ordered]@{}                            # per psmux cell: shell echo vs psmux hops, from the traced pass
 $script:Floor    = $null                                   # ConPTY floor, measured in this run
 $script:Started  = [System.Collections.ArrayList]::new()   # every PID we spawned
 # PID -> creation time of the process we spawned under that PID. A PID on its
@@ -396,7 +401,7 @@ function Head { param($m) Write-Host ""; Write-Host ("=" * 78) -ForegroundColor 
 # Such a threshold stays a hard failure when the run's own load samples say the
 # machine was quiet, and becomes a recorded warning when they do not. Every
 # threshold that is NOT a difference of two timings stays hard in all cases:
-# T3 is measured against the ConPTY floor taken in the same run, T4 is a p90 on
+# T3b and T3c are hard (T3a, a median, follows the load policy), T4 is a p90 on
 # psmux alone, T6, T7 and T8 are memory and CPU, and T5 counts processes. Those
 # are the ones that still catch a regression on a loaded box.
 #
@@ -967,12 +972,16 @@ function Wait-Marker {
 }
 
 function New-Wrapper {
-    param([string]$Tag, [string]$Line)
+    # $Trace: a PSMUX_PTY_TRACE base for a psmux cell hosted by a terminal. The
+    # tab is created by the terminal process, which does not pass the caller's
+    # environment through, so the variable has to be set here, inside the tab.
+    param([string]$Tag, [string]$Line, [string]$Trace = "")
     $f = Join-Path $RunDir "wrap_$Tag.cmd"
     $body = "@echo off`r`n" +
             "set PSMUX_DATA_DIR=$env:PSMUX_DATA_DIR`r`n" +
             "set PSMUX_SERVER_IMAGE_NAMES=$env:PSMUX_SERVER_IMAGE_NAMES`r`n" +
             "set PSMUX_SESSION_NAME=`r`n" +
+            $(if ($Trace) { "set PSMUX_PTY_TRACE=$Trace`r`n" } else { "" }) +
             "$Line`r`n"
     Set-Content -Path $f -Value $body -Encoding ASCII
     return $f
@@ -1036,6 +1045,7 @@ function Save-Metrics {
         launch_to_prompt    = $script:Launch
         keystroke_to_screen = $script:Key
         conpty_floor        = $script:Floor
+        keystroke_split     = $script:KeySplit
         resources           = $script:Resource
         creation_latency    = $script:Create
         summary_table  = $Rows
@@ -1248,11 +1258,34 @@ function Invoke-KeyLat {
 # before it returns.
 function Measure-KeyCell {
     param([string]$Cell, [string]$Exe, [string[]]$Argv, [string]$MarkerFile,
-          [string]$GuiProcName = "", [switch]$IsPsmux, [string]$Session = "", [int]$Attempt = 0)
+          [string]$GuiProcName = "", [switch]$IsPsmux, [string]$Session = "", [int]$Attempt = 0,
+          [string]$TraceBase = "", [switch]$SplitPass)
+    # $SplitPass: the SECOND, traced pass over a psmux cell. The first pass is
+    # untraced and owns the end to end number and every memory and CPU figure,
+    # so those stay measurements of the shipped path: tracing writes and flushes
+    # a line per hop in the server and the client, and no number that T3b or T6
+    # to T8 judge should ever include that. This pass only types the same keys
+    # down the same path and splits them; it samples nothing.
+    $kLabel = if ($SplitPass) { "${Cell}_trace" } else { $Cell }
     $snap = Snapshot-Hosts
     $since = Get-Date
     Remove-Item $MarkerFile -Force -ErrorAction SilentlyContinue
-    $p = Start-Process -FilePath $Exe -ArgumentList $Argv -PassThru
+    # A psmux cell runs with the keystroke trace on (see section 2's thresholds
+    # and Get-PerfShellSplit): set only around this launch, so the client
+    # inherits it and a server the client spawns inherits it from the client.
+    # A terminal hosted cell also gets it from its wrapper (New-Wrapper -Trace).
+    # Every attempt starts from an empty trace so a retried cell is never split
+    # against a previous attempt's server.
+    if ($TraceBase) {
+        Get-ChildItem -Path (Split-Path -Parent $TraceBase) -Filter ((Split-Path -Leaf $TraceBase) + ".*") -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        if ($TraceBase) { $env:PSMUX_PTY_TRACE = $TraceBase }
+        $p = Start-Process -FilePath $Exe -ArgumentList $Argv -PassThru
+    } finally {
+        Remove-Item Env:\PSMUX_PTY_TRACE -ErrorAction SilentlyContinue
+    }
     Register-Started $p.Id
     $m = Wait-Marker $MarkerFile 30000
     $ok = $false
@@ -1315,10 +1348,39 @@ function Measure-KeyCell {
             # CPU samples with it.
             for ($ka = 0; $ka -lt 3 -and -not $ok; $ka++) {
                 if ($ka -gt 0) { Start-Sleep -Milliseconds 800 }
-                $ok = Invoke-KeyLat $target $Cell $Keys
+                $ok = Invoke-KeyLat $target $kLabel $Keys
             }
         }
         $afterKeys = Sample-Roles $roles
+
+        # Split every keystroke of a psmux cell into the pane shell's own echo
+        # time and psmux's hops, from the server's trace of this very run.
+        if ($ok -and $SplitPass -and $TraceBase -and $script:Key[$kLabel]) {
+            $srvHow = "unknown"
+            if ($roles.ContainsKey("server")) {
+                $sci = Get-ProcInfo ([int]$roles["server"])
+                if ($sci -and $sci.CommandLine) { $srvHow = $(if ($sci.CommandLine -match '__warm__') { "warm claim" } else { "cold spawn" }) }
+            }
+            $sp = Get-PerfShellSplit -KeylatOut (Join-Path $RunDir "kl_$kLabel.txt") -TraceBase $TraceBase
+            $st = $script:Key[$kLabel]
+            $script:Key.Remove($kLabel)
+            $cov = if ($sp -and $st.n -gt 0) { $sp.PsmuxMs.Count / [double]$st.n } else { 0 }
+            if ($sp -and $cov -ge 0.8) {
+                $hs = [double[]]($sp.PsmuxMs | Sort-Object)
+                $ss = [double[]]($sp.ShellMs | Sort-Object)
+                $script:KeySplit[$Cell] = ([pscustomobject]@{
+                    n = $hs.Count; server = $srvHow
+                    traced_median = $st.median; traced_p99 = $st.p99
+                    psmux_median = (Percentile $hs 0.5); psmux_p90 = (Percentile $hs 0.9); psmux_p99 = (Percentile $hs 0.99)
+                    shell_median = (Percentile $ss 0.5); shell_p99 = (Percentile $ss 0.99)
+                })
+                Write-Host ("      split ({0}, n={1}): pane shell echo median {2:F2} ms | psmux hops median {3:F2}  p90 {4:F2}  p99 {5:F2} ms" -f `
+                    $srvHow, $hs.Count, $script:KeySplit[$Cell].shell_median, $script:KeySplit[$Cell].psmux_median, $script:KeySplit[$Cell].psmux_p90, $script:KeySplit[$Cell].psmux_p99) -ForegroundColor Green
+            } else {
+                Warn ("  {0} : the keystroke trace split {1} of {2} keys (server: {3}); this cell's floor subtraction is NOT judged, its end to end number is reported only" -f `
+                    $Cell, $(if ($sp) { $sp.PsmuxMs.Count } else { 0 }), $st.n, $srvHow)
+            }
+        }
 
         # TWO idle windows, because psmux's client polls adaptively (1 ms while
         # typing, then 5 ms, then 50 ms) and so does ConPTY. A window opened half
@@ -1338,6 +1400,7 @@ function Measure-KeyCell {
         # is ten ticks and the verdict stops depending on a single scheduling
         # accident. The ramp down window stays short because it is reported, not
         # judged, and its job is only to show the adaptive poll coming down.
+        if (-not $SplitPass) {
         $settle = 4
         $settledSeconds = [math]::Max($IdleSeconds, 8)
         Start-Sleep -Milliseconds 500
@@ -1389,6 +1452,7 @@ function Measure-KeyCell {
         Write-Host ("      idle cpu, first window ({0}s ramp down, not judged): {1}" -f $IdleSeconds, $earLine) -ForegroundColor DarkGray
         Write-Host ("      idle cpu, settled window ({0}s, T7 judges this)   : {1}" -f $settledSeconds, $idlLine) -ForegroundColor DarkGray
         if ($sh.gui_shared) { Write-Host ("      host $($sh.gui_name) pid $($sh.gui) is shared with the user's own windows: its working set is not this cell's cost") -ForegroundColor DarkGray }
+        }
     }
     $hosts = Find-CellHosts -Snap $snap -Since $since -Gui $GuiProcName -Ours @($p.Id, $shellPid)
     Close-Cell -Hosts $hosts -LauncherPid $p.Id -ShellPid $shellPid -Ns $(if ($IsPsmux) { $RunId } else { "" })
@@ -1401,7 +1465,7 @@ function Measure-KeyCell {
     if (-not $ok -and $Attempt -lt 2) {
         Warn ("  {0} : no data, attempt {1} of 3 failed, retrying" -f $Cell, ($Attempt + 1))
         return (Measure-KeyCell -Cell $Cell -Exe $Exe -Argv $Argv -MarkerFile $MarkerFile `
-                -GuiProcName $GuiProcName -IsPsmux:$IsPsmux -Session $Session -Attempt ($Attempt + 1))
+                -GuiProcName $GuiProcName -IsPsmux:$IsPsmux -Session $Session -Attempt ($Attempt + 1) -TraceBase $TraceBase -SplitPass:$SplitPass)
     }
     return $ok
 }
@@ -1476,12 +1540,18 @@ if (-not $SkipKeys -and $KeyLat) {
     $mf = Join-Path $RunDir "k_psmux.txt"
     $script:KeyCells += "psmux_attached"
     $null = Measure-KeyCell -Cell "psmux_attached" -Exe $Psmux -Argv (@("-L",$RunId,"new-session","-s","ka") + (Shell-Argv $mf)) -MarkerFile $mf -IsPsmux -Session "ka"
+    # the traced pass over the same path, for the split T3a and T3c judge
+    $mf = Join-Path $RunDir "k_psmux_trace.txt"
+    $null = Measure-KeyCell -Cell "psmux_attached" -Exe $Psmux -Argv (@("-L",$RunId,"new-session","-s","ka") + (Shell-Argv $mf)) -MarkerFile $mf -IsPsmux -Session "ka" -TraceBase (Join-Path $RunDir "ptrace_ka") -SplitPass
 
     if ($WT) {
         $mf = Join-Path $RunDir "k_psmuxwt.txt"
         $w = New-Wrapper "kpwt" ("`"$Psmux`" -L $RunId new-session -s kw " + (Shell-CmdLine $mf))
         $script:KeyCells += "psmux_in_wt"
         $null = Measure-KeyCell -Cell "psmux_in_wt" -Exe $WT -Argv @("-w",$WtWindow,"cmd","/c",$w) -MarkerFile $mf -GuiProcName "WindowsTerminal" -IsPsmux -Session "kw"
+        $mf = Join-Path $RunDir "k_psmuxwt_trace.txt"
+        $w = New-Wrapper "kpwtt" ("`"$Psmux`" -L $RunId new-session -s kw " + (Shell-CmdLine $mf)) -Trace (Join-Path $RunDir "ptrace_kw")
+        $null = Measure-KeyCell -Cell "psmux_in_wt" -Exe $WT -Argv @("-w",$WtWindow,"cmd","/c",$w) -MarkerFile $mf -GuiProcName "WindowsTerminal" -IsPsmux -Session "kw" -TraceBase (Join-Path $RunDir "ptrace_kw") -SplitPass
     }
 
     Head "2. KEYSTROKE THRESHOLDS  (judged against the ConPTY floor measured in this run)"
@@ -1502,19 +1572,51 @@ if (-not $SkipKeys -and $KeyLat) {
     # timer tick cannot hide. The absolute p99 ceiling stays at 25 ms so the total
     # a user waits is still bounded, and a 30 ms median ceiling takes over if the
     # floor probe itself fails.
+    #
+    # SINCE 2026-10-01 T3a and T3c JUDGE PSMUX'S OWN HOPS, not end to end minus
+    # the floor. On 2026-09-30 the standalone floor fell from ~15.7 to ~11.1 ms
+    # on this machine while pwsh inside a psmux pane kept taking ~15 ms from
+    # psmux's pty write to the read carrying the character, for an old and a new
+    # build alike (interleaved A/B, identical to 0.1 ms). The subtraction then
+    # charged psmux ~4.5 ms of machine timer state. So every psmux cell runs
+    # with PSMUX_PTY_TRACE on and each keystroke is split with the server's own
+    # stamps (Get-PerfShellSplit in perf_metrics_common.ps1): psmux's hops are
+    # end to end minus the pane shell's echo time. The budgets are unchanged and
+    # now stricter in effect, because the old subtraction hid about 1 ms of
+    # shell time inside the "overhead". The floor still takes part: T3d holds
+    # the pane shell's own echo time against it with a margin wider than the two
+    # timer states sit apart (~4.5 ms) and narrower than the extra 15.6 ms tick
+    # psmux would cost by answering a shell query late, which a split alone
+    # cannot see. A cell whose trace did not split is reported end to end only
+    # and says so; its floor subtraction is not judged.
     $best = $null
     foreach ($c in @("psmux_attached","psmux_in_wt")) {
         if ($script:Key[$c] -and ((-not $best) -or ($script:Key[$c].median -lt $best.median))) { $best = $script:Key[$c] }
     }
+    $bestSplit = $null; $bestSplitCell = ""
+    foreach ($c in @("psmux_attached","psmux_in_wt")) {
+        $k = $script:KeySplit[$c]
+        if (-not $k) { continue }
+        if ((-not $bestSplit) -or ($k.psmux_median -lt $bestSplit.psmux_median)) { $bestSplit = $k; $bestSplitCell = $c }
+    }
+    foreach ($c in @("psmux_attached","psmux_in_wt")) {
+        $k = $script:Key[$c]
+        if ($k -and $script:Floor) {
+            Info ("{0}: end to end minus the standalone floor, median {1:F2} ms, p99 {2:F2} ms (reported, not judged)" -f $c, ($k.median - $script:Floor.median), ($k.p99 - $script:Floor.p99))
+        }
+    }
     if ($best) {
-        if ($script:Floor) {
-            Check "T3a psmux keystroke median over the ConPTY floor" ($best.median - $script:Floor.median) 2.5 "ms" `
-                ("psmux {0:F2} ms minus the floor's {1:F2} ms, both measured in this run; the floor is conhost's pseudoconsole serializer and is paid by every ConPTY consumer" -f $best.median, $script:Floor.median)
-            Check "T3c psmux keystroke p99 over the ConPTY floor p99" ($best.p99 - $script:Floor.p99) 6 "ms" `
-                ("psmux {0:F2} ms minus the floor's {1:F2} ms" -f $best.p99, $script:Floor.p99)
+        if ($bestSplit) {
+            Check "T3a psmux keystroke median, psmux's own hops" $bestSplit.psmux_median 2.5 "ms" `
+                ("{0}, {1}: end to end minus the pane shell's own echo time, per keystroke from the server's pty trace; pane shell echo median {2:F2} ms" -f $bestSplitCell, $bestSplit.server, $bestSplit.shell_median) -LoadSensitive
+            Check "T3c psmux keystroke p99, psmux's own hops" $bestSplit.psmux_p99 6 "ms" `
+                ("{0}: the same split, p99 over {1} keystrokes" -f $bestSplitCell, $bestSplit.n)
+            if ($script:Floor) {
+                Check "T3d pane shell echo under psmux over the standalone ConPTY floor" ($bestSplit.shell_median - $script:Floor.median) 7 "ms" `
+                    ("pane shell {0:F2} ms against the floor's {1:F2} ms; a reply psmux answers late would add a whole 15.6 ms tick here" -f $bestSplit.shell_median, $script:Floor.median)
+            }
         } else {
-            Check "T3a psmux keystroke median (absolute ceiling, the floor could not be measured)" $best.median 30 "ms" `
-                "the floor probe failed, so this run can only bound the total; about 15.8 ms of it is conhost's, not psmux's"
+            Warn "T3a/T3c not judged: no psmux cell's keystroke trace could be split, so psmux's own hops were not measured; the end to end numbers above are reported only"
         }
         Check "T3b psmux keystroke p99 (absolute)" $best.p99 25 "ms" `
             "what a user actually waits for, floor included"
