@@ -286,10 +286,11 @@ backslashes, with or without `.exe`, in any letter case, quoted, and with argume
 | `pwsh`, `powershell` | `cd '<dir>'; [System.IO.Directory]::SetCurrentDirectory(...); cls` (the second call keeps the Win32 working directory in step so `#{pane_current_path}` follows) |
 | `cmd` | `cd /d "<dir>" & cls` |
 | `bash`, `zsh`, `sh`, `fish`, `dash`, `ksh`, `tcsh`, `csh`, `ash`, `busybox` | `cd '<dir>'; clear` with the path written with forward slashes |
+| `nu`, `nushell` | `cd '<dir>'; clear` with the path written with forward slashes; a path containing an apostrophe switches to double quotes (`cd "<dir>"`) because a nushell single-quoted string has no quote escape at all |
 | anything else | the PowerShell form |
 
 `git-bash.exe` (Git Bash's GUI launcher, which psmux runs as the console `bash.exe` beside it)
-counts as bash. Nushell and `wsl` fall into the last row; a `default-shell` of
+counts as bash. `wsl` falls into the last row; a `default-shell` of
 `C:\Windows\System32\bash.exe` is WSL's bash and gets the bash row, because the shell on the other
 side of it is a POSIX shell. If your `default-shell` falls into the last row and the injected line
 errors, turn warm panes off with `set -g warm off` so every pane starts cold in the requested

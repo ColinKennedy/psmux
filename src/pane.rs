@@ -405,6 +405,8 @@ pub(crate) enum RehomeSyntax {
     PowerShell,
     /// bash, sh, zsh, fish, dash, ksh, csh and friends.
     Posix,
+    /// Nushell (`nu` / `nushell`).
+    Nu,
     /// cmd.exe.
     Cmd,
 }
@@ -427,6 +429,8 @@ fn rehome_syntax_for_stem(stem: &str) -> Option<RehomeSyntax> {
         // rewrites it to the console `bash.exe` beside it when that file is
         // there, and when it is not the launcher still names bash.
         Some(RehomeSyntax::Posix)
+    } else if stem == "nu" || stem == "nushell" {
+        Some(RehomeSyntax::Nu)
     } else if stem == "cmd" {
         Some(RehomeSyntax::Cmd)
     } else if stem == "pwsh" || stem == "powershell" {
@@ -538,6 +542,24 @@ pub(crate) fn rehome_command(dir: &str, syntax: RehomeSyntax) -> String {
             let dir = if cfg!(windows) { dir.replace('\\', "/") } else { dir.to_string() };
             let escaped = dir.replace('\'', r"'\''");
             format!(" cd '{}'; clear\r", escaped)
+        }
+        RehomeSyntax::Nu => {
+            // Nushell single quotes are fully literal and have NO escape for
+            // a quote: doubling ('') keeps both characters, and a backslash
+            // before a quote does nothing but close the string. A path with
+            // an apostrophe therefore cannot travel in single quotes at all,
+            // while Windows paths may legally contain one. Double quotes can
+            // hold it — they escape \\ \" \$ — so an apostrophe switches
+            // the form. Separators are normalised like the POSIX form:
+            // `cd` accepts forward slashes, which leaves nothing to escape
+            // for the ordinary single-quoted spelling.
+            let dir = if cfg!(windows) { dir.replace('\\', "/") } else { dir.to_string() };
+            if dir.contains('\'') {
+                let escaped = dir.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
+                format!(" cd \"{}\"; clear\r", escaped)
+            } else {
+                format!(" cd '{}'; clear\r", dir)
+            }
         }
         RehomeSyntax::Cmd => {
             let escaped = dir.replace('"', "");
@@ -4116,6 +4138,10 @@ mod tests_dashdash_window_name;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue600_bash_rehome.rs"]
 mod tests_issue600_bash_rehome;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_nu_rehome.rs"]
+mod tests_nu_rehome;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue672_shell_basename_classify.rs"]
