@@ -528,10 +528,140 @@ fn expand_expression(expr: &str, app: &AppState, win_idx: usize) -> String {
 
 // ─────────────────── modifier chain parsing ──────────────────────
 
+/// tmux's `format_is_end` (format.c:4754).
+fn tmux_is_end(b: Option<u8>) -> bool {
+    matches!(b, Some(b';') | Some(b':'))
+}
+
+/// tmux's `format_skip1` (format.c:4684): the index of the first byte of `s`
+/// from `i` on that is in `end` outside any nested `#{...}`, stepping over the
+/// `#,` `##` `#{` `#}` `#:` escapes.
+fn tmux_skip1(s: &[u8], mut i: usize, end: &[u8]) -> Option<usize> {
+    let mut brackets: i32 = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c == b'#' && s.get(i + 1) == Some(&b'{') {
+            brackets += 1;
+        }
+        if c == b'#' && i + 1 < s.len() && b",#{}:".contains(&s[i + 1]) {
+            i += 2;
+            continue;
+        }
+        if c == b'}' {
+            brackets -= 1;
+        }
+        if end.contains(&c) && brackets == 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Where tmux's `format_build_modifiers` (format.c:4790 to :4900) ends the
+/// modifier list of `expr`: the index of the `:` it stops on, or `None` when
+/// tmux abandons the list.
+///
+/// tmux walks the list one modifier at a time and gives up on the WHOLE list
+/// at the first character it does not know (format.c:4841 `break`, then :4893
+/// returns NULL), so `#{t;Z:session_name}` has no modifiers at all and the
+/// complete text is looked up as one name. A modifier that takes arguments
+/// wraps them in an ASCII punctuation character other than `-`; any other
+/// character after it (a letter, a space, a byte of a UTF-8 sequence) starts
+/// one bare argument that runs to the next `:` or `;` (format.c:4855).
+///
+/// The letter sets are the union of tmux 3.4's and current tmux's, so a list
+/// either version accepts is accepted.
+fn tmux_modifier_colon(expr: &str) -> Option<usize> {
+    let s = expr.as_bytes();
+    let at = |i: usize| s.get(i).copied();
+    let mut cp = 0usize;
+    while cp < s.len() && s[cp] != b':' {
+        if s[cp] == b';' {
+            cp += 1;
+        }
+        if cp >= s.len() {
+            break;
+        }
+        let c = s[cp];
+        if b"labcdnwETSWPOVL!<>".contains(&c) && tmux_is_end(at(cp + 1)) {
+            cp += 1;
+            continue;
+        }
+        if cp + 1 < s.len()
+            && matches!(&s[cp..cp + 2], b"||" | b"&&" | b"!!" | b"!=" | b"==" | b"<=" | b">=")
+            && tmux_is_end(at(cp + 2))
+        {
+            cp += 2;
+            continue;
+        }
+        if !b"ImCLNPSOVst=pReqWc".contains(&c) {
+            break;
+        }
+        if tmux_is_end(at(cp + 1)) {
+            cp += 1;
+            continue;
+        }
+        let Some(sep) = at(cp + 1) else { break };
+        if !sep.is_ascii_punctuation() || sep == b'-' {
+            match tmux_skip1(s, cp + 1, b":;") {
+                Some(e) => { cp = e; continue; }
+                None => break,
+            }
+        }
+        let last = [sep, b';', b':'];
+        cp += 1;
+        loop {
+            if s[cp] == sep && tmux_is_end(at(cp + 1)) {
+                cp += 1;
+                break;
+            }
+            match tmux_skip1(s, cp + 1, &last) {
+                Some(e) => cp = e,
+                None => break,
+            }
+            if tmux_is_end(at(cp)) {
+                break;
+            }
+        }
+    }
+    if at(cp) == Some(b':') { Some(cp) } else { None }
+}
+
 /// Try to parse and apply modifier chain(s). Returns None if expr is a plain variable.
 fn try_expand_modifier_chain(expr: &str, app: &AppState, win_idx: usize) -> Option<String> {
     let bytes = expr.as_bytes();
     let first = bytes[0];
+
+    let Some(colon_pos) = tmux_modifier_colon(expr) else {
+        // Not a modifier list tmux accepts. tmux then treats the whole text as
+        // one name (format.c:4893 hands back no modifiers and the key
+        // unchanged), which expands as a format when it holds `#{` and is
+        // looked up as a name otherwise (format_replace's final branch): an
+        // unknown name, so nothing. `#{t;Z:session_name}` is empty in tmux; it
+        // used to drop the unknown `Z` and apply `t`.
+        let looks_like_chain = b"labcdnwETSWPOVL!<>ImCLNPSOVst=pReqWc|&;".contains(&first);
+        if looks_like_chain && find_modifier_colon(expr).is_some() {
+            if expr.contains("#{") {
+                return Some(expand_format_for_window(expr, app, win_idx));
+            }
+            return Some(String::new());
+        }
+        return None;
+    };
+
+    // Separators before the first modifier are skipped (format.c:4813), and a
+    // list with no modifiers in it (`#{:name}`, `#{;:name}`) is a plain lookup
+    // of what follows the colon.
+    let mod_spec = expr[..colon_pos].trim_start_matches(';');
+    let target = &expr[colon_pos + 1..];
+    if mod_spec.bytes().all(|b| b == b';') {
+        if target.contains("#{") {
+            return Some(expand_format_for_window(target, app, win_idx));
+        }
+        return Some(expand_var(target, app, win_idx));
+    }
+    let first = mod_spec.as_bytes()[0];
 
     // Quick check: does this look like a modifier?
     let is_modifier_start = matches!(first,
@@ -545,16 +675,10 @@ fn try_expand_modifier_chain(expr: &str, app: &AppState, win_idx: usize) -> Opti
 
     // Special: 'l' modifier with colon — #{l:string} returns literal string
     if first == b'l' {
-        if let Some(colon_pos) = find_modifier_colon(expr) {
-            let literal_val = &expr[colon_pos + 1..];
-            return Some(literal_val.to_string());
-        }
+        return Some(target.to_string());
     }
 
-    // Find the colon separating modifier spec from the variable/format
-    if let Some(colon_pos) = find_modifier_colon(expr) {
-        let mod_spec = &expr[..colon_pos];
-        let target = &expr[colon_pos + 1..];
+    {
 
         // Parse modifier chain (separated by ';')
         let modifiers = parse_modifier_chain(mod_spec);
@@ -586,9 +710,6 @@ fn try_expand_modifier_chain(expr: &str, app: &AppState, win_idx: usize) -> Opti
         }
 
         Some(value)
-    } else {
-        // No colon found — treat as plain variable
-        None
     }
 }
 
@@ -636,6 +757,9 @@ enum Modifier {
     Match { regex: bool, case_insensitive: bool },
     SearchContent { _regex: bool, _case_insensitive: bool },
     Width,
+    /// A modifier tmux parses and then ignores (`s` without both of its
+    /// arguments): it changes nothing but keeps the list valid.
+    Ignored,
 }
 
 /// Parse a modifier chain string (e.g. "s|foo|bar|;=5" ) into modifiers.
@@ -687,10 +811,13 @@ fn parse_single_modifier(spec: &str) -> Option<Modifier> {
             Some(Modifier::Pad(n))
         }
         's' => {
-            // tmux only takes an ASCII punctuation wrapper (format.c ispunct);
-            // anything else is one bare argument, which `s` ignores.
-            let sep = rest.chars().next()?;
-            if !sep.is_ascii() { return None; }
+            // tmux only takes an ASCII punctuation wrapper other than `-`
+            // (format.c:4855); anything else is one bare argument, and `s`
+            // with fewer than two arguments is skipped while the rest of the
+            // list still applies (format.c:5857). `#{sXaXbX:v}` and
+            // `#{s:v}` are both just `v` in tmux.
+            let Some(sep) = rest.chars().next() else { return Some(Modifier::Ignored) };
+            if !sep.is_ascii_punctuation() || sep == '-' { return Some(Modifier::Ignored); }
             let inner = &rest[1..];
             let parts: Vec<&str> = inner.splitn(3, sep).collect();
             let pattern = parts.first().unwrap_or(&"").to_string();
@@ -703,9 +830,10 @@ fn parse_single_modifier(spec: &str) -> Option<Modifier> {
             })
         }
         'e' => {
-            // Same wrapper rule as `s`: a non ASCII separator is not one.
+            // Same wrapper rule as `s`: only ASCII punctuation other than `-`
+            // wraps the arguments.
             let sep = rest.chars().next()?;
-            if !sep.is_ascii() { return None; }
+            if !sep.is_ascii_punctuation() || sep == '-' { return None; }
             let inner = &rest[1..];
             let parts: Vec<&str> = inner.splitn(3, sep).collect();
             let op = parts.first().and_then(|s| s.chars().next()).unwrap_or('+');
@@ -920,6 +1048,7 @@ fn apply_modifier(m: &Modifier, value: &str, app: &AppState, win_idx: usize) -> 
         Modifier::Width => {
             value.chars().count().to_string()
         }
+        Modifier::Ignored => value.to_string(),
     }
 }
 
@@ -2285,3 +2414,7 @@ mod tests_issue580_pane_start_command;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_format_modifier_utf8.rs"]
 mod tests_issue712_format_modifier_utf8;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_format_modifier_chain_parity.rs"]
+mod tests_format_modifier_chain_parity;
