@@ -58,6 +58,8 @@ const COLS: u16 = 60;
 
 #[derive(Debug)]
 struct DummyWriter;
+impl crate::pane::PaneInputSink for DummyWriter {}
+
 impl std::io::Write for DummyWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
