@@ -164,6 +164,7 @@ pub const COPY_MODE_VI_DEFAULTS: &[(&str, &str)] = &[
     (",", "send-keys -X jump-reverse"),
     ("/", "send-keys -X search-forward"),
     ("0", "send-keys -X start-of-line"),
+    (":", "command-prompt -p'(goto line)' { send -X goto-line -- '%%' }"),
     (";", "send-keys -X jump-again"),
     ("?", "send-keys -X search-backward"),
     ("A", "send-keys -X append-selection-and-cancel"),
@@ -411,6 +412,8 @@ const COPY_MODE_VI: &[(&str, &str)] = &[
     ("?",         "search-backward"),
     ("n",         "search-again"),
     ("N",         "search-reverse"),
+    // Goto line
+    (":",         "command-prompt -p'(goto line)' { send -X goto-line -- '%%' }"),
     // Registers / text objects
     ("\"{a-z}",   "set register for next yank"),
     ("aw",        "select-word (a word)"),

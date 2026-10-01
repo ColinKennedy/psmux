@@ -499,6 +499,14 @@ Search covers the whole scrollback, not just the rows on screen. A match that is
 scrolls the view to it, parked a quarter of a screen from the bottom the way tmux does, and
 `?` stops at the nearest match above the cursor.
 
+### Goto Line
+
+| Key | Action |
+|-----|--------|
+| `:` | Ask for a line number and move the view to it (`mode-keys vi` only) |
+
+See [Copy Mode Goto Line Prompt](#copy-mode-goto-line-prompt) for what the number counts.
+
 ### Text Objects & Registers
 
 | Key | Action |
@@ -525,6 +533,28 @@ Opened by `/`, `?`, `Ctrl+s` or `Ctrl+r`. While it is open the copy mode keys ar
 | `Backspace` | Delete the last character |
 | `Enter` | Accept the search and jump to the match |
 | `Esc` | Cancel the search |
+
+### Copy Mode Goto Line Prompt
+
+Opened by `:` with `mode-keys vi`, which is the key tmux binds it to in `copy-mode-vi`. While it is
+open the copy mode keys are inactive.
+
+| Key | Action |
+|-----|--------|
+| Any character | Append to the line number |
+| `Backspace` | Delete the last character |
+| `Enter` | Move the view to that line |
+| `Esc` | Cancel and leave the view where it was |
+
+What the number counts follows `copy-mode-line-numbers`, so it always matches the gutter on screen:
+
+| `copy-mode-line-numbers` | The number means |
+|-----|--------|
+| `absolute`, `relative`, `hybrid` | A line of the whole buffer, counting the oldest retained line as 1 |
+| `off`, `default` | How many lines back from the live bottom to scroll |
+
+A line number past the end is clamped to the end, and anything that is not a number leaves the view
+alone. The same rules apply to `send-keys -X goto-line <n>`.
 
 ### Emacs Copy Mode
 

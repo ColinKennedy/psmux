@@ -350,7 +350,7 @@ pub fn resize_window_panes(app: &mut AppState, window_index: usize, area: Rect) 
     // otherwise measure its own pane's retained depth and apply the shift to
     // the pane the user is actually looking at.
     let copy_view_before = if window_index == app.active_idx
-        && matches!(app.mode, crate::types::Mode::CopyMode | crate::types::Mode::CopySearch { .. })
+        && app.mode.in_copy()
     {
         let win = &app.windows[window_index];
         active_pane(&win.root, &win.active_path).map(|p| {

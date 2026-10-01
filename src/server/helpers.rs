@@ -93,7 +93,7 @@ pub(crate) fn serialize_bindings_json(app: &AppState) -> String {
 pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
     if !buf.ends_with('}') { return; }
     let cln = app.user_options.get("copy-mode-line-numbers").filter(|v| v.as_str() != "off");
-    let in_copy = matches!(app.mode, crate::types::Mode::CopyMode | crate::types::Mode::CopySearch { .. });
+    let in_copy = app.mode.in_copy();
     if cln.is_none() && !in_copy { return; }
     let hsize = app.windows.get(app.active_idx)
         .and_then(|win| crate::tree::active_pane(&win.root, &win.active_path))
@@ -454,6 +454,7 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
         crate::types::Mode::MenuMode { .. } => 7,
         crate::types::Mode::PaneChooser { .. } => 8,
         crate::types::Mode::BufferChooser { .. } => 9,
+        crate::types::Mode::CopyGoto { .. } => 11,
         _ => 10,
     };
     v = v.wrapping_add(mode_tag.wrapping_mul(0x1_0000_0000));

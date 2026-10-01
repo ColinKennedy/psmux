@@ -18,7 +18,7 @@ pub fn emit_osc52<W: Write>(writer: &mut W, text: &str) {
 
 /// True while the focused pane is in copy mode, including its search prompt.
 pub fn in_copy_mode(app: &AppState) -> bool {
-    matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. })
+    app.mode.in_copy()
 }
 
 pub fn enter_copy_mode(app: &mut AppState) {
@@ -237,7 +237,7 @@ pub fn exit_copy_mode(app: &mut AppState) {
 /// copy mode with `copy-mode -t` lost its snapshot on the very next frame, and
 /// its own output went back to pushing the view (#673).
 pub fn sync_copy_snapshot(app: &mut AppState) {
-    let focused_in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    let focused_in_copy = in_copy_mode(app);
     let active_id = app
         .windows
         .get(app.active_idx)
@@ -335,7 +335,8 @@ pub fn restore_copy_state_from_pane(app: &mut AppState) {
 /// Call the `switch_fn` closure between save and restore to perform the
 /// actual focus change.
 pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switch_fn: F) {
-    let was_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    let was_copy = in_copy_mode(app);
+    let had_prompt = copy_prompt_text(&app.mode).is_some();
     if was_copy {
         save_copy_state_to_pane(app);
     }
@@ -349,6 +350,38 @@ pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switc
     } else if was_copy {
         // We were in copy mode but new pane is not — switch to passthrough.
         app.mode = Mode::Passthrough;
+    }
+    sync_copy_prompt_status(app, had_prompt);
+}
+
+/// The status line text of the copy mode prompt `mode` holds open, if any.
+///
+/// The prompts are drawn as a sticky status message, and the status line is
+/// not per pane, so this is the one place that says what the message reads.
+pub fn copy_prompt_text(mode: &Mode) -> Option<String> {
+    match mode {
+        Mode::CopySearch { input, forward } => {
+            let arrow = if *forward { "down" } else { "up" };
+            Some(format!("(search {}) {}", arrow, input))
+        }
+        Mode::CopyGoto { input } => Some(format!("(goto line) {}", input)),
+        _ => None,
+    }
+}
+
+/// Make the status line show the prompt of the pane that has focus now.
+///
+/// A prompt's sticky message stayed behind when focus moved: `select-pane`
+/// away from a pane with `(goto line) 1` or `(search down) x` open left that
+/// text on the status line over a pane that was not even in copy mode, until
+/// something else replaced it. `had_prompt` says whether the pane focus left
+/// had a prompt open, which is the only case where the message is ours to
+/// clear.
+fn sync_copy_prompt_status(app: &mut AppState, had_prompt: bool) {
+    if let Some(text) = copy_prompt_text(&app.mode) {
+        app.status_message = Some((text, std::time::Instant::now(), Some(0)));
+    } else if had_prompt {
+        app.status_message = None;
     }
 }
 
@@ -376,7 +409,7 @@ pub fn active_pane_id(app: &AppState) -> Option<usize> {
 /// live one.  Call the first before the active pane changes and the second
 /// after, passing the pane id captured before the change.
 pub fn park_mode_on_active_pane(app: &mut AppState) {
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if in_copy_mode(app) {
         save_copy_state_to_pane(app);
     }
 }
@@ -390,12 +423,18 @@ pub fn retarget_mode_to_active_pane(app: &mut AppState, prev: Option<usize>) {
     if now == prev {
         return;
     }
+    let had_prompt = copy_prompt_text(&app.mode).is_some();
+    retarget_mode_inner(app);
+    sync_copy_prompt_status(app, had_prompt);
+}
+
+fn retarget_mode_inner(app: &mut AppState) {
     let has_copy = app.windows.get(app.active_idx)
         .and_then(|w| active_pane(&w.root, &w.active_path))
         .map_or(false, |p| p.copy_state.is_some());
     if has_copy {
         restore_copy_state_from_pane(app);
-    } else if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    } else if in_copy_mode(app) {
         // The pane that owned copy mode is no longer the active one, and the
         // pane that is has never been in copy mode.  Drop the live copy
         // cursor with the mode so nothing of the old pane's selection is left
@@ -800,7 +839,7 @@ pub fn offset_after_trim(
 /// history fell to 508, then settled at scroll == history_size with the view
 /// stuck on line 1.
 pub fn reanchor_after_resize(app: &mut AppState, offset_before: usize, filled_before: usize) {
-    if !matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if !in_copy_mode(app) {
         return;
     }
     let after = {
@@ -844,6 +883,64 @@ pub fn scroll_to_bottom(app: &mut AppState) {
     let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
     parser.screen_mut().set_scrollback(0);
     app.copy_scroll_offset = 0;
+}
+
+/// Read a line number the way tmux reads it and jump there.
+///
+/// An argument that is not a number, or one outside the range tmux reads with
+/// `strtonum(linestr, -1, INT_MAX, &errstr)`, leaves the view alone
+/// (window-copy.c:4587-4589). So does an empty one (window-copy.c:2491).
+pub fn run_goto_line(app: &mut AppState, arg: &str) {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() { return; }
+    match trimmed.parse::<i64>() {
+        Ok(n) if (-1..=i32::MAX as i64).contains(&n) => goto_line(app, n),
+        _ => {}
+    }
+}
+
+/// The scroll offset `goto-line <lineno>` asks for, given the size of the
+/// history and whether line numbers are being counted absolutely.
+///
+/// This is `window_copy_goto_line` (window-copy.c:4579-4606) with the screen
+/// writes left out so it can be tested on its own. Absolute numbering counts
+/// 1-based lines of the whole grid, so line `hsize + 1` is the first row of
+/// the live screen; otherwise the number is how many lines back from the live
+/// bottom to park, which is what the `default` gutter prints.
+pub fn goto_line_offset(lineno: i64, hsize: usize, absolute: bool) -> usize {
+    let hsize = hsize as i64;
+    if absolute {
+        let line = lineno.clamp(1, hsize + 1);
+        (hsize - (line - 1)) as usize
+    } else if lineno < 0 || lineno > hsize {
+        hsize as usize
+    } else {
+        lineno as usize
+    }
+}
+
+/// Bring line `lineno` into view, as tmux `window_copy_goto_line` does.
+///
+/// Only the viewport moves. tmux leaves the cursor row `cy` alone here, so the
+/// copy cursor stays on the screen row it was on and comes to mean whichever
+/// content line is now under it, which is also why `copy_pos_scroll_offset`
+/// stays `None` (see its comment in types.rs: a scroll leaves it there).
+pub fn goto_line(app: &mut AppState, lineno: i64) {
+    let geom = match grid_geometry(app) { Some(g) => g, None => return };
+    // `copy_line_numbers::is_absolute` is the same question the gutter asks, so
+    // the number typed here always means what the gutter printed.
+    let absolute = crate::copy_line_numbers::is_absolute(
+        crate::copy_line_numbers::CopyLnMode::parse(
+            app.user_options.get("copy-mode-line-numbers").map(|s| s.as_str()).unwrap_or("off"),
+        ),
+    );
+    let offset = goto_line_offset(lineno, geom.history, absolute);
+
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
+    parser.screen_mut().set_scrollback(offset);
+    app.copy_scroll_offset = parser.screen().scrollback();
 }
 
 pub fn yank_selection(app: &mut AppState) -> io::Result<()> {

@@ -1362,7 +1362,7 @@ fn send_keys_x_takes_count(name: &str) -> bool {
 /// that takes a repeat count. A command that leaves copy mode ends the
 /// repeat.
 fn run_send_keys_x(app: &mut AppState, cmd: &str, count: usize) -> Result<(), String> {
-    if !matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if !app.mode.in_copy() {
         return Err("not in a mode".to_string());
     }
     let name = cmd.split_whitespace().next().unwrap_or("");
@@ -1374,7 +1374,7 @@ fn run_send_keys_x(app: &mut AppState, cmd: &str, count: usize) -> Result<(), St
     }
     let reps = if send_keys_x_takes_count(name) { count } else { 1 };
     for _ in 0..reps {
-        if !matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) { break; }
+        if !app.mode.in_copy() { break; }
         run_copy_mode_command_by_name(app, cmd);
     }
     Ok(())
@@ -1581,10 +1581,13 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
             if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
         }
         s if s.starts_with("goto-line") => {
-            // goto-line <N> — jump to line N in scrollback
-            let n = s.strip_prefix("goto-line").unwrap_or("").trim()
-                .parse::<u16>().unwrap_or(0);
-            app.copy_pos = Some((n, 0));
+            // goto-line <N>: move the view to line N, which is what
+            // window_copy_goto_line does (window-copy.c:4579).
+            // This used to write N into the copy cursor's SCREEN row and leave
+            // the scroll offset alone, so a line in the scrollback could not be
+            // reached at all and a number past the pane height was clamped away.
+            let arg = s.strip_prefix("goto-line").unwrap_or("");
+            crate::copy_mode::run_goto_line(app, arg);
         }
         "jump-forward" => { app.copy_find_char_pending = Some(0); }
         "jump-backward" => { app.copy_find_char_pending = Some(1); }
@@ -3250,7 +3253,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
                     // ── Automatic rename / allow-rename: resolve window names ──
                     {
-                        let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+                        let in_copy = app.mode.in_copy();
                         let global_auto_rename = app.automatic_rename;
                         let allow_rename = app.allow_rename;
                         // #648: automatic-rename is a WINDOW option, so each
@@ -3858,7 +3861,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     send_bytes_to_active(&mut app, &bytes)?;
                 }
                 CtrlReq::SendKeys(keys, literal) => {
-                    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+                    let in_copy = app.mode.in_copy();
                     if in_copy {
                         // In copy/search mode — route through mode-aware handlers
                         if literal {
