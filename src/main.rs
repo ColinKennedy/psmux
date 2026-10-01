@@ -5654,29 +5654,71 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
     let reader_stream = reader.get_ref().try_clone()?;
     let cc_log_path = Some(cc_log_path);
     let cc_log_out = cc_log_path.clone();
+    // Set once stdin has ended: from then on the main thread owns the exit
+    // (it drains the reader and prints %exit itself).
+    let stdin_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdin_closed_rd = stdin_closed.clone();
+    // The last %exit line the server relayed, if the stream ended right
+    // after one, so the client does not print a second %exit.
+    let relayed_exit: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let relayed_exit_rd = relayed_exit.clone();
     let reader_thread = std::thread::spawn(move || {
-        let mut br = io::BufReader::new(reader_stream);
-        let mut line = String::new();
-        let stdout = io::stdout();
-        let start = std::time::Instant::now();
-        let mut log_file = cc_log_out.as_ref().and_then(|p| {
-            std::fs::OpenOptions::new().append(true).open(p).ok()
-        });
-        loop {
-            line.clear();
-            match br.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if let Some(ref mut f) = log_file {
-                        let _ = writeln!(f, "[{:>8.3}s] OUT ({} bytes): {:?}",
-                            start.elapsed().as_secs_f64(), line.len(),
-                            &line[..line.len().min(200)]);
+        let relay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut br = io::BufReader::new(reader_stream);
+            // Bytes, not String: a server line is relayed exactly as sent,
+            // and a stray invalid UTF-8 byte must not end the relay either.
+            let mut line: Vec<u8> = Vec::new();
+            let stdout = io::stdout();
+            let start = std::time::Instant::now();
+            let mut log_file = cc_log_out.as_ref().and_then(|p| {
+                std::fs::OpenOptions::new().append(true).open(p).ok()
+            });
+            loop {
+                line.clear();
+                match br.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Some(ref mut f) = log_file {
+                            let text = String::from_utf8_lossy(&line);
+                            let _ = writeln!(f, "[{:>8.3}s] OUT ({} bytes): {:?}",
+                                start.elapsed().as_secs_f64(), line.len(),
+                                crate::util::str_prefix_within(&text, 200));
+                        }
+                        let is_exit = line.starts_with(b"%exit")
+                            && matches!(line.get(5), None | Some(b' ') | Some(b'\n') | Some(b'\r'));
+                        if let Ok(mut slot) = relayed_exit_rd.lock() {
+                            *slot = if is_exit {
+                                Some(String::from_utf8_lossy(&line).trim_end().to_string())
+                            } else {
+                                None
+                            };
+                        }
+                        let mut out = stdout.lock();
+                        let _ = out.write_all(&line);
+                        let _ = out.flush();
                     }
-                    let mut out = stdout.lock();
-                    let _ = out.write_all(line.as_bytes());
-                    let _ = out.flush();
                 }
             }
+        }));
+        // The relay is over: the server closed the connection, the read
+        // failed, or the relay itself panicked. A control client with no
+        // relay is useless, so leave like tmux's client does on losing its
+        // server (client.c: print %exit, exit) instead of lingering with
+        // stdin still forwarding into the void (#712).
+        if stdin_closed_rd.load(std::sync::atomic::Ordering::Acquire) {
+            return; // the main thread is already shutting down and prints %exit
+        }
+        let relayed = relayed_exit_rd.lock().ok().and_then(|s| s.clone());
+        let (exit_line, code) = match (&relay, &relayed) {
+            // The server said why (detach, kill-server, too far behind).
+            // tmux exits 1 when the server shut down under it.
+            (Ok(()), Some(l)) => (None, if l == "%exit server exited" { 1 } else { 0 }),
+            (Ok(()), None) => (Some("%exit server exited unexpectedly"), 1),
+            (Err(_), _) => (Some("%exit"), 1),
+        };
+        if control_mode_finish(mode, exit_line) {
+            std::process::exit(code);
         }
     });
 
@@ -5874,6 +5916,7 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
     // After stdin EOF, shut down the TCP write side so the server sees
     // EOF and can clean up.  Then emit %exit + ST to stdout like real
     // tmux's client does (tmux/client.c).
+    stdin_closed.store(true, std::sync::atomic::Ordering::Release);
     let _ = write_stream.shutdown(std::net::Shutdown::Write);
     if let Some(ref mut f) = stdin_log_file {
         let _ = writeln!(f, "[{:>8.3}s] stdin closed (total_bytes_read={}), TCP write shut down",
@@ -5900,17 +5943,35 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
     // Emit %exit and ST to stdout like real tmux's client does
     // (tmux/client.c). iTerm2 watches for %exit to leave tmux
     // integration mode cleanly.  ST (\x1b\\) terminates the DCS.
-    {
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        let _ = out.write_all(b"%exit\n");
-        if mode == 2 {
-            let _ = out.write_all(b"\x1b\\");
-        }
-        let _ = out.flush();
-    }
+    // If the server's own %exit was the last line relayed, do not repeat it.
+    let relayed = relayed_exit.lock().ok().and_then(|s| s.clone());
+    control_mode_finish(mode, if relayed.is_some() { None } else { Some("%exit") });
 
     Ok(())
+}
+
+/// Print the control client's closing lines exactly once per process:
+/// `exit_line` (when the server has not already sent its own %exit) and,
+/// for `-CC`, the ST that ends the DCS. Returns false if another thread
+/// already finished, so the caller must not exit or print again.
+fn control_mode_finish(mode: u8, exit_line: Option<&str>) -> bool {
+    static FINISHED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut done = FINISHED.lock().unwrap_or_else(|e| e.into_inner());
+    if *done {
+        return false;
+    }
+    *done = true;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if let Some(l) = exit_line {
+        let _ = out.write_all(l.as_bytes());
+        let _ = out.write_all(b"\n");
+    }
+    if mode == 2 {
+        let _ = out.write_all(b"\x1b\\");
+    }
+    let _ = out.flush();
+    true
 }
 
 /// Returns `true` when stdout is a Windows console handle (ConPTY).
