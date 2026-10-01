@@ -2971,19 +2971,28 @@ fn deliver_paste_to_pane(pane: &mut crate::types::Pane, text: &str, use_bracket:
     };
     if route == PasteRoute::Inject {
         if let Some(pid) = pane.child_pid {
-            // send_vt_response encodes as UTF-16 and normalises a line break to
-            // CR exactly as write_paste_chunked does, so the child sees the same
-            // bytes whichever route carried them.
-            let payload = format!("\x1b[200~{}\x1b[201~", text);
-            let ok = crate::platform::mouse_inject::send_vt_response(pid, &payload);
-            crate::debug_log::input_log(
-                "paste",
-                &format!("route=inject pid={} text_len={} ok={}", pid, text.len(), ok),
-            );
-            if ok {
-                return;
+            // The injection runs on the pane writer thread, in order with the
+            // bytes queued before and after it, never on this (the server)
+            // thread: see pane::spawn_pane_write_queue_with.  It encodes as
+            // UTF-16 and normalises a line break to CR exactly as
+            // write_paste_chunked does, so the child sees the same bytes
+            // whichever route carried them, and a failed injection falls back
+            // to the pipe there for whatever the console did not take.  The
+            // outcome is logged there as `route=inject pid=.. ok=..`.
+            let job = crate::pane::InjectPaste { pid, text: text.to_owned(), normalize };
+            match pane.writer.queue_inject_paste(job) {
+                Ok(()) => {
+                    crate::debug_log::input_log(
+                        "paste",
+                        &format!("route=inject queued pid={} text_len={}", pid, text.len()),
+                    );
+                    return;
+                }
+                Err(_) => crate::debug_log::input_log(
+                    "paste",
+                    "route=inject wanted but the pane writer cannot carry it, using the pipe",
+                ),
             }
-            crate::debug_log::input_log("paste", "route=inject failed, falling back to the pipe");
         } else {
             crate::debug_log::input_log(
                 "paste",
@@ -3043,14 +3052,37 @@ pub(crate) const PASTE_SLICE: usize = 64 * 1024;
 /// 1.3 MB pastes into PSReadLine and nvim arrive line exact.
 ///
 /// The inject route (`deliver_paste_to_pane`, below build 22523 or with
-/// PSMUX_PASTE_INJECT=1) does not come through here; its one
-/// WriteConsoleInputW call still runs on the server thread.
+/// PSMUX_PASTE_INJECT=1) does not come through here: it queues an
+/// `InjectPaste` on the same pane writer, whose thread performs the
+/// WriteConsoleInputW calls in order with these bytes.
 ///
 /// The bytes are a single ordered run, `ESC[200~`, text, `ESC[201~`, written
 /// in one call from the server thread, the only producer for this writer, so
 /// nothing written to the pane later (a key typed after the paste) can land
 /// inside the brackets or ahead of the paste.
 fn write_paste_bytes(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool, normalize: bool) {
+    let (open, close): (&[u8], &[u8]) = if bracket { (b"\x1b[200~", b"\x1b[201~") } else { (b"", b"") };
+    let _ = write_paste_parts(writer, open, text, close, normalize);
+}
+
+/// The pipe fallback for an injected paste the console did not take whole:
+/// whatever of `ESC[200~` + `text` + `ESC[201~` lies past `consumed` (a byte
+/// offset into that payload, see `pane::PasteInjectResult`) goes to `writer`,
+/// the pane's raw input pipe, on the pane writer thread.  Nothing the console
+/// already took is sent twice.  False when the pipe write failed.
+pub(crate) fn write_paste_remainder(writer: &mut dyn std::io::Write, text: &str, consumed: usize, normalize: bool) -> bool {
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+    let text = text.as_bytes();
+    let open = &OPEN[consumed.min(OPEN.len())..];
+    let t = consumed.saturating_sub(OPEN.len()).min(text.len());
+    let c = consumed.saturating_sub(OPEN.len() + text.len()).min(CLOSE.len());
+    write_paste_parts(writer, open, &text[t..], &CLOSE[c..], normalize)
+}
+
+/// `open`, `text` (line endings normalised when asked) and `close`, handed to
+/// `writer` in [`PASTE_SLICE`] slices.  False once a write fails.
+fn write_paste_parts(writer: &mut dyn std::io::Write, open: &[u8], text: &[u8], close: &[u8], normalize: bool) -> bool {
     // Append to the slice, handing each full slice to the writer.  False once
     // a write fails, which means the pane writer thread is gone (the pane is
     // closing) and the rest of the paste has nowhere to go.
@@ -3067,10 +3099,10 @@ fn write_paste_bytes(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool
         }
         true
     }
-    let mut slice: Vec<u8> = Vec::with_capacity(PASTE_SLICE.min(text.len() + 12));
-    if bracket && !push(writer, &mut slice, b"\x1b[200~") { return; }
+    let mut slice: Vec<u8> = Vec::with_capacity(PASTE_SLICE.min(open.len() + text.len() + close.len()));
+    if !push(writer, &mut slice, open) { return false; }
     if !normalize {
-        if !push(writer, &mut slice, text) { return; }
+        if !push(writer, &mut slice, text) { return false; }
     } else {
         // Normalize line endings to CR for ConPTY.  Clipboard text may arrive
         // with LF (\n) or CRLF (\r\n), but ConPTY's input parser expects CR
@@ -3082,20 +3114,21 @@ fn write_paste_bytes(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool
         while i < text.len() {
             let b = text[i];
             if b == b'\n' || (b == b'\r' && text.get(i + 1) == Some(&b'\n')) {
-                if !push(writer, &mut slice, &text[run..i]) || !push(writer, &mut slice, b"\r") { return; }
+                if !push(writer, &mut slice, &text[run..i]) || !push(writer, &mut slice, b"\r") { return false; }
                 i += if b == b'\r' { 2 } else { 1 };
                 run = i;
             } else {
                 i += 1;
             }
         }
-        if !push(writer, &mut slice, &text[run..]) { return; }
+        if !push(writer, &mut slice, &text[run..]) { return false; }
     }
-    if bracket && !push(writer, &mut slice, b"\x1b[201~") { return; }
-    if !slice.is_empty() {
-        let _ = writer.write_all(&slice);
+    if !push(writer, &mut slice, close) { return false; }
+    if !slice.is_empty() && writer.write_all(&slice).is_err() {
+        return false;
     }
     let _ = writer.flush();
+    true
 }
 
 /// Send pasted text to the active pane, wrapping in bracketed-paste

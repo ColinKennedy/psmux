@@ -2052,6 +2052,122 @@ pub mod mouse_inject {
         }
     }
 
+    /// Deliver a bracketed paste (`ESC[200~` + `text` + `ESC[201~`) into
+    /// `child_pid`'s console input as `KEY_EVENT` records: the injection route
+    /// of issue #684.  Called on the pane writer thread
+    /// (`pane::spawn_pane_write_queue_with`), never on the server thread.
+    ///
+    /// The process wide console lock is held only to attach to the child's
+    /// console and open its `CONIN$`; the process is then detached again and
+    /// the lock released BEFORE the first record is written.  `CONIN$` is a
+    /// real handle to the console driver object, so `WriteConsoleInputW` on it
+    /// goes to that console whatever this process is attached to meanwhile
+    /// (verified on this host: a 1.3 MB injection arrives byte exact while
+    /// other panes are attached to, injected into and spawned during it, see
+    /// tests\test_large_paste_no_server_stall.ps1).  So the paste, paced at
+    /// 5 ms per 2048 records like the synchronous injection it replaces, no
+    /// longer keeps a mouse injection, a terminal query reply, a ConPTY spawn
+    /// or the next paste's route probe (all of which take the same lock, most
+    /// of them on the server thread) waiting for seconds.
+    ///
+    /// Streams the records a chunk at a time (`pane::drive_paste_inject`), so
+    /// no record array the size of the paste is built.  Stops at the next chunk
+    /// once `abort` is set (the pane dropped its writer).
+    pub fn inject_paste(
+        child_pid: u32,
+        text: &str,
+        abort: &std::sync::atomic::AtomicBool,
+    ) -> crate::pane::PasteInjectResult {
+        let failed = crate::pane::PasteInjectResult { consumed: 0, complete: false };
+        let handle = {
+            let _console_guard = portable_pty::console_state_lock();
+            unsafe {
+                let had_console = GetConsoleWindow() != 0;
+                if !free_and_attach(child_pid, "inject_paste") {
+                    if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                    return failed;
+                }
+                let conin: [u16; 7] = [
+                    'C' as u16, 'O' as u16, 'N' as u16,
+                    'I' as u16, 'N' as u16, '$' as u16, 0,
+                ];
+                let handle = CreateFileW(
+                    conin.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null(),
+                );
+                let open_err = GetLastError();
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if handle == INVALID_HANDLE || handle == 0 {
+                    debug_log(&format!("inject_paste: CreateFileW(CONIN$) FAILED err={}", open_err));
+                    return failed;
+                }
+                handle
+            }
+        };
+
+        const KEY_EVENT: u16 = 0x0001;
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct KEY_EVENT_RECORD {
+            key_down: i32,
+            repeat_count: u16,
+            virtual_key_code: u16,
+            virtual_scan_code: u16,
+            u_char: u16,
+            control_key_state: u32,
+        }
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct KEY_INPUT_RECORD {
+            event_type: u16,
+            _padding: u16,
+            event: KEY_EVENT_RECORD,
+        }
+        let mut records: Vec<KEY_INPUT_RECORD> = Vec::with_capacity(crate::pane::INJECT_CHUNK);
+        let mut last_err = 0u32;
+        let r = crate::pane::drive_paste_inject(text, abort, crate::pane::INJECT_PAUSE, |units| {
+            records.clear();
+            records.extend(units.iter().map(|&wch| KEY_INPUT_RECORD {
+                event_type: KEY_EVENT,
+                _padding: 0,
+                event: KEY_EVENT_RECORD {
+                    key_down: 1,
+                    repeat_count: 1,
+                    virtual_key_code: 0,
+                    virtual_scan_code: 0,
+                    u_char: wch,
+                    control_key_state: 0,
+                },
+            }));
+            let mut written: u32 = 0;
+            let ok = unsafe {
+                WriteConsoleInputW(
+                    handle,
+                    records.as_ptr() as *const INPUT_RECORD,
+                    records.len() as u32,
+                    &mut written,
+                )
+            };
+            if ok == 0 {
+                last_err = unsafe { GetLastError() };
+                return None;
+            }
+            Some(written as usize)
+        });
+        unsafe { CloseHandle(handle); }
+        debug_log(&format!(
+            "inject_paste: pid={} text_len={} consumed={} complete={} last_err={}",
+            child_pid, text.len(), r.consumed, r.complete, last_err
+        ));
+        r
+    }
+
     /// Issue #597: record a reply psmux had to answer a pane's query with and
     /// could not deliver.
     ///
@@ -2913,6 +3029,9 @@ pub mod mouse_inject {
     pub fn query_mouse_input_enabled(_pid: u32) -> Option<bool> { None }
     pub fn query_console_input_mode(_pid: u32) -> Option<u32> { None }
     pub fn send_vt_response(_pid: u32, _text: &str) -> bool { false }
+    pub fn inject_paste(_pid: u32, _text: &str, _abort: &std::sync::atomic::AtomicBool) -> crate::pane::PasteInjectResult {
+        crate::pane::PasteInjectResult { consumed: 0, complete: false }
+    }
     pub fn send_vt_reply(_pid: u32, _text: &str) -> bool { false }
     pub fn log_lost_reply(_pid: Option<u32>, _kind: &str, _len: usize) {}
     pub fn send_modified_key_event(_pid: u32, _ch: char, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }

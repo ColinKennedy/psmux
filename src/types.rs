@@ -146,7 +146,7 @@ pub struct WheelAuth {
 
 pub struct Pane {
     pub master: Box<dyn MasterPty>,
-    pub writer: Box<dyn std::io::Write + Send>,
+    pub writer: Box<dyn crate::pane::PaneInputSink>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
     /// While copy mode displays this pane, `term` holds a frozen *snapshot* of
@@ -445,7 +445,7 @@ pub struct CwdHint {
 /// perceived "instant tab" experience.
 pub struct WarmPane {
     pub master: Box<dyn MasterPty>,
-    pub writer: Box<dyn std::io::Write + Send>,
+    pub writer: Box<dyn crate::pane::PaneInputSink>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
     pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,

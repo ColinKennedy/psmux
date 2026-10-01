@@ -42,7 +42,7 @@ pub fn conpty_preemptive_dsr_response(_writer: &mut dyn std::io::Write) {
 /// bytes are delivered in order, and backpressure is absorbed by memory
 /// exactly like tmux's event buffer.
 struct QueuedPaneWriter {
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    tx: std::sync::mpsc::Sender<PaneInput>,
     /// Set when the pane drops its writer.  Whatever is still queued then
     /// (the rest of a large paste into a pane being killed or respawned) is
     /// discarded instead of being written to a pane that no longer exists,
@@ -61,7 +61,7 @@ impl std::io::Write for QueuedPaneWriter {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.tx.send(buf.to_vec()).map_err(|_| {
+        self.tx.send(PaneInput::Bytes(buf.to_vec())).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pane writer thread exited")
         })?;
         Ok(buf.len())
@@ -70,6 +70,201 @@ impl std::io::Write for QueuedPaneWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+impl PaneInputSink for QueuedPaneWriter {
+    fn queue_inject_paste(&mut self, job: InjectPaste) -> Result<(), InjectPaste> {
+        self.tx.send(PaneInput::InjectPaste(job)).map_err(|e| match e.0 {
+            PaneInput::InjectPaste(job) => job,
+            PaneInput::Bytes(_) => unreachable!("sent an InjectPaste"),
+        })
+    }
+}
+
+/// One item on a pane's input queue.  The pane writer thread is the only
+/// thing that delivers input to the pane child, so whatever reaches the child
+/// reaches it in the order the server queued it, whichever channel carries it.
+pub(crate) enum PaneInput {
+    /// Bytes for the ConPTY input pipe.
+    Bytes(Vec<u8>),
+    /// A bracketed paste to deliver as console `KEY_EVENT` records
+    /// (`WriteConsoleInputW`), the route `input::choose_paste_route` picks
+    /// where conhost strips the paste markers from the pipe (issue #684).
+    InjectPaste(InjectPaste),
+}
+
+/// A bracketed paste waiting on a pane's queue to be injected into the pane
+/// child's console input.  The payload the child receives is
+/// `ESC[200~`, `text` with every CRLF / LF made CR, `ESC[201~`.
+pub struct InjectPaste {
+    /// The pane child the console belongs to, taken when the paste was
+    /// queued.  A respawned pane has a new writer and a new queue, so this
+    /// can never reach the new child.
+    pub pid: u32,
+    /// The paste text, held once (no second copy is made to deliver it).
+    pub text: String,
+    /// What a pipe fallback does with line endings, as for the pipe route
+    /// (`input::write_paste_bytes`).
+    pub normalize: bool,
+}
+
+/// What a pane's writer is: a byte sink for the input pipe that may also carry
+/// a paste to be injected in order with those bytes.
+///
+/// Every pane writer psmux makes is a [`spawn_pane_write_queue`] queue, which
+/// accepts the paste.  The default refuses it, so a writer that cannot keep
+/// the paste in order with its bytes (a test stand in) hands the job back and
+/// the caller writes the paste to the pipe instead.
+pub trait PaneInputSink: std::io::Write + Send {
+    /// Queue `job` behind everything already written.  Returns it when this
+    /// writer cannot carry it (or its thread is gone).
+    fn queue_inject_paste(&mut self, job: InjectPaste) -> Result<(), InjectPaste> {
+        Err(job)
+    }
+}
+
+/// How an injected paste ended, as the pane writer thread sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteInjectResult {
+    /// Bytes of the logical payload (`ESC[200~` + text + `ESC[201~`, before
+    /// line ending normalisation) the child's console has taken.  Always on a
+    /// character boundary, and never between the CR and LF of a CRLF.
+    pub consumed: usize,
+    /// True when the whole payload was taken.
+    pub complete: bool,
+}
+
+/// Delivers an [`InjectPaste`] for the pane writer thread: `(pid, text, abort)`.
+/// `abort` turns true when the pane drops its writer; the injector stops at its
+/// next chunk.  The real one is `platform::mouse_inject::inject_paste`.
+pub(crate) type PasteInjector =
+    Arc<dyn Fn(u32, &str, &AtomicBool) -> PasteInjectResult + Send + Sync>;
+
+/// Records per `WriteConsoleInputW` call when injecting a paste, and the pause
+/// after each full chunk (both unchanged from the synchronous injection this
+/// replaces, so a 19045 child sees the same pacing; the pause now holds only
+/// this pane's queue, never the server or the console lock).
+pub(crate) const INJECT_CHUNK: usize = 2048;
+pub(crate) const INJECT_PAUSE: Duration = Duration::from_millis(5);
+
+const PASTE_OPEN: &str = "\x1b[200~";
+const PASTE_CLOSE: &str = "\x1b[201~";
+
+/// The UTF-16 units an injected paste is made of, each with the payload byte
+/// offset reached once it has been delivered.  CRLF and bare LF become one CR
+/// (what the console input buffer means by a line break); the CR of a CRLF
+/// carries the offset past its LF, so a fallback never restarts on that LF.
+pub(crate) fn paste_inject_units(text: &str) -> PasteInjectUnits<'_> {
+    PasteInjectUnits { text, part: 0, pos: 0, pending: None }
+}
+
+/// Iterator behind [`paste_inject_units`].
+pub(crate) struct PasteInjectUnits<'a> {
+    text: &'a str,
+    /// 0 the open marker, 1 the text, 2 the close marker, 3 done.
+    part: u8,
+    /// Byte position inside the current part.
+    pos: usize,
+    /// Second half of a surrogate pair.
+    pending: Option<(u16, usize)>,
+}
+
+impl Iterator for PasteInjectUnits<'_> {
+    type Item = (u16, usize);
+    fn next(&mut self) -> Option<(u16, usize)> {
+        if let Some(p) = self.pending.take() {
+            return Some(p);
+        }
+        loop {
+            let (s, base) = match self.part {
+                0 => (PASTE_OPEN, 0),
+                1 => (self.text, PASTE_OPEN.len()),
+                2 => (PASTE_CLOSE, PASTE_OPEN.len() + self.text.len()),
+                _ => return None,
+            };
+            let Some(c) = s[self.pos..].chars().next() else {
+                self.part += 1;
+                self.pos = 0;
+                continue;
+            };
+            let start = base + self.pos;
+            self.pos += c.len_utf8();
+            let mut end = base + self.pos;
+            let mut c = c;
+            if self.part == 1 {
+                if c == '\r' && s.as_bytes().get(self.pos) == Some(&b'\n') {
+                    // CRLF: one CR, and the LF goes with it.
+                    self.pos += 1;
+                    end += 1;
+                } else if c == '\n' {
+                    c = '\r';
+                }
+            }
+            let mut buf = [0u16; 2];
+            let units = c.encode_utf16(&mut buf);
+            if units.len() == 2 {
+                // Only the second half of a surrogate pair completes the character.
+                self.pending = Some((units[1], end));
+                return Some((units[0], start));
+            }
+            return Some((units[0], end));
+        }
+    }
+}
+
+/// Inject a paste in chunks of [`INJECT_CHUNK`] UTF-16 units through `write`,
+/// which returns how many units the console took (`None` on failure).
+///
+/// Streams: the payload is never expanded into a full size record array, so
+/// injecting holds one chunk on top of the text already on the queue.  A
+/// short write resumes with the units not taken, a write that takes nothing
+/// is retried once after 10 ms, and `abort` is checked before every chunk.
+pub(crate) fn drive_paste_inject(
+    text: &str,
+    abort: &AtomicBool,
+    pause: Duration,
+    mut write: impl FnMut(&[u16]) -> Option<usize>,
+) -> PasteInjectResult {
+    let total = PASTE_OPEN.len() + text.len() + PASTE_CLOSE.len();
+    let mut units = paste_inject_units(text);
+    let mut chunk: Vec<u16> = Vec::with_capacity(INJECT_CHUNK);
+    let mut ends: Vec<usize> = Vec::with_capacity(INJECT_CHUNK);
+    let mut consumed = 0usize;
+    let mut exhausted = false;
+    loop {
+        while !exhausted && chunk.len() < INJECT_CHUNK {
+            match units.next() {
+                Some((u, end)) => { chunk.push(u); ends.push(end); }
+                None => exhausted = true,
+            }
+        }
+        if chunk.is_empty() {
+            return PasteInjectResult { consumed: total, complete: true };
+        }
+        if abort.load(Ordering::Acquire) {
+            return PasteInjectResult { consumed, complete: false };
+        }
+        let full = chunk.len() >= INJECT_CHUNK;
+        let mut n = write(&chunk).unwrap_or(0).min(chunk.len());
+        if n == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            n = write(&chunk).unwrap_or(0).min(chunk.len());
+            if n == 0 {
+                return PasteInjectResult { consumed, complete: false };
+            }
+        }
+        consumed = ends[n - 1];
+        chunk.drain(..n);
+        ends.drain(..n);
+        if full && !(exhausted && chunk.is_empty()) && !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+/// The real injector: the pane child's console, through `WriteConsoleInputW`.
+fn console_paste_injector() -> PasteInjector {
+    Arc::new(|pid, text, abort| crate::platform::mouse_inject::inject_paste(pid, text, abort))
 }
 
 /// Largest single write the pane writer thread builds by coalescing queued
@@ -85,35 +280,98 @@ pub(crate) const WRITE_COALESCE_MAX: usize = 64 * 1024;
 /// it only stops further writes. The thread — and with it the inner
 /// writer — goes away only when the queue side is dropped with the pane.
 pub fn spawn_pane_write_queue(
+    inner: Box<dyn std::io::Write + Send>,
+) -> Box<dyn PaneInputSink> {
+    spawn_pane_write_queue_with(inner, console_paste_injector())
+}
+
+/// [`spawn_pane_write_queue`] with the paste injector supplied, so the queue
+/// can be driven by a stand in for the console in tests.
+///
+/// An [`InjectPaste`] is delivered by THIS thread when it reaches the item,
+/// so the keys queued before a paste reach the child before it, the keys
+/// queued after it arrive after `ESC[201~`, and the server thread never waits
+/// for an injection (issue #684's route used to run the whole
+/// `WriteConsoleInputW` sequence on the server thread: 3.8 s of total server
+/// freeze for a 1.3 MB paste).  A failed injection falls back to the pipe
+/// HERE, in place, for exactly the part the console did not take, so the
+/// fallback keeps the same position in the queue and nothing is duplicated.
+pub(crate) fn spawn_pane_write_queue_with(
     mut inner: Box<dyn std::io::Write + Send>,
-) -> Box<dyn std::io::Write + Send> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    injector: PasteInjector,
+) -> Box<dyn PaneInputSink> {
+    let (tx, rx) = std::sync::mpsc::channel::<PaneInput>();
     let closed = Arc::new(AtomicBool::new(false));
     let closed_rx = closed.clone();
     let _ = std::thread::Builder::new()
         .name("pane-writer".to_string())
         .spawn(move || {
             let mut broken = false;
-            while let Ok(mut buf) = rx.recv() {
-                // Coalesce whatever else is already queued into one write, up
-                // to a cap: a large paste is queued in 64 KiB slices
-                // (input::PASTE_SLICE) and gluing all of them back together
-                // here would make a second full size copy of it.
-                while buf.len() < WRITE_COALESCE_MAX {
-                    match rx.try_recv() {
-                        Ok(more) => buf.extend_from_slice(&more),
+            // An item taken while coalescing that is not bytes: it is next.
+            let mut next: Option<PaneInput> = None;
+            loop {
+                let item = match next.take() {
+                    Some(item) => item,
+                    None => match rx.recv() {
+                        Ok(item) => item,
                         Err(_) => break,
+                    },
+                };
+                match item {
+                    PaneInput::Bytes(mut buf) => {
+                        // Coalesce whatever else is already queued into one
+                        // write, up to a cap: a large paste is queued in
+                        // 64 KiB slices (input::PASTE_SLICE) and gluing all
+                        // of them back together here would make a second
+                        // full size copy of it.  Coalescing stops at a paste
+                        // to inject, which must follow these bytes.
+                        while buf.len() < WRITE_COALESCE_MAX {
+                            match rx.try_recv() {
+                                Ok(PaneInput::Bytes(more)) => buf.extend_from_slice(&more),
+                                Ok(other) => { next = Some(other); break; }
+                                Err(_) => break,
+                            }
+                        }
+                        if broken || closed_rx.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        if inner.write_all(&buf).is_err() {
+                            broken = true;
+                            continue;
+                        }
+                        let _ = inner.flush();
+                        crate::pty_trace::mark("w", 0, &buf);
+                    }
+                    PaneInput::InjectPaste(job) => {
+                        if closed_rx.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let r = injector(job.pid, &job.text, &closed_rx);
+                        crate::debug_log::input_log(
+                            "paste",
+                            &format!(
+                                "route=inject pid={} text_len={} ok={}",
+                                job.pid, job.text.len(), r.complete
+                            ),
+                        );
+                        if r.complete || closed_rx.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        crate::debug_log::input_log(
+                            "paste",
+                            &format!(
+                                "route=inject failed, falling back to the pipe (the console took {} of {} payload bytes)",
+                                r.consumed, job.text.len() + 12
+                            ),
+                        );
+                        if broken {
+                            continue;
+                        }
+                        if !crate::input::write_paste_remainder(&mut *inner, &job.text, r.consumed, job.normalize) {
+                            broken = true;
+                        }
                     }
                 }
-                if broken || closed_rx.load(Ordering::Acquire) {
-                    continue;
-                }
-                if inner.write_all(&buf).is_err() {
-                    broken = true;
-                    continue;
-                }
-                let _ = inner.flush();
-                crate::pty_trace::mark("w", 0, &buf);
             }
         });
     Box::new(QueuedPaneWriter { tx, closed })
