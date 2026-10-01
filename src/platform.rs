@@ -960,11 +960,13 @@ pub fn take_client_ctrl_break() -> bool {
 // The solution: use WriteConsoleInput to inject native MOUSE_EVENT records
 // directly into the child's console input buffer.
 //
-// Flow:
-//   1. On first mouse event targeting a pane, lazily acquire the console handle:
-//      FreeConsole() → AttachConsole(child_pid) → CreateFileW("CONIN$") → FreeConsole()
-//   2. The handle remains valid after FreeConsole on modern Windows (real kernel handles).
-//   3. Use WriteConsoleInputW(handle, MOUSE_EVENT record) for each mouse event.
+// Flow, per injection, under portable_pty::console_state_lock():
+//   FreeConsole() → AttachConsole(child_pid) → CreateFileW("CONIN$")
+//   → WriteConsoleInputW(handle, records) → CloseHandle → FreeConsole()
+// The CONIN$ handle does NOT outlive the attach: once this process has
+// detached, WriteConsoleInputW on it fails with ERROR_INVALID_HANDLE
+// (measured on 26200 while moving the paste injection off the server
+// thread), so every write happens while attached, inside the lock.
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
