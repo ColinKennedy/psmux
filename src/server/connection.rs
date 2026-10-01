@@ -3794,6 +3794,14 @@ match cmd {
     "clear-history" | "clearhist" => {
         let _ = tx.send(CtrlReq::ClearHistory);
     }
+    // TEST ONLY: `debug-stall <ms>` stalls the server loop so a test can
+    // reproduce a long stall on demand.  Inert (an unknown command) unless
+    // the server process was started with PSMUX_TEST_STALL_HOOK=1; the CLI
+    // has no verb for it, tests send it as a raw line over the TCP port.
+    "debug-stall" if std::env::var("PSMUX_TEST_STALL_HOOK").as_deref() == Ok("1") => {
+        let ms = args.first().and_then(|a| a.parse::<u64>().ok()).unwrap_or(0);
+        let _ = tx.send(CtrlReq::DebugStall(ms));
+    }
     "save-buffer" | "saveb" => {
         let path = args.iter().find(|a| **a == "-" || !a.starts_with('-')).unwrap_or(&"").to_string();
         let _ = tx.send(CtrlReq::SaveBuffer(path));

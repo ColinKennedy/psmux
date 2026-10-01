@@ -6933,6 +6933,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // tmux does; see clear_active_pane_history.
                     crate::window_ops::clear_active_pane_history(&mut app);
                 }
+                CtrlReq::DebugStall(ms) => {
+                    // TEST ONLY, see CtrlReq::DebugStall: a deliberate stall
+                    // of the server loop, reachable only through the env
+                    // gated `debug-stall` wire command.
+                    std::thread::sleep(Duration::from_millis(ms.min(60_000)));
+                }
                 CtrlReq::SaveBuffer(path) => {
                     if let Some(content) = app.paste_buffers.first() {
                         let _ = std::fs::write(&path, content);

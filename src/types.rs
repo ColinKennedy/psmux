@@ -3174,6 +3174,13 @@ pub enum CtrlReq {
     SuspendClient,
     CopyModePageUp,
     ClearHistory,
+    /// TEST ONLY: sleep the server loop this many milliseconds.  Sent by the
+    /// hidden `debug-stall <ms>` wire command, which the connection thread
+    /// accepts only when the server was started with
+    /// `PSMUX_TEST_STALL_HOOK=1` (see server::connection), so it is inert in
+    /// normal use.  It lets tests\test_stalled_server_target_routing.ps1
+    /// reproduce a long server stall deterministically.
+    DebugStall(u64),
     SaveBuffer(String),
     LoadBuffer(String),
     SetEnvironment(String, String),
