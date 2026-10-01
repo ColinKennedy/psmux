@@ -20,11 +20,11 @@ use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 /// search (#335). Without this the screen looks frozen because the search
 /// input is otherwise invisible.
 fn refresh_search_prompt(app: &mut AppState) {
-    if let Mode::CopySearch { ref input, forward } = app.mode {
-        let arrow = if forward { "down" } else { "up" };
-        let prompt = format!("(search {}) {}", arrow, input);
-        // display-time = 0 keeps the message sticky until cleared.
-        app.status_message = Some((prompt, Instant::now(), Some(0)));
+    if let Mode::CopySearch { .. } = app.mode {
+        if let Some(prompt) = crate::copy_mode::copy_prompt_text(&app.mode) {
+            // display-time = 0 keeps the message sticky until cleared.
+            app.status_message = Some((prompt, Instant::now(), Some(0)));
+        }
     }
 }
 
@@ -34,10 +34,11 @@ fn refresh_search_prompt(app: &mut AppState) {
 /// the server here and the command prompt lives in the client, so the prompt
 /// is the search prompt's twin rather than a command prompt.
 fn refresh_goto_prompt(app: &mut AppState) {
-    if let Mode::CopyGoto { ref input } = app.mode {
-        let prompt = format!("(goto line) {}", input);
-        // display-time = 0 keeps the message sticky until cleared.
-        app.status_message = Some((prompt, Instant::now(), Some(0)));
+    if let Mode::CopyGoto { .. } = app.mode {
+        if let Some(prompt) = crate::copy_mode::copy_prompt_text(&app.mode) {
+            // display-time = 0 keeps the message sticky until cleared.
+            app.status_message = Some((prompt, Instant::now(), Some(0)));
+        }
     }
 }
 

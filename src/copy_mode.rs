@@ -336,6 +336,7 @@ pub fn restore_copy_state_from_pane(app: &mut AppState) {
 /// actual focus change.
 pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switch_fn: F) {
     let was_copy = in_copy_mode(app);
+    let had_prompt = copy_prompt_text(&app.mode).is_some();
     if was_copy {
         save_copy_state_to_pane(app);
     }
@@ -349,6 +350,38 @@ pub fn switch_with_copy_save<F: FnOnce(&mut AppState)>(app: &mut AppState, switc
     } else if was_copy {
         // We were in copy mode but new pane is not — switch to passthrough.
         app.mode = Mode::Passthrough;
+    }
+    sync_copy_prompt_status(app, had_prompt);
+}
+
+/// The status line text of the copy mode prompt `mode` holds open, if any.
+///
+/// The prompts are drawn as a sticky status message, and the status line is
+/// not per pane, so this is the one place that says what the message reads.
+pub fn copy_prompt_text(mode: &Mode) -> Option<String> {
+    match mode {
+        Mode::CopySearch { input, forward } => {
+            let arrow = if *forward { "down" } else { "up" };
+            Some(format!("(search {}) {}", arrow, input))
+        }
+        Mode::CopyGoto { input } => Some(format!("(goto line) {}", input)),
+        _ => None,
+    }
+}
+
+/// Make the status line show the prompt of the pane that has focus now.
+///
+/// A prompt's sticky message stayed behind when focus moved: `select-pane`
+/// away from a pane with `(goto line) 1` or `(search down) x` open left that
+/// text on the status line over a pane that was not even in copy mode, until
+/// something else replaced it. `had_prompt` says whether the pane focus left
+/// had a prompt open, which is the only case where the message is ours to
+/// clear.
+fn sync_copy_prompt_status(app: &mut AppState, had_prompt: bool) {
+    if let Some(text) = copy_prompt_text(&app.mode) {
+        app.status_message = Some((text, std::time::Instant::now(), Some(0)));
+    } else if had_prompt {
+        app.status_message = None;
     }
 }
 
@@ -390,6 +423,12 @@ pub fn retarget_mode_to_active_pane(app: &mut AppState, prev: Option<usize>) {
     if now == prev {
         return;
     }
+    let had_prompt = copy_prompt_text(&app.mode).is_some();
+    retarget_mode_inner(app);
+    sync_copy_prompt_status(app, had_prompt);
+}
+
+fn retarget_mode_inner(app: &mut AppState) {
     let has_copy = app.windows.get(app.active_idx)
         .and_then(|w| active_pane(&w.root, &w.active_path))
         .map_or(false, |p| p.copy_state.is_some());

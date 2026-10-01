@@ -480,6 +480,29 @@ fn pane_in_mode_and_pane_mode_answer_while_the_prompt_is_open() {
 }
 
 #[test]
+fn a_focus_change_takes_the_cancelled_prompt_off_the_status_line() {
+    // The prompt is a sticky status message and the status line is not per
+    // pane, so the text has to go with the prompt: before, `(goto line) 1`
+    // stayed on the status line after select-pane, over a pane that was not
+    // even in copy mode.
+    let mut app = copy_app("vi", "absolute");
+    crate::input::send_text_to_active(&mut app, ":1").unwrap();
+    crate::copy_mode::switch_with_copy_save(&mut app, |_| {});
+    assert!(matches!(app.mode, Mode::CopyMode));
+    assert!(app.status_message.is_none(), "the cancelled prompt must not stay on the status line");
+}
+
+#[test]
+fn a_focus_change_back_to_a_parked_search_shows_that_search_again() {
+    let mut app = copy_app("vi", "absolute");
+    crate::input::send_text_to_active(&mut app, "/ab").unwrap();
+    app.status_message = None;
+    crate::copy_mode::switch_with_copy_save(&mut app, |_| {});
+    let msg = app.status_message.as_ref().map(|(m, _, _)| m.clone()).unwrap_or_default();
+    assert_eq!(msg, "(search down) ab", "the restored search prompt must be on the status line");
+}
+
+#[test]
 fn switching_panes_cancels_the_prompt_and_stays_in_copy_mode() {
     let mut app = copy_app("vi", "absolute");
     crate::input::send_text_to_active(&mut app, ":").unwrap();
