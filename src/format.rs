@@ -652,9 +652,12 @@ fn parse_modifier_chain(spec: &str) -> Vec<Modifier> {
 
 /// Parse one modifier segment.
 fn parse_single_modifier(spec: &str) -> Option<Modifier> {
-    if spec.is_empty() { return None; }
-    let first = spec.as_bytes()[0] as char;
-    let rest = &spec[1..];
+    // Char aware: a segment that starts with a multi byte character used to
+    // be sliced at byte 1 and panicked the server (#712 audit). tmux stops
+    // parsing modifiers at a character it does not know (format.c
+    // format_build_modifiers); the `_` arm below does the same.
+    let first = spec.chars().next()?;
+    let rest = &spec[first.len_utf8()..];
 
     match first {
         't' => Some(Modifier::Time),
@@ -684,8 +687,10 @@ fn parse_single_modifier(spec: &str) -> Option<Modifier> {
             Some(Modifier::Pad(n))
         }
         's' => {
-            if rest.is_empty() { return None; }
-            let sep = rest.as_bytes()[0] as char;
+            // tmux only takes an ASCII punctuation wrapper (format.c ispunct);
+            // anything else is one bare argument, which `s` ignores.
+            let sep = rest.chars().next()?;
+            if !sep.is_ascii() { return None; }
             let inner = &rest[1..];
             let parts: Vec<&str> = inner.splitn(3, sep).collect();
             let pattern = parts.first().unwrap_or(&"").to_string();
@@ -698,8 +703,9 @@ fn parse_single_modifier(spec: &str) -> Option<Modifier> {
             })
         }
         'e' => {
-            if rest.is_empty() { return None; }
-            let sep = rest.as_bytes()[0] as char;
+            // Same wrapper rule as `s`: a non ASCII separator is not one.
+            let sep = rest.chars().next()?;
+            if !sep.is_ascii() { return None; }
             let inner = &rest[1..];
             let parts: Vec<&str> = inner.splitn(3, sep).collect();
             let op = parts.first().and_then(|s| s.chars().next()).unwrap_or('+');
@@ -2272,3 +2278,7 @@ mod tests_modifier_over_empty_var;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue580_pane_start_command.rs"]
 mod tests_issue580_pane_start_command;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue712_format_modifier_utf8.rs"]
+mod tests_issue712_format_modifier_utf8;
