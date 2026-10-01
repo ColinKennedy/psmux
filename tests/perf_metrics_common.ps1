@@ -422,3 +422,108 @@ function Format-PerfResourceLine {
     if ($parts.Count -eq 0) { return "$Label : no process found" }
     return ("{0} : {1}" -f $Label, ($parts -join "  |  "))
 }
+
+# ── splitting a shell keystroke into the shell's part and psmux's part ──
+#
+# With pwsh in the pane, keystroke to screen is two terms in series: the time
+# the pane's own shell and conhost take to put the echo on the pseudoconsole
+# output pipe, and every psmux hop around it (client, socket, server loop, pty
+# write, and after the read: parse, frame, socket, client draw). Only the second
+# is psmux's. The first is a PSReadLine redraw that conhost serialises in two
+# frames with a timer wait between them, and how long that wait lasts depends
+# on the machine's timer state, not on psmux.
+#
+# That is why a floor measured in ANOTHER pseudoconsole host is not a like for
+# like baseline on its own. Measured 2026-09-30 on one machine, same minutes:
+# the standalone host (tests/conpty_echolat.cs) read 11.1ms while pwsh in a
+# psmux pane took 15.0ms from pty write to the read carrying the character; on
+# every earlier day both read about 15.7. Neither psmux build moved it: an A/B
+# of 39ac085 against 99bfd9e, three interleaved pairs, agreed to 0.1ms, and a
+# later run caught the pane itself at 11.8. Subtracting a floor that sits in a
+# different timer state from the pane reported 4 to 5ms of "psmux overhead"
+# that psmux never spent.
+#
+# So the shell cell runs with PSMUX_PTY_TRACE on and splits every keystroke
+# with the server's own QPC stamps (src/pty_trace.rs): `w` is psmux finishing
+# the pty write of the key, and the first `r` after it whose visible text holds
+# the character is the pane's echo coming back. shell = r - w, and
+# psmux = (appear - inject) - shell, per keystroke, on one clock (QPC is system
+# wide, and keylat logs its QPC base).
+#
+# Returns $null when the trace or the keylat log is unusable, so the caller
+# reports that instead of passing on missing data.
+function Get-PerfShellSplit {
+    param([string]$KeylatOut, [string]$TraceBase)
+    if (-not (Test-Path $KeylatOut)) { return $null }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $klog = Get-Content $KeylatOut
+    $base = $null; $freq = $null
+    $trials = @()
+    foreach ($l in $klog) {
+        $m = [regex]::Match($l, '^QPCBASE (\d+) freq (\d+)')
+        if ($m.Success) { $base = [int64]$m.Groups[1].Value; $freq = [double]$m.Groups[2].Value; continue }
+        $m = [regex]::Match($l, '^TRIALT (\d+) char=(\S) t0_ms=([0-9.]+) appear_ms=([0-9.]+)')
+        if ($m.Success) {
+            $trials += [pscustomobject]@{
+                ch = $m.Groups[2].Value
+                t0 = [double]::Parse($m.Groups[3].Value, $inv)
+                ap = [double]::Parse($m.Groups[4].Value, $inv)
+            }
+        }
+    }
+    if ($null -eq $base -or $trials.Count -eq 0) { return $null }
+
+    # The server is the one process that writes keys into a pane; the client's
+    # file and any warm standby's carry no `w`.
+    $dir = Split-Path -Parent $TraceBase
+    $leaf = Split-Path -Leaf $TraceBase
+    $events = $null
+    foreach ($f in @(Get-ChildItem -Path $dir -Filter "$leaf.*" -ErrorAction SilentlyContinue)) {
+        $ev = New-Object System.Collections.Generic.List[object]
+        $hasW = $false
+        foreach ($l in (Get-Content $f.FullName)) {
+            $p = $l.Split(' ', 5)
+            if ($p.Count -lt 5) { continue }
+            $st = $p[1]
+            if ($st -cne 'w' -and $st -cne 'r') { continue }
+            if ($st -ceq 'w') { $hasW = $true }
+            $ev.Add([pscustomobject]@{ t = [int64]$p[0]; s = $st; x = $p[4] })
+        }
+        if ($hasW) { $events = $ev; break }
+    }
+    if ($null -eq $events) { return $null }
+
+    $shell = New-Object System.Collections.Generic.List[double]
+    $own = New-Object System.Collections.Generic.List[double]
+    $cursor = 0
+    foreach ($tr in $trials) {
+        $t0q = $base + [int64]($tr.t0 * $freq / 1000.0)
+        $apq = $base + [int64]($tr.ap * $freq / 1000.0)
+        $wi = -1
+        for ($i = $cursor; $i -lt $events.Count; $i++) {
+            $e = $events[$i]
+            if ($e.t -gt $apq) { break }
+            if ($e.s -ceq 'w' -and $e.t -ge $t0q -and $e.x -ceq $tr.ch) { $wi = $i; break }
+        }
+        if ($wi -lt 0) { continue }
+        $cursor = $wi + 1
+        for ($j = $wi + 1; $j -lt $events.Count; $j++) {
+            $e = $events[$j]
+            if ($e.t -gt $apq) { break }
+            if ($e.s -cne 'r') { continue }
+            # Visible text only: drop CSI and OSC sequences, then any other
+            # escaped byte, so a colour code can never fake a match.
+            $vis = [regex]::Replace($e.x, '<E>\[[0-9;?<=>]*[ -/]*[@-~]', '')
+            $vis = [regex]::Replace($vis, '<E>\].*?(<07>|<E>\\)', '')
+            $vis = [regex]::Replace($vis, '<(E|CR|LF|[0-9A-F]{2})>', '')
+            if ($vis.Contains($tr.ch)) {
+                $s = ($e.t - $events[$wi].t) * 1000.0 / $freq
+                $shell.Add($s)
+                $own.Add(($tr.ap - $tr.t0) - $s)
+                break
+            }
+        }
+    }
+    if ($shell.Count -eq 0) { return $null }
+    return [pscustomobject]@{ Trials = $trials.Count; ShellMs = $shell.ToArray(); PsmuxMs = $own.ToArray() }
+}

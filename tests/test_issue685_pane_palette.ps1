@@ -20,7 +20,8 @@
 # tmux parity: input.c:2733 dispatches OSC 4 to input_osc_4 (input.c:2927),
 # which fills the per pane `struct colour_palette` (tmux.h:764, held by
 # window_pane at tmux.h:1379) through colour_palette_set (colour.c:1272);
-# input_osc_104 (input.c:3446) resets it, RIS clears it (input.c:1407), and
+# input_osc_104 (input.c:3446) resets it, RIS clears it (input.c:1407), a
+# respawn keeps it (Group 6), and
 # tty_check_fg / tty_check_bg / tty_check_us (tty.c:2822, 2892, 2945) apply it
 # on the way to the terminal.  psmux applies it where a cell is serialised for
 # the client, which is the same place in its own pipeline.
@@ -230,11 +231,25 @@ if (Test-Path $cap) {
     Write-Fail "no two pane capture"
 }
 
-Write-Host "`n=== Group 6: respawn clears the palette ===" -ForegroundColor Cyan
+Write-Host "`n=== Group 6: respawn keeps the palette (tmux parity, #708) ===" -ForegroundColor Cyan
+# tmux keeps a pane's OSC 4 palette across respawn-pane.  The palette lives on
+# the window_pane (wp->palette, set up once in window_add_pane, window.c:1332)
+# and the parser only holds a pointer to it (input_init, window.c:1544).  The
+# respawn branch of spawn_pane (spawn.c:311-334) frees the parser with
+# input_free, which never touches the palette (input.c:904), and calls
+# screen_reinit, which does not either; only RIS (input.c:1407), OSC 104
+# (input.c:3453) and a pane teardown (colour_palette_free, window.c:1489) empty
+# it.  Measured on tmux 3.4 in WSL: a pane sets ESC]4;4;rgb:00/00/80, dies
+# under remain-on-exit, `respawn-pane -k` starts a child that sets nothing and
+# prints ESC[44m, and the attached client receives ESC[48;2;0;0;128m; the same
+# flow without the OSC 4 receives ESC[44m.  psmux matches since #708
+# (Screen::reinit_keep_history), so the replacement child's ESC[44m must still
+# leave the client as the RGB the first child installed.
 $sessR = "p685r"
 & $PSMUX -L $SOCK kill-session -t $sessR 2>&1 | Out-Null
 # The first child stays ALIVE and sets index 4; `respawn-pane -k` kills it and
-# starts a replacement that sets nothing.  (A child that exits on its own takes
+# starts a replacement that sets nothing, so any RGB on its MARK_A can only
+# come from the palette the first child left on the pane.  (A child that exits on its own takes
 # the whole session with it, remain-on-exit being off by default, so there
 # would be no pane left to respawn.)
 & $PSMUX -L $SOCK new-session -d -s $sessR -x 80 -y 24 "$emit -sec 60" 2>&1 | Out-Null
@@ -257,10 +272,10 @@ if (Test-Path $cap) {
     $null = $fs.Read($buf, 0, $buf.Length); $fs.Close()
     $sr2 = [Text.Encoding]::ASCII.GetString($buf)
     $ar = Sgr-After $sr2 "MARK_A"
-    if ($ar -eq "[44m") {
-        Write-Pass "the respawned pane starts with an empty palette (ESC$ar)"
+    if ($ar -eq "[48;2;0;0;128m") {
+        Write-Pass "the respawned pane kept the palette like tmux (ESC$ar)"
     } else {
-        Write-Fail "the respawned pane kept a palette: ESC$ar, expected ESC[44m"
+        Write-Fail "the respawned pane lost the palette: ESC$ar, expected ESC[48;2;0;0;128m (tmux keeps wp->palette across respawn)"
     }
 } else {
     Write-Skip "respawn capture unavailable"

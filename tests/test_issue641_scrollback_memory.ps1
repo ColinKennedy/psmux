@@ -361,11 +361,16 @@ if (-not $ready) {
     # own offset: the region that starts scroll_position lines above the bottom.
     $cmPos = [int]((Pmux display-message -p -t "i641_read" '#{scroll_position}') -join '').Trim()
     $cmView = (Pmux capture-pane -p -t "i641_read" -S "-$cmPos" -E "-$([Math]::Max(0, $cmPos - 9))") -join "`n"
+    # history-top homes the cursor to row 0 col 0 of the oldest line, as tmux
+    # does, and that row is the prompt that launched the payload. Search down
+    # to a known compacted row so select-line copies it (tmux 3.4 does the same
+    # flow and yields exactly 'plain line 7').
+    Pmux send-keys -t "i641_read" -X search-forward 'plain line 7' | Out-Null
     Pmux send-keys -t "i641_read" -X select-line | Out-Null
     Pmux send-keys -t "i641_read" -X copy-selection-and-cancel | Out-Null
     Start-Sleep -Milliseconds 400
     $buf = ((Pmux show-buffer) -join '') -replace '\s+$', ''
-    if ($cmView -match 'plain line' -and $buf -match 'plain line') {
+    if ($cmView -match 'plain line' -and $buf -eq 'plain line 7') {
         Write-Pass "copy mode reads a compacted history row and yields '$buf'"
     } else {
         Write-Fail "copy mode over a compacted history row failed (view match=$($cmView -match 'plain line'), buffer='$buf')"

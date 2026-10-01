@@ -218,11 +218,25 @@ $rg = Invoke-Psmux @('show-options','-g','-t',$SESSION)
 if ($rg.out -match '(?m)^status\s') { Write-Pass "show-options -g still lists session options (no collateral narrowing)" }
 else { Write-Fail "show-options -g stopped listing status" }
 
-$rv = Invoke-Psmux @('show-options','-sv','-t',$SESSION)
-$vlines = @($rv.out -split "`r?`n")
-if ($rv.rc -eq 0 -and $vlines.Count -eq $lines.Count -and $rv.out -notmatch 'default-terminal') {
-    Write-Pass "show-options -sv prints the same rows as values only"
-} else { Write-Fail "show-options -sv: rc=$($rv.rc) rows=$($vlines.Count) vs $($lines.Count) out=[$($rv.out)]" }
+# -v prints one value row per option that HAS a value.  An array option with
+# no items (terminal-overrides since #700, like tmux's terminal-overrides and
+# user-keys) is listed by its bare name without -v and prints NOTHING with -v.
+# tmux cmd_show_options_print (cmd-show-options.c):
+#   if (a == NULL) { if (!args_has(args, 'v')) cmdq_print(item, "%s", name); return; }
+# Measured on tmux 3.4 with -f /dev/null: `show -s` printed 25 rows, among them
+# the bare `terminal-overrides` and `user-keys`, and `show -sv` printed 23.
+# So the -v row count is the -s row count minus the bare name rows.  The rows
+# are read raw (not through the trimmed Invoke-Psmux output) because an empty
+# string value, such as copy-command, is a legitimate empty row and trimming
+# would drop it when it lands first or last.
+$slines = @(& $PSMUX show-options -s -t $SESSION 2>$null)
+$bare = @($slines | Where-Object { $_ -match '^\S+$' })
+$vlines = @(& $PSMUX show-options -sv -t $SESSION 2>$null)
+$vrc = $LASTEXITCODE
+$vjoined = $vlines -join "`n"
+if ($vrc -eq 0 -and $vlines.Count -eq ($slines.Count - $bare.Count) -and $vjoined -notmatch 'default-terminal') {
+    Write-Pass "show-options -sv prints one row per valued option, empty arrays omitted like tmux ($($vlines.Count) = $($slines.Count) minus bare [$($bare -join ',')])"
+} else { Write-Fail "show-options -sv: rc=$vrc rows=$($vlines.Count), expected $($slines.Count) minus $($bare.Count) bare [$($bare -join ',')] out=[$vjoined]" }
 
 $rn = Invoke-Psmux @('show-options','-s','-t',$SESSION,'default-terminal')
 if ($rn.rc -eq 0 -and $rn.out -match 'default-terminal') {

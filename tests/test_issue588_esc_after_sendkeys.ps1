@@ -55,6 +55,18 @@ foreach ($exe in @($injector, $feeder, $keylog)) {
     }
 }
 
+# Real keystrokes go through Invoke-GuardedInjector. In sweep
+# 2026-10-01_01-53-14 Defender quarantined psmux_588_injector.exe in the middle
+# of Test 2; every later raw `& $injector` call failed silently, and Test 3
+# reported "#588 REGRESSION: no ESC reached the pane app" because its delivery
+# oracle read a STALE psmux_inject.log full of `vk=` lines from an earlier,
+# successful injection. The guard deletes that log before every run, so the
+# oracle only ever describes the injection it follows, and it records why the
+# injector could not run (with any Defender detection) in $script:InjectorBlocked.
+. "$PSScriptRoot\injector_guard.ps1"
+function Send-Keys588($procId, [string]$Keys) { $null = Invoke-GuardedInjector $injector $procId $Keys }
+function No-Delivery-Note { if ($script:InjectorBlocked) { " ($($script:InjectorBlocked))" } else { "" } }
+
 $emptyConf = "$env:TEMP\psmux_588_empty.conf"
 "" | Set-Content -Path $emptyConf -Encoding ASCII
 
@@ -164,24 +176,24 @@ if (-not (Test-Path $BASH)) {
 
         # The stty/dd line is typed with REAL keystrokes, never send-keys:
         # send-keys is the variable under test and must not leak into the arm.
-        & $injector $client.Id $LINE 2>&1 | Out-Null
+        Send-Keys588 $client.Id $LINE
         Start-Sleep -Milliseconds 700
         if ((Cap $sess) -notmatch '/usr/bin/stty raw') {
-            & $injector $client.Id $LINE 2>&1 | Out-Null
+            Send-Keys588 $client.Id $LINE
             Start-Sleep -Milliseconds 700
         }
-        & $injector $client.Id "{ENTER}" 2>&1 | Out-Null
+        Send-Keys588 $client.Id "{ENTER}"
         Start-Sleep -Seconds 2
 
-        & $injector $client.Id "{ESC}{SLEEP:400}{ESC}{SLEEP:400}{ESC}" 2>&1 | Out-Null
+        Send-Keys588 $client.Id "{ESC}{SLEEP:400}{ESC}{SLEEP:400}{ESC}"
         # The injector log is the delivery oracle: no `vk=` line means the keys
         # never reached the console input buffer, which is a SKIP, not a FAIL.
-        $ilog = if (Test-Path "$env:TEMP\psmux_inject.log") { Get-Content "$env:TEMP\psmux_inject.log" -Raw } else { "" }
+        $ilog = Get-InjectorLog
         Start-Sleep -Seconds 3
 
         $cap = Cap $sess
         # Unblock the dd so the pane is not left holding a raw-mode read.
-        if ($cap -notmatch '1b\s+1b\s+1b') { & $injector $client.Id "zzz" 2>&1 | Out-Null; Start-Sleep -Seconds 2 }
+        if ($cap -notmatch '1b\s+1b\s+1b') { Send-Keys588 $client.Id "zzz"; Start-Sleep -Seconds 2 }
         return @{ up = $true; client = $client; cap = $cap; ilog = $ilog }
     }
 
@@ -190,7 +202,7 @@ if (-not (Test-Path $BASH)) {
     if (-not $base.up) {
         Write-Fail "the attached cygwin session did not come up"
     } elseif ($base.ilog -notmatch 'vk=') {
-        Write-Skip "the injector delivered no key records (focus/console refused) - not a psmux result"
+        Write-Skip "the injector delivered no key records (focus/console refused) - not a psmux result$(No-Delivery-Note)"
     } elseif ($base.cap -match '1b\s+1b\s+1b') {
         Write-Pass "baseline: three real ESC presses arrive as 1b 1b 1b"
 
@@ -199,7 +211,7 @@ if (-not (Test-Path $BASH)) {
         if (-not $bad.up) {
             Write-Fail "the attached cygwin session did not come up for the send-keys arm"
         } elseif ($bad.ilog -notmatch 'vk=') {
-            Write-Skip "the injector delivered no key records for the send-keys arm"
+            Write-Skip "the injector delivered no key records for the send-keys arm$(No-Delivery-Note)"
         } elseif ($bad.cap -match '1b\s+1b\s+1b') {
             Write-Pass "after `send-keys ' cd .' C-m` the ESC presses STILL arrive as 1b 1b 1b (#588 fixed)"
         } else {
@@ -240,8 +252,8 @@ if ($LASTEXITCODE -ne 0) {
     Start-Sleep -Seconds 2
     $before = @(Get-Content $KEYLOG_OUT)
 
-    & $injector $client3.Id "{ESC}{SLEEP:400}{ESC}{SLEEP:400}{ESC}" 2>&1 | Out-Null
-    $ilog3 = if (Test-Path "$env:TEMP\psmux_inject.log") { Get-Content "$env:TEMP\psmux_inject.log" -Raw } else { "" }
+    Send-Keys588 $client3.Id "{ESC}{SLEEP:400}{ESC}{SLEEP:400}{ESC}"
+    $ilog3 = Get-InjectorLog
     Start-Sleep -Seconds 3
 
     $after = @(Get-Content $KEYLOG_OUT)
@@ -249,7 +261,7 @@ if ($LASTEXITCODE -ne 0) {
     $escapes = @($new | Where-Object { $_ -match 'key=Escape' })
 
     if ($ilog3 -notmatch 'vk=') {
-        Write-Skip "the injector delivered no key records (focus/console refused) - not a psmux result"
+        Write-Skip "the injector delivered no key records (focus/console refused) - not a psmux result$(No-Delivery-Note)"
     } elseif ($escapes.Count -ge 3) {
         Write-Pass "all three ESC presses reached the pane app after send-keys C-m ($($escapes.Count) Escape records)"
     } elseif ($escapes.Count -ge 1) {
