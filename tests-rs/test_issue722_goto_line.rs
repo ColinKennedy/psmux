@@ -306,6 +306,45 @@ fn characters_are_appended_to_the_number() {
 }
 
 #[test]
+fn one_text_holding_the_key_and_the_number_types_the_number_into_the_prompt() {
+    // `send-keys ':500'` and a paste of `:500` arrive as ONE send-text. The
+    // characters after `:` must reach the prompt the key just opened, exactly
+    // as they do when they arrive one send-text at a time; before, they were
+    // run as copy mode keys and became a count nobody asked for.
+    let mut app = copy_app("vi", "absolute");
+    crate::input::send_text_to_active(&mut app, ":12").unwrap();
+    assert_eq!(typed(&app), "12");
+    assert_eq!(app.copy_count, None, "the digits must not become a count");
+    let history = hsize(&app);
+    crate::input::send_key_to_active(&mut app, "enter").unwrap();
+    assert_eq!(offset(&app), history - 11, "line 12 of the grid");
+}
+
+#[test]
+fn one_text_holding_a_search_key_and_its_pattern_types_the_pattern() {
+    // The same loop served `/` and `?` before `:` existed, with the same
+    // defect: `send-keys '?abc'` searched for nothing and ran `a`, `b`, `c`
+    // as copy mode keys.
+    let mut app = copy_app("vi", "absolute");
+    crate::input::send_text_to_active(&mut app, "?line-4").unwrap();
+    match app.mode {
+        Mode::CopySearch { ref input, forward } => {
+            assert_eq!(input, "line-4");
+            assert!(!forward);
+        }
+        _ => panic!("`?` must leave the search prompt open"),
+    }
+}
+
+#[test]
+fn text_after_a_key_that_leaves_copy_mode_is_dropped() {
+    let mut app = copy_app("vi", "absolute");
+    crate::input::send_text_to_active(&mut app, "q:5").unwrap();
+    assert!(!app.mode.in_copy(), "`q` leaves copy mode");
+    assert!(app.status_message.is_none(), "no prompt opened after copy mode ended");
+}
+
+#[test]
 fn copy_mode_keys_are_inactive_while_the_prompt_is_open() {
     // `q` exits copy mode and `j` moves the cursor, but not in here.
     let mut app = copy_app("vi", "absolute");

@@ -3184,8 +3184,27 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     }
     // In copy mode, interpret characters as copy-mode actions (never send to PTY)
     if matches!(app.mode, Mode::CopyMode) {
-        for c in text.chars() {
+        let mut chars = text.char_indices();
+        while let Some((i, c)) = chars.next() {
             handle_copy_mode_char(app, c)?;
+            if matches!(app.mode, Mode::CopyMode) {
+                continue;
+            }
+            // The key opened a copy mode prompt (`/`, `?`, `:`): what follows
+            // is typed into it, exactly as if the characters had come one
+            // send-text at a time. Without this, `send-keys ':500'` or a
+            // paste of `/foo` fed `500` / `foo` to the copy mode keys.
+            if app.mode.in_copy() {
+                let rest = &text[i + c.len_utf8()..];
+                if !rest.is_empty() {
+                    return send_text_to_active(app, rest);
+                }
+            }
+            // Copy mode ended (`q`, a yank, ...) or something else took over:
+            // drop the rest. Running it as copy mode keys on a pane that has
+            // left copy mode does nothing useful, and sending it to the shell
+            // would type text nobody meant for it.
+            break;
         }
         return Ok(());
     }
