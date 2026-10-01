@@ -314,6 +314,25 @@ $pos = Pos
 if ($pos -eq $hist) { Write-Pass "send -X goto-line 1 reaches line 1 without the -- marker" }
 else { Write-Fail "send -X goto-line 1 gave scroll_position = $pos, expected $hist" }
 
+# ── The key and the number in one argument ──
+
+Write-Head "one send-keys argument"
+
+# `send-keys ':50'` reaches the server as ONE send-text. The characters after
+# `:` belong to the prompt it opens, the same as when they come one at a time;
+# they used to be run as copy mode keys, so 50 became a count and the prompt
+# was accepted empty.
+if ((InMode) -ne "1") { P copy-mode -t $SESS | Out-Null; Start-Sleep -Milliseconds 800 }
+P send-keys -t $SESS -X history-bottom | Out-Null
+Start-Sleep -Milliseconds 400
+$hNow = Hist
+P send-keys -t $SESS ':50' Enter | Out-Null
+Start-Sleep -Milliseconds 600
+$pos = Pos
+$want = $hNow - 49
+if ($pos -eq $want) { Write-Pass "send-keys ':50' Enter reaches line 50 (scroll_position = $pos)" }
+else { Write-Fail "send-keys ':50' Enter gave scroll_position = $pos, expected $want" }
+
 # ── g keeps its meaning, since the new arm sits next to it ──
 
 Write-Head "the g key"
