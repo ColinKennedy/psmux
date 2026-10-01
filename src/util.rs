@@ -730,7 +730,9 @@ pub fn parse_cat_file_sink(cmd: &str) -> Option<(String, bool)> {
     let trimmed = cmd.trim();
     // PowerShell aliases are case-insensitive, so `CAT`/`Cat` hit the same
     // Get-Content trap as `cat` — match the word the same way.
-    if trimmed.len() < 3 || !trimmed[..3].eq_ignore_ascii_case("cat") {
+    // `get`, not `[..3]`: byte 3 of `caé ...` falls inside the é, and the
+    // slice used to panic the server on a pipe-pane command (#712 audit).
+    if !trimmed.get(..3).is_some_and(|w| w.eq_ignore_ascii_case("cat")) {
         return None;
     }
     let rest = &trimmed[3..];
@@ -906,6 +908,53 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         out.push_str(&format!("{:02x}", b));
     }
     out
+}
+
+/// The longest prefix of `s` that is at most `max_bytes` bytes long and ends
+/// on a char boundary.
+///
+/// `&s[..max_bytes]` panics when byte `max_bytes` falls inside a multi byte
+/// character (#712: the -CC relay thread died on a box drawing line), so every
+/// byte budgeted cut of text that can hold non ASCII goes through here.
+pub fn str_prefix_within(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The longest prefix of `s` whose display width is at most `max_cols`
+/// columns (wide CJK and emoji count 2). For titles cut to a box width,
+/// where a byte budget would both split characters and miscount columns.
+pub fn str_prefix_within_cols(s: &str, max_cols: usize) -> &str {
+    use unicode_width::UnicodeWidthChar;
+    let mut cols = 0usize;
+    for (i, ch) in s.char_indices() {
+        let w = ch.width().unwrap_or(0);
+        if cols + w > max_cols {
+            return &s[..i];
+        }
+        cols += w;
+    }
+    s
+}
+
+/// Remove the whole character that ends at byte offset `cursor` (Backspace
+/// in a line editor whose cursor is a byte offset). `cursor` inside a
+/// character is first floored to a boundary. Returns false at offset 0.
+pub fn str_remove_char_before(s: &mut String, cursor: usize) -> bool {
+    let cur = str_prefix_within(s, cursor).len();
+    match s[..cur].chars().next_back() {
+        Some(ch) => {
+            s.remove(cur - ch.len_utf8());
+            true
+        }
+        None => false,
+    }
 }
 
 /// Decode the output of [`hex_encode`].  `None` for an odd length or any
@@ -1393,3 +1442,11 @@ mod tests_issue560_quote_arg_control_bytes;
 #[cfg(test)]
 #[path = "../tests-rs/test_pipe_pane_cat_file_sink.rs"]
 mod tests_pipe_pane_cat_file_sink;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue712_str_prefix_within.rs"]
+mod tests_issue712_str_prefix_within;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue712_util_audit.rs"]
+mod tests_issue712_util_audit;

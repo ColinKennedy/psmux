@@ -1292,6 +1292,31 @@ fn copy_cursor_abs(app: &mut AppState) -> (usize, u16) {
     (top + r as usize, c)
 }
 
+/// Every (overlapping) occurrence of `query_lower` in `lower`, as
+/// (col_start, col_end) pairs in DISPLAY columns, the unit of the copy
+/// cursor: a wide CJK or emoji character spans two cells of the grid row the
+/// line was read from, so a character count put the cursor short of every
+/// hit that followed one (tmux searches grid cells, window-copy.c).
+///
+/// The scan resumes one CHARACTER after each hit, not one byte: a query that
+/// starts with a multi byte character (日本, école) used to resume inside it
+/// and the slice panicked, taking the whole server down (#712 audit).
+pub(crate) fn search_line_matches(lower: &str, query_lower: &str) -> Vec<(u16, u16)> {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = Vec::new();
+    if query_lower.is_empty() { return out; }
+    let qlen = UnicodeWidthStr::width(query_lower) as u16;
+    let mut start = 0usize;
+    while let Some(pos) = lower[start..].find(query_lower) {
+        let byte_at = start + pos;
+        let col_start = UnicodeWidthStr::width(&lower[..byte_at]) as u16;
+        out.push((col_start, col_start + qlen));
+        start = byte_at + lower[byte_at..].chars().next().map_or(1, char::len_utf8);
+        if start >= lower.len() { break; }
+    }
+    out
+}
+
 /// Search the active pane for a query string across the WHOLE buffer, the
 /// scrollback history included, exactly as tmux `window_copy_search_jump`
 /// walks lines 0..gd->hsize + gd->sy - 1 (window-copy.c).
@@ -1309,19 +1334,12 @@ pub fn search_copy_mode(app: &mut AppState, query: &str, forward: bool) {
     let (lines, _geom) = match read_all_lines(app) { Some(v) => v, None => return };
 
     let query_lower = query.to_lowercase();
-    let qlen = query_lower.chars().count() as u16;
 
     // Ascending absolute order first; the direction ordering is applied below.
     let mut ascending: Vec<(usize, u16, u16)> = Vec::new();
     for (abs, line) in lines.iter().enumerate() {
-        let lower = line.to_lowercase();
-        let mut start = 0usize;
-        while let Some(pos) = lower[start..].find(&query_lower) {
-            let byte_at = start + pos;
-            let col_start = lower[..byte_at].chars().count() as u16;
-            ascending.push((abs, col_start, col_start + qlen));
-            start = byte_at + 1;
-            if start >= lower.len() { break; }
+        for (c0, c1) in search_line_matches(&line.to_lowercase(), &query_lower) {
+            ascending.push((abs, c0, c1));
         }
     }
     if ascending.is_empty() { return; }
@@ -2420,3 +2438,7 @@ mod test_issue687_copy_mode_keyboard_selection;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue704_toggle_position.rs"]
 mod test_issue704_toggle_position;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue712_copy_search_utf8.rs"]
+mod tests_issue712_copy_search_utf8;

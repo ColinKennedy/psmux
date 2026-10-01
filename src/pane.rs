@@ -2162,8 +2162,11 @@ fn detect_bash_c_wrapper(cmd: &str) -> Option<(&str, &str)> {
         if cmd.starts_with(prefix) {
             let rest = &cmd[prefix.len()..];
             // Strip outer quotes (single or double)
-            let inner = if (rest.starts_with('\'') && rest.ends_with('\''))
-                || (rest.starts_with('"') && rest.ends_with('"'))
+            // len >= 2: a lone quote both starts and ends with itself, and
+            // [1..0] panicked the server (#712 audit).
+            let inner = if rest.len() >= 2
+                && ((rest.starts_with('\'') && rest.ends_with('\''))
+                    || (rest.starts_with('"') && rest.ends_with('"')))
             {
                 &rest[1..rest.len() - 1]
             } else {
@@ -2205,8 +2208,9 @@ fn parse_bash_env_script(script: &str) -> (Vec<String>, Vec<(String, String)>, S
                 let var = assign[..eq_pos].to_string();
                 let mut val = assign[eq_pos + 1..].trim().to_string();
                 // Strip outer quotes
-                if (val.starts_with('"') && val.ends_with('"'))
-                    || (val.starts_with('\'') && val.ends_with('\''))
+                if val.len() >= 2
+                    && ((val.starts_with('"') && val.ends_with('"'))
+                        || (val.starts_with('\'') && val.ends_with('\'')))
                 {
                     val = val[1..val.len() - 1].to_string();
                 }
@@ -4166,3 +4170,7 @@ mod tests_issue615_warm_claim_cwd_hint;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue683_shell_env.rs"]
 mod tests_issue683_shell_env;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue712_bash_quote_strip.rs"]
+mod tests_issue712_bash_quote_strip;
