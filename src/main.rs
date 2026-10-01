@@ -197,7 +197,7 @@ fn cli_pane_index_exists(idx_spec: &str) -> Option<bool> {
 /// its window identity (a bare `list-panes` is scoped to the ACTIVE window,
 /// which is not necessarily the target). Issue #554: needed because focus
 /// commands (select-pane/select-window) use the permanent focus path, which
-/// has no reply channel — the server-side ValidateTarget check that covers
+/// has no reply channel, so the server-side ValidateTarget check that covers
 /// targeted commands never runs for them, so a stale numeric pane index in
 /// an explicit window had no error signal at all.
 fn cli_pane_index_exists_in_window(window_spec: &str, idx_spec: &str) -> Option<bool> {
