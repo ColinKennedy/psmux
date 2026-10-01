@@ -1196,19 +1196,23 @@ fn copy_cursor_abs(app: &mut AppState) -> (usize, u16) {
 }
 
 /// Every (overlapping) occurrence of `query_lower` in `lower`, as
-/// (col_start, col_end) pairs counted in characters.
+/// (col_start, col_end) pairs in DISPLAY columns, the unit of the copy
+/// cursor: a wide CJK or emoji character spans two cells of the grid row the
+/// line was read from, so a character count put the cursor short of every
+/// hit that followed one (tmux searches grid cells, window-copy.c).
 ///
 /// The scan resumes one CHARACTER after each hit, not one byte: a query that
 /// starts with a multi byte character (日本, école) used to resume inside it
 /// and the slice panicked, taking the whole server down (#712 audit).
 pub(crate) fn search_line_matches(lower: &str, query_lower: &str) -> Vec<(u16, u16)> {
+    use unicode_width::UnicodeWidthStr;
     let mut out = Vec::new();
     if query_lower.is_empty() { return out; }
-    let qlen = query_lower.chars().count() as u16;
+    let qlen = UnicodeWidthStr::width(query_lower) as u16;
     let mut start = 0usize;
     while let Some(pos) = lower[start..].find(query_lower) {
         let byte_at = start + pos;
-        let col_start = lower[..byte_at].chars().count() as u16;
+        let col_start = UnicodeWidthStr::width(&lower[..byte_at]) as u16;
         out.push((col_start, col_start + qlen));
         start = byte_at + lower[byte_at..].chars().next().map_or(1, char::len_utf8);
         if start >= lower.len() { break; }

@@ -4,10 +4,11 @@
 
 use super::search_line_matches;
 
+// Columns are display cells: each CJK character is two of them.
 #[test]
-fn cjk_query_finds_every_hit() {
+fn cjk_query_finds_every_hit_at_its_display_column() {
     let m = search_line_matches("x\u{65e5}\u{672c}y\u{65e5}\u{672c}z\u{65e5}\u{672c}w", "\u{65e5}\u{672c}");
-    assert_eq!(m, vec![(1, 3), (4, 6), (7, 9)]);
+    assert_eq!(m, vec![(1, 5), (6, 10), (11, 15)]);
 }
 
 #[test]
@@ -21,7 +22,7 @@ fn two_byte_query_back_to_back() {
 fn four_byte_query_overlapping() {
     let line = "\u{1f600}\u{1f600}\u{1f600}";
     let m = search_line_matches(line, "\u{1f600}\u{1f600}");
-    assert_eq!(m, vec![(0, 2), (1, 3)]);
+    assert_eq!(m, vec![(0, 4), (2, 6)]);
 }
 
 #[test]
@@ -34,5 +35,12 @@ fn ascii_overlap_unchanged() {
 
 #[test]
 fn hit_at_the_very_end() {
-    assert_eq!(search_line_matches("ab\u{65e5}", "\u{65e5}"), vec![(2, 3)]);
+    assert_eq!(search_line_matches("ab\u{65e5}", "\u{65e5}"), vec![(2, 4)]);
+}
+
+#[test]
+fn narrow_non_ascii_is_one_column_per_char() {
+    // Box drawing and Latin accents are 1 column despite 2 or 3 bytes.
+    let m = search_line_matches("\u{2500}\u{2500}x\u{2500}x", "x");
+    assert_eq!(m, vec![(2, 3), (4, 5)]);
 }
