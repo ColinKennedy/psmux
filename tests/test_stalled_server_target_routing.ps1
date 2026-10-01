@@ -156,7 +156,7 @@ try {
                 elseif ($n -gt $want[2]) { $problems += "$($want[0]) arrived $n times, wanted $($want[2])"; $totals.dup_keys++ }
             }
             if ($titleB -ne "T$($case.tag)$i" -or $titleA -eq "T$($case.tag)$i") { $problems += "select-pane -T landed wrong: A='$titleA' B='$titleB'"; $totals.wrong_title++ }
-            if (($panes -join ',') -ne "$idA,$idB") { $problems += "kill-pane -t ${S}:0.2 left panes [$($panes -join ',')], wanted [$idA,$idB] (killed $idD)"; $totals.wrong_kill++ }
+            if (($panes -join ',') -ne "$idA,$idB") { $problems += "kill-pane -t ${S}:0.2 left panes [$($panes -join ',')], wanted [$idA,$idB] (the sacrificial pane was $idD)"; $totals.wrong_kill++ }
             $dm = $res[5].out.Trim()
             if ($dm -notmatch 'timed out|no response' -and $dm -notmatch '^1\.%\d+$') { $problems += "display-message -t ${S}:1 answered '$dm', not window 1"; $totals.wrong_display++ }
             if ($after -ne $before) { $problems += "active pane moved from $before to $after"; $totals.focus_moved++ }
