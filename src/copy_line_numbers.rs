@@ -48,7 +48,6 @@ impl CopyLnMode {
     pub fn is_active(self) -> bool {
         self != CopyLnMode::Off
     }
-
 }
 
 /// Total gutter width in columns, including the trailing space separator.
