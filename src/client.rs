@@ -4051,15 +4051,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     KeyCode::Esc => { cmd_batch.push("customize-edit-cancel\n".into()); }
                                     KeyCode::Enter => { cmd_batch.push("customize-edit-confirm\n".into()); }
                                     KeyCode::Backspace => {
-                                        if srv_customize_cursor > 0 {
-                                            let mut buf = srv_customize_edit_buf.clone();
-                                            buf.remove(srv_customize_cursor - 1);
+                                        // The cursor is a byte offset (the server parks it
+                                        // at edit_buffer.len()); remove the whole character
+                                        // before it, not byte cursor-1, which panicked on a
+                                        // value ending in a multi byte char (#712 audit).
+                                        let mut buf = srv_customize_edit_buf.clone();
+                                        if crate::util::str_remove_char_before(&mut buf, srv_customize_cursor) {
                                             cmd_batch.push(format!("customize-edit-update {}\n", buf));
                                         }
                                     }
                                     KeyCode::Char(c) => {
                                         let mut buf = srv_customize_edit_buf.clone();
-                                        buf.insert(srv_customize_cursor, c);
+                                        let at = crate::util::str_prefix_within(&buf, srv_customize_cursor).len();
+                                        buf.insert(at, c);
                                         cmd_batch.push(format!("customize-edit-update {}\n", buf));
                                     }
                                     _ => {}
@@ -8142,7 +8146,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             if srv_popup_active {
                 let popup_area = popup_overlay_rect(content_chunk, srv_popup_width, srv_popup_height);
                 let w = popup_area.width;
-                let title = if srv_popup_command.is_empty() { "Popup".to_string() } else { let max_title = (w as usize).saturating_sub(4); if srv_popup_command.len() > max_title { format!("{}...", &srv_popup_command[..max_title.saturating_sub(3)]) } else { srv_popup_command.clone() } };
+                // Cut by display columns on a char boundary: a byte cut of a
+                // non ASCII command panicked the client (#712 audit).
+                let title = if srv_popup_command.is_empty() { "Popup".to_string() } else {
+                    let max_title = (w as usize).saturating_sub(4);
+                    if unicode_width::UnicodeWidthStr::width(srv_popup_command.as_str()) > max_title {
+                        format!("{}...", crate::util::str_prefix_within_cols(&srv_popup_command, max_title.saturating_sub(3)))
+                    } else { srv_popup_command.clone() }
+                };
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow))
