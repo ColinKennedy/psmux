@@ -23,6 +23,7 @@ mod popup;
 mod pane_border;
 mod clipboard;
 mod copy_mode;
+mod copy_prompt;
 mod input;
 mod layout;
 mod window_ops;

@@ -1119,6 +1119,9 @@ pub enum Mode {
     CopyGoto {
         input: String,
     },
+    /// A `command-prompt` opened by a copy mode key table binding; the pane
+    /// stays in copy mode while it is open (see `crate::copy_prompt`).
+    CopyCommandPrompt(Box<crate::copy_prompt::CopyCommandPrompt>),
     /// Big clock display (tmux clock-mode)
     ClockMode,
     /// Interactive buffer chooser (prefix =)
@@ -1144,7 +1147,7 @@ impl Mode {
     /// is what a caller holding `&mut app.windows` needs, since a call taking
     /// `&AppState` would borrow the rest of the state along with it.
     pub fn in_copy(&self) -> bool {
-        matches!(self, Mode::CopyMode | Mode::CopySearch { .. } | Mode::CopyGoto { .. })
+        matches!(self, Mode::CopyMode | Mode::CopySearch { .. } | Mode::CopyGoto { .. } | Mode::CopyCommandPrompt(_))
     }
 }
 

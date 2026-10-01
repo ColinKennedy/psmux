@@ -455,6 +455,7 @@ pub(crate) fn combined_data_version(app: &AppState) -> u64 {
         crate::types::Mode::PaneChooser { .. } => 8,
         crate::types::Mode::BufferChooser { .. } => 9,
         crate::types::Mode::CopyGoto { .. } => 11,
+        crate::types::Mode::CopyCommandPrompt(_) => 12,
         _ => 10,
     };
     v = v.wrapping_add(mode_tag.wrapping_mul(0x1_0000_0000));

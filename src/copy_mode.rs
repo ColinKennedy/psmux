@@ -365,6 +365,7 @@ pub fn copy_prompt_text(mode: &Mode) -> Option<String> {
             Some(format!("(search {}) {}", arrow, input))
         }
         Mode::CopyGoto { input } => Some(format!("(goto line) {}", input)),
+        Mode::CopyCommandPrompt(p) => Some(p.status_text()),
         _ => None,
     }
 }

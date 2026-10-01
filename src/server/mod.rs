@@ -1456,7 +1456,7 @@ fn send_keys_x_takes_count(name: &str) -> bool {
 /// for -X), then the command runs, repeated `count` times when it is one
 /// that takes a repeat count. A command that leaves copy mode ends the
 /// repeat.
-fn run_send_keys_x(app: &mut AppState, cmd: &str, count: usize) -> Result<(), String> {
+pub(crate) fn run_send_keys_x(app: &mut AppState, cmd: &str, count: usize) -> Result<(), String> {
     if !app.mode.in_copy() {
         return Err("not in a mode".to_string());
     }
@@ -1683,6 +1683,25 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
             // reached at all and a number past the pane height was clamped away.
             let arg = s.strip_prefix("goto-line").unwrap_or("");
             crate::copy_mode::run_goto_line(app, arg);
+        }
+        // With the character as an argument the jump happens at once, which is
+        // how tmux's own `f` binding delivers it: `command-prompt -1p'(jump
+        // forward)' { send -X jump-forward -- '%%' }` (key-bindings.c:693).
+        s if s.starts_with("jump-forward ") || s.starts_with("jump-backward ")
+            || s.starts_with("jump-to-forward ") || s.starts_with("jump-to-backward ") =>
+        {
+            let (verb, arg) = s.split_once(' ').unwrap_or((s, ""));
+            let n = app.copy_count.take().unwrap_or(1);
+            if let Some(ch) = arg.chars().next() {
+                for _ in 0..n {
+                    match verb {
+                        "jump-forward" => crate::copy_mode::find_char_forward(app, ch),
+                        "jump-backward" => crate::copy_mode::find_char_backward(app, ch),
+                        "jump-to-forward" => crate::copy_mode::find_char_to_forward(app, ch),
+                        _ => crate::copy_mode::find_char_to_backward(app, ch),
+                    }
+                }
+            }
         }
         "jump-forward" => { app.copy_find_char_pending = Some(0); }
         "jump-backward" => { app.copy_find_char_pending = Some(1); }
