@@ -4114,3 +4114,7 @@ mod tests_copy_mode_parity_keys;
 #[cfg(all(test, windows))]
 #[path = "../tests-rs/test_issue722_goto_line.rs"]
 mod tests_issue722_goto_line;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_paste_no_server_stall.rs"]
+mod tests_paste_no_server_stall;
