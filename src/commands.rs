@@ -1105,11 +1105,49 @@ pub(crate) struct PasteBufferArgs {
     /// `-d`: delete the buffer once it has been pasted.
     pub delete: bool,
     /// The separator that replaces each newline, from `-s` or implied by `-r`.
-    /// `None` means "leave the line endings to the pane writer", which already
-    /// emits CR, exactly tmux's default separator (cmd-paste-buffer.c:93).
+    /// `None` means tmux's default, a carriage return (cmd-paste-buffer.c:93);
+    /// see [`PasteBufferArgs::effective_separator`].
     pub separator: Option<String>,
     /// `-t`: target pane.
     pub target: Option<String>,
+}
+
+impl PasteBufferArgs {
+    /// The separator actually written in place of each LF: `-s`, else LF for
+    /// `-r`, else CR (cmd-paste-buffer.c:88 to :95).
+    ///
+    /// Issue #719: `None` used to mean "leave the line endings to the pane
+    /// writer", on the belief that the writer emits CR.  Only the bracketed
+    /// writer does; a plain `paste-buffer` goes through the send-keys text path,
+    /// which writes LF as LF, so a multi line buffer reached the pane with LF
+    /// where tmux writes CR.
+    pub fn effective_separator(&self) -> &str {
+        self.separator.as_deref().unwrap_or("\r")
+    }
+}
+
+/// The exact text `paste-buffer` writes to the pane for `text`: every LF
+/// replaced by the separator, nothing else touched.  The `-p` brackets are
+/// added by the writer, and only when the pane asked for `?2004h`
+/// (cmd-paste-buffer.c:97 and :124).
+pub(crate) fn paste_buffer_payload(text: &str, pb: &PasteBufferArgs) -> String {
+    apply_separator(text, pb.effective_separator())
+}
+
+/// Write a `paste-buffer` payload to the active pane.  Neither route rewrites
+/// line endings again: `-p` uses the verbatim paste writer, plain text the
+/// send-keys text path, so `-r` keeps its LF and a CR in the buffer stays a CR,
+/// as in tmux.
+fn deliver_paste_buffer(app: &mut AppState, text: &str, pb: &PasteBufferArgs) -> io::Result<()> {
+    let payload = paste_buffer_payload(text, pb);
+    if payload.is_empty() {
+        return Ok(());
+    }
+    if pb.bracket {
+        crate::input::send_paste_buffer_to_active(app, &payload)
+    } else {
+        crate::input::send_text_to_active(app, &payload)
+    }
 }
 
 /// Parse a `paste-buffer` command line.
@@ -1262,13 +1300,7 @@ fn run_paste_buffer_here(app: &mut AppState, pb: &PasteBufferArgs) -> io::Result
     if pb.buffer.is_none() {
         if let Some(reg) = app.copy_register.take() {
             if let Some(text) = app.named_registers.get(&reg).cloned() {
-                if !text.is_empty() {
-                    if pb.bracket {
-                        crate::input::send_paste_to_active(app, &text)?;
-                    } else {
-                        crate::input::send_text_to_active(app, &text)?;
-                    }
-                }
+                deliver_paste_buffer(app, &text, pb)?;
             }
             return Ok(None);
         }
@@ -1301,18 +1333,7 @@ fn run_paste_buffer_here(app: &mut AppState, pb: &PasteBufferArgs) -> io::Result
         }
     };
 
-    let text = match &pb.separator {
-        Some(sep) => apply_separator(&text, sep),
-        None => text,
-    };
-
-    if !text.is_empty() {
-        if pb.bracket {
-            crate::input::send_paste_to_active(app, &text)?;
-        } else {
-            crate::input::send_text_to_active(app, &text)?;
-        }
-    }
+    deliver_paste_buffer(app, &text, pb)?;
 
     if pb.delete {
         match &pb.buffer {

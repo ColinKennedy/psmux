@@ -2807,7 +2807,7 @@ pub fn pane_host_is_supplied() -> bool {
 /// A failed injection falls back to the pipe rather than dropping the paste:
 /// text without markers is a worse paste, no text at all is a lost one.
 #[cfg(windows)]
-fn deliver_paste_to_pane(pane: &mut crate::types::Pane, text: &str, use_bracket: bool) {
+fn deliver_paste_to_pane(pane: &mut crate::types::Pane, text: &str, use_bracket: bool, normalize: bool) {
     let route = if use_bracket {
         let vt = crate::window_ops::pane_reads_vt_bytes(pane);
         let build = crate::ssh_input::windows_build_number();
@@ -2855,7 +2855,7 @@ fn deliver_paste_to_pane(pane: &mut crate::types::Pane, text: &str, use_bracket:
             &format!("route=pipe bracket={} text_len={}", use_bracket, text.len()),
         );
     }
-    write_paste_chunked(&mut pane.writer, text.as_bytes(), use_bracket);
+    write_paste_bytes(&mut pane.writer, text.as_bytes(), use_bracket, normalize);
 }
 
 /// Chunked PTY write for paste delivery.  The PTY pipe can silently
@@ -2865,12 +2865,24 @@ fn deliver_paste_to_pane(pane: &mut crate::types::Pane, text: &str, use_bracket:
 /// (shell / PSReadLine / nvim) has time to drain.  Bracket sequences
 /// are tiny and always written in one shot.
 fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool) {
+    write_paste_bytes(writer, text, bracket, true)
+}
+
+/// [`write_paste_chunked`] with the line ending normalisation optional.
+///
+/// `normalize` is true for a paste that came from a terminal or the clipboard,
+/// whose CRLF / LF line breaks must become the CR ConPTY reads as Enter.  It is
+/// false for `paste-buffer`, which has already replaced every LF with its
+/// separator the way cmd-paste-buffer.c:103 to :122 does, so whatever is left
+/// (the LF of `-r`, a CR that was in the buffer) is what tmux would write and
+/// must reach the pane unchanged (issue #719).
+fn write_paste_bytes(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool, normalize: bool) {
     const CHUNK: usize = 512;
     // Normalize line endings to CR for ConPTY.  Clipboard text may arrive
     // with LF (\n) or CRLF (\r\n), but ConPTY's input parser expects CR
     // (\r) for Enter.  Bare LF is misinterpreted by PSReadLine, causing
     // multi-line pastes to appear in reverse order.
-    let text = {
+    let text = if !normalize { text.to_vec() } else {
         let mut out = Vec::with_capacity(text.len());
         let mut i = 0;
         while i < text.len() {
@@ -2920,6 +2932,17 @@ fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bo
 /// drag-and-drop file paths, ensuring applications like Claude CLI can
 /// distinguish paste/drop from typed input.
 pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
+    send_paste_to_active_impl(app, text, true)
+}
+
+/// `paste-buffer -p`: the same delivery as [`send_paste_to_active`], brackets
+/// only when the pane asked for `?2004h`, but the text goes out exactly as
+/// given.  The caller has already applied the separator (issue #719).
+pub fn send_paste_buffer_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
+    send_paste_to_active_impl(app, text, false)
+}
+
+fn send_paste_to_active_impl(app: &mut AppState, text: &str, normalize: bool) -> io::Result<()> {
     // In clock mode, any input exits back to passthrough
     if matches!(app.mode, Mode::ClockMode) {
         app.mode = Mode::Passthrough;
@@ -2979,21 +3002,21 @@ pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     {
         if app.sync_input {
             let win = &mut app.windows[app.active_idx];
-            fn write_all_panes(node: &mut crate::types::Node, text: &str, bracket: bool) {
+            fn write_all_panes(node: &mut crate::types::Node, text: &str, bracket: bool, normalize: bool) {
                 match node {
                     crate::types::Node::Leaf(p) => {
-                        deliver_paste_to_pane(p, text, bracket);
+                        deliver_paste_to_pane(p, text, bracket, normalize);
                     }
                     crate::types::Node::Split { children, .. } => {
-                        for c in children { write_all_panes(c, text, bracket); }
+                        for c in children { write_all_panes(c, text, bracket, normalize); }
                     }
                 }
             }
-            write_all_panes(&mut win.root, text, use_bracket);
+            write_all_panes(&mut win.root, text, use_bracket, normalize);
         } else {
             let win = &mut app.windows[app.active_idx];
             if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                deliver_paste_to_pane(p, text, use_bracket);
+                deliver_paste_to_pane(p, text, use_bracket, normalize);
             }
         }
     }
@@ -3003,21 +3026,21 @@ pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     {
         if app.sync_input {
             let win = &mut app.windows[app.active_idx];
-            fn write_paste_all_panes(node: &mut Node, text: &[u8], bracket: bool) {
+            fn write_paste_all_panes(node: &mut Node, text: &[u8], bracket: bool, normalize: bool) {
                 match node {
                     Node::Leaf(p) => {
-                        write_paste_chunked(&mut p.writer, text, bracket);
+                        write_paste_bytes(&mut p.writer, text, bracket, normalize);
                     }
                     Node::Split { children, .. } => {
-                        for c in children { write_paste_all_panes(c, text, bracket); }
+                        for c in children { write_paste_all_panes(c, text, bracket, normalize); }
                     }
                 }
             }
-            write_paste_all_panes(&mut win.root, text.as_bytes(), use_bracket);
+            write_paste_all_panes(&mut win.root, text.as_bytes(), use_bracket, normalize);
         } else {
             let win = &mut app.windows[app.active_idx];
             if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                write_paste_chunked(&mut p.writer, text.as_bytes(), use_bracket);
+                write_paste_bytes(&mut p.writer, text.as_bytes(), use_bracket, normalize);
             }
         }
     }
@@ -3941,6 +3964,10 @@ mod tests_issue588_win32_input_escape;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue684_paste_route.rs"]
 mod tests_issue684_paste_route;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue719_paste_buffer_bytes.rs"]
+mod tests_issue719_paste_buffer_bytes;
 
 #[cfg(all(test, windows))]
 #[path = "../tests-rs/test_issue623_ctrl_digit.rs"]
