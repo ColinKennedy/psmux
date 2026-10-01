@@ -845,25 +845,55 @@ fn drain_plugin_req(
 /// delete them, since a crash report is wanted precisely when the `.port` that
 /// drives every sweep is already gone.
 fn append_data_dir_report(filename: &str, base: &str, body: &str) {
-    use std::io::Write as _;
     let Some(dir) = crate::paths::psmux_dir_opt() else { return };
     let _ = std::fs::create_dir_all(&dir);
     let path = format!("{}\\{}", dir, filename);
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    append_report_at(&path, base, body, DATA_DIR_REPORT_CAP_BYTES);
+}
+
+/// What starts every report in an appended data directory log. The reader
+/// keys on it, so the two must not drift apart.
+const REPORT_HEADER: &str = "\n=== session ";
+
+/// Size at which an appended report log is rotated to `<name>.1`.
+///
+/// These files are always on, unlike the opt in debug logs whose per process
+/// line cap keeps them small (#684, `input_debug.log`), so a machine that keeps
+/// failing to start a server would otherwise grow them for ever. A startup
+/// report is about 1.2 KB and a crash report with its backtrace a few tens of
+/// KB, so 512 KB holds hundreds of the first and dozens of the second, and with
+/// the one rotated copy the pair never exceeds about 1 MB.
+const DATA_DIR_REPORT_CAP_BYTES: u64 = 512 * 1024;
+
+/// Path injectable core of [`append_data_dir_report`].
+///
+/// The whole report, header and body, goes out in ONE append write. Two
+/// writes (header, then body) let two servers failing at the same moment
+/// interleave as header A, header B, body A, body B, and the reader, which
+/// trusts the header above a body, would then hand A's error to B's client.
+pub(crate) fn append_report_at(path: &str, base: &str, body: &str, cap: u64) {
+    use std::io::Write as _;
+    if std::fs::metadata(path).map(|m| m.len() >= cap).unwrap_or(false) {
+        // Replaces any older `.1`. Two servers rotating at the same instant can
+        // at worst rotate twice and lose the older copy, never this report.
+        let _ = std::fs::rename(path, format!("{}.1", path));
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
     let when = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let _ = writeln!(
-        f,
-        "\n=== session {} pid {} at epoch {} ===",
+    let report = format!(
+        "{}{} pid {} at epoch {} ===\n{}\n",
+        REPORT_HEADER,
         base,
         std::process::id(),
-        when
+        when,
+        body
     );
-    let _ = writeln!(f, "{}", body);
+    let _ = f.write_all(report.as_bytes());
     let _ = f.flush();
 }
 
@@ -977,24 +1007,53 @@ pub(crate) fn startup_error_log_path() -> Option<String> {
 /// `since_epoch` is the wall-clock second the current startup attempt began;
 /// logs whose `when (epoch s)` predate it are stale (from an earlier run or an
 /// adopted warm server) and are ignored. Returns `(error_text, log_path)`.
-pub(crate) fn read_fresh_startup_error(since_epoch: u64) -> Option<(String, String)> {
+///
+/// `base` is the port file base (`ns__name` under `-L`) of the server this
+/// client started, the same string that server writes into its report header.
+/// Only that server's report is surfaced: the file is shared by every server in
+/// the data directory, and with two failing at nearly the same moment the LAST
+/// report is as likely to be the other one's (measured: 20 of 40 clients
+/// printed the other server's error when only the last report was read).
+pub(crate) fn read_fresh_startup_error(since_epoch: u64, base: &str) -> Option<(String, String)> {
     let path = startup_error_log_path()?;
-    read_fresh_startup_error_at(&path, since_epoch)
+    read_fresh_startup_error_for_at(&path, since_epoch, Some(base))
 }
 
 /// Path-injectable core of [`read_fresh_startup_error`] — kept separate so unit
 /// tests can exercise the freshness/parsing logic against a temp file without
 /// mutating the process-global USERPROFILE/HOME env (which would race the
-/// issue-167 log tests sharing this binary).
+/// issue-167 log tests sharing this binary). Reads the last report, whoever
+/// wrote it.
 fn read_fresh_startup_error_at(path: &str, since_epoch: u64) -> Option<(String, String)> {
+    read_fresh_startup_error_for_at(path, since_epoch, None)
+}
+
+/// The reader, with the server it is asking about as a parameter.
+///
+/// `Some(base)`: the last report whose header names `base`; a file that has
+/// headed reports but none for `base` yields nothing, because every report in
+/// it belongs to some other server. `None`: the last report of any server.
+/// A file with no header at all is one an older psmux wrote by truncating, and
+/// is read whole either way.
+pub(crate) fn read_fresh_startup_error_for_at(
+    path: &str,
+    since_epoch: u64,
+    base: Option<&str>,
+) -> Option<(String, String)> {
     let whole = std::fs::read_to_string(path).ok()?;
-    // The file appends one report per failing server (`append_data_dir_report`),
-    // so the report this attempt wants is the LAST one. Everything below reads
-    // the first match it finds, which before appending was also the only one.
-    // A file with no header is one an older psmux wrote: read all of it.
-    let content = match whole.rfind("\n=== session ") {
-        Some(at) => &whole[at..],
-        None => whole.as_str(),
+    let content = if !whole.contains(REPORT_HEADER) {
+        whole.as_str()
+    } else {
+        let at = match base {
+            Some(b) => whole.rfind(&format!("{}{} pid ", REPORT_HEADER, b))?,
+            None => whole.rfind(REPORT_HEADER)?,
+        };
+        // Up to the next report's header, so its body cannot be read as ours.
+        let rest = &whole[at..];
+        match rest[REPORT_HEADER.len()..].find(REPORT_HEADER) {
+            Some(end) => &rest[..REPORT_HEADER.len() + end],
+            None => rest,
+        }
     };
 
     // Freshness gate: only surface a log written during this attempt.
