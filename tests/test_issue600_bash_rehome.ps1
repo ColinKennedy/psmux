@@ -60,7 +60,13 @@ $PWSHEXE = (Get-Command pwsh -EA SilentlyContinue).Source
 
 # ---- isolated data root + fixture dirs --------------------------------------
 $TAG = [guid]::NewGuid().ToString('N').Substring(0, 8)
-$ROOT = Join-Path $env:TEMP "psmux-i600-$TAG"
+# NOT under %TEMP%. Storage Sense deletes whatever nothing holds open in %TEMP%
+# when the disk runs low; in sweep 2026-10-01_01-53-14 it ran at 06:15:28
+# (Storsvc event 1003) between sections 2 and 3, took dirA, dirB and
+# "target dir", and every later -c fell back to the client's cwd, which read
+# as three product failures. A LocalAppData folder is outside its reach.
+$FixtureBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "psmux-test-fixtures" } else { $env:TEMP }
+$ROOT = Join-Path $FixtureBase "psmux-i600-$TAG"
 $DIRA = Join-Path $ROOT "dirA"
 $DIRB = Join-Path $ROOT "dirB"
 $TARGET = Join-Path $ROOT "target dir"     # a space, so quoting is exercised
@@ -152,6 +158,22 @@ function Assert-BashPwd($label, $target, $expectedDir) {
 
 function Kill-Session($name) { & $PSMUX kill-session -t $name 2>&1 | Out-Null }
 
+# A -c or cwd assertion is only about psmux while the directory it names still
+# exists. If something outside psmux removed a fixture, say so with evidence
+# and do not judge psmux on a directory that is not there.
+function Test-Fixtures($label, [string[]]$dirs) {
+    $gone = @($dirs | Where-Object { -not (Test-Path -LiteralPath $_) })
+    if ($gone.Count -eq 0) { return $true }
+    $ss = ''
+    try {
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Storsvc/Diagnostic'; Id = 1003; StartTime = $script:SuiteStart } -ErrorAction Stop)
+        if ($ev.Count) { $ss = " Storage Sense ran at " + (($ev | ForEach-Object { $_.TimeCreated.ToString('HH:mm:ss.fff') }) -join ',') + "." }
+    } catch { }
+    Write-Fail "$label not judged: fixture dir(s) deleted by something outside psmux before this step: $($gone -join '; ').$ss"
+    return $false
+}
+$script:SuiteStart = Get-Date
+
 try {
     $env:PSMUX_DATA_DIR = $ROOT
     $env:PSMUX_CONFIG_FILE = $CONF
@@ -170,14 +192,14 @@ try {
     Wait-Prompt "${SESSION}_bash:1" '\$ ' | Out-Null
     Start-Sleep -Milliseconds 1500          # let the injected rehome settle
     Assert-CleanRehome "new-window -c" "${SESSION}_bash:1" $TARGET | Out-Null
-    Assert-BashPwd     "new-window -c" "${SESSION}_bash:1" $TARGET
+    if (Test-Fixtures "new-window -c pwd" @($TARGET)) { Assert-BashPwd "new-window -c" "${SESSION}_bash:1" $TARGET }
 
     Start-Sleep -Milliseconds $WarmLoadMs   # let the replenished warm pane load
     & $PSMUX split-window -t "${SESSION}_bash:1" -c $TARGET 2>&1 | Out-Null
     Wait-Prompt "${SESSION}_bash:1.1" '\$ ' | Out-Null
     Start-Sleep -Milliseconds 1500
     Assert-CleanRehome "split-window -c" "${SESSION}_bash:1.1" $TARGET | Out-Null
-    Assert-BashPwd     "split-window -c" "${SESSION}_bash:1.1" $TARGET
+    if (Test-Fixtures "split-window -c pwd" @($TARGET)) { Assert-BashPwd "split-window -c" "${SESSION}_bash:1.1" $TARGET }
 
     Kill-Session "${SESSION}_bash"
 
@@ -197,7 +219,7 @@ try {
     Wait-Prompt "${SESSION}_warm" '\$ ' | Out-Null
     Start-Sleep -Milliseconds 1500
     Assert-CleanRehome "warm claim" "${SESSION}_warm" $DIRB | Out-Null
-    Assert-BashPwd     "warm claim" "${SESSION}_warm" $DIRB
+    if (Test-Fixtures "warm claim pwd" @($DIRA, $DIRB)) { Assert-BashPwd "warm claim" "${SESSION}_warm" $DIRB }
     Kill-Session "${SESSION}_warm"
 
     # =====================================================================
@@ -215,7 +237,8 @@ try {
     Start-Sleep -Milliseconds 1500
     $ccap = Assert-CleanRehome "cmd new-window -c" "${SESSION}_cmd:1" $TARGET
     # cmd's prompt IS its cwd, so the prompt is the directory assertion.
-    if ($ccap -match [regex]::Escape($TARGET)) {
+    if (-not (Test-Fixtures "cmd new-window -c prompt" @($TARGET))) { }
+    elseif ($ccap -match [regex]::Escape($TARGET)) {
         Write-Pass "cmd new-window -c pane prompt is the requested dir"
     } else {
         Write-Fail "cmd new-window -c pane prompt is not '$TARGET'"
@@ -240,7 +263,8 @@ try {
         Wait-Prompt "${SESSION}_pwsh:1" 'PS [A-Za-z]:\\' | Out-Null
         Start-Sleep -Milliseconds 1500
         $pcap = Assert-CleanRehome "pwsh new-window -c" "${SESSION}_pwsh:1" $TARGET
-        if ($pcap -match [regex]::Escape($TARGET)) {
+        if (-not (Test-Fixtures "pwsh new-window -c prompt" @($TARGET))) { }
+        elseif ($pcap -match [regex]::Escape($TARGET)) {
             Write-Pass "pwsh new-window -c pane prompt is the requested dir (unchanged behaviour)"
         } else {
             Write-Fail "pwsh new-window -c pane prompt is not '$TARGET'"
