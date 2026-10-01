@@ -2890,7 +2890,8 @@ match cmd {
                     .collect::<Vec<_>>()
                     .join(" ");
                 if payload.len() >= screen_b64_len {
-                    payload[..screen_b64_len].to_string()
+                    // base64 is ASCII; a corrupt payload must not panic here.
+                    payload.get(..screen_b64_len).unwrap_or(&payload).to_string()
                 } else {
                     payload
                 }

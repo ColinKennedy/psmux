@@ -210,7 +210,8 @@ pub fn orchestrate_cross_session_join(
         (len, Some(data)) => {
             let data = data.trim_end();
             if data.len() >= len {
-                Some(data[..len].to_string())
+                // base64 is ASCII; a corrupt payload must not panic here.
+                Some(data.get(..len).unwrap_or(data).to_string())
             } else {
                 Some(data.to_string())
             }
