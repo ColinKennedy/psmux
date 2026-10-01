@@ -1004,14 +1004,29 @@ fn customize_mode_shows_options_popup() {
 /// than in the one test that bites means a command added to the lists below
 /// cannot reintroduce this.
 fn assert_server_forward_noop(cmd: &str) {
+    // The restore is a Drop guard, declared after the lock so it runs before
+    // the lock is released, and it runs on a panic inside the command too: a
+    // command that panics instead of returning Err must not leave every later
+    // test in this binary pointed at a deleted temporary directory.
+    struct RestoreDataDir(Option<std::ffi::OsString>, std::path::PathBuf);
+    impl Drop for RestoreDataDir {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("PSMUX_DATA_DIR", v),
+                None => std::env::remove_var("PSMUX_DATA_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
     let _env = crate::util::lock_test_env();
-    let saved = std::env::var_os("PSMUX_DATA_DIR");
     let dir = std::env::temp_dir().join(format!(
         "psmux_fwd_noop_{}_{}",
         std::process::id(),
         cmd.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()
     ));
+    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
+    let restore = RestoreDataDir(std::env::var_os("PSMUX_DATA_DIR"), dir.clone());
     std::env::set_var("PSMUX_DATA_DIR", &dir);
 
     let mut app = mock_app_with_window();
@@ -1021,13 +1036,9 @@ fn assert_server_forward_noop(cmd: &str) {
     let original_sync = app.sync_input;
     let result = execute_command_string(&mut app, cmd);
 
-    // Put the directory back before asserting, so a failure cannot leak the
-    // override into whatever test runs next.
-    match saved {
-        Some(v) => std::env::set_var("PSMUX_DATA_DIR", v),
-        None => std::env::remove_var("PSMUX_DATA_DIR"),
-    }
-    let _ = std::fs::remove_dir_all(&dir);
+    // Put the directory back before asserting, so the assertions below run
+    // against the caller's data directory again.
+    drop(restore);
 
     result.unwrap();
     assert_eq!(app.windows.len(), original_len, "'{}' must not add/remove windows", cmd);
