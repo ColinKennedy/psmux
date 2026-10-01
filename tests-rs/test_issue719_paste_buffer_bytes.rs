@@ -40,9 +40,13 @@ fn s_flag_wins_and_is_written_as_given() {
 
 #[test]
 fn only_linefeeds_are_replaced() {
-    // tmux walks the buffer with memchr('\n'); a CR already in the buffer is
-    // data, so CRLF becomes CR CR, exactly what tmux writes.
-    assert_eq!(payload("a\r\nb", &[]), "a\r\rb");
+    // tmux walks the buffer with memchr('\n').  A CRLF (a Windows file loaded
+    // with load-buffer, a clipboard paste) is one line break here, or every
+    // line would be submitted twice; a lone CR is data and stays.
+    assert_eq!(payload("a\r\nb", &[]), "a\rb");
+    assert_eq!(payload("a\r\nb\r\n", &["-r"]), "a\nb\n");
+    assert_eq!(payload("a\r\nb", &["-s", "|"]), "a|b");
+    assert_eq!(payload("a\rb", &[]), "a\rb");
     assert_eq!(payload("tab\there\x1bend", &[]), "tab\there\x1bend");
     assert_eq!(payload("no newline", &[]), "no newline");
     assert_eq!(payload("trailing\n", &[]), "trailing\r");

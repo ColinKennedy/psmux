@@ -1181,11 +1181,18 @@ pub(crate) fn parse_paste_buffer_args(args: &[&str]) -> PasteBufferArgs {
 
 /// Replace every newline with `sep`, the way cmd-paste-buffer.c:103 to :122
 /// walks the buffer and writes the separator after each line.
+///
+/// A CRLF counts as ONE newline.  tmux splits on LF only, which on Unix is the
+/// whole story; on Windows a buffer loaded from a file (`load-buffer`) or taken
+/// from the clipboard ends its lines with CRLF, and splitting on the LF alone
+/// would leave the CR in front of the separator, so every line would be
+/// submitted twice (CR CR).  A lone CR is data and is left alone.
 pub(crate) fn apply_separator(text: &str, sep: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find('\n') {
-        out.push_str(&rest[..i]);
+        let line = &rest[..i];
+        out.push_str(line.strip_suffix('\r').unwrap_or(line));
         out.push_str(sep);
         rest = &rest[i + 1..];
     }

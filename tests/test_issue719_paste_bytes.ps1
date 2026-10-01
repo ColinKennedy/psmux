@@ -83,7 +83,8 @@ try {
         @{ n = '-s X replaces LF with X';                         bp = 'on';  buf = "a`nb`nc";     a = @('-s', 'X');      want = 'aXbXc' },
         @{ n = '-p keeps the CR separator inside the brackets';   bp = 'on';  buf = "a`nb`nc";     a = @('-p');           want = '<ESC>[200~a<CR>b<CR>c<ESC>[201~' },
         @{ n = '-p -r keeps LF inside the brackets';              bp = 'on';  buf = "a`nb`nc";     a = @('-p', '-r');     want = '<ESC>[200~a<LF>b<LF>c<ESC>[201~' },
-        @{ n = 'only LF is replaced: CRLF becomes CR CR';         bp = 'on';  buf = "a`r`nb";      a = @();               want = 'a<CR><CR>b' }
+        @{ n = 'a CRLF is one line break, not two';               bp = 'on';  buf = "a`r`nb";      a = @();               want = 'a<CR>b' },
+        @{ n = '-p -r turns CRLF into one LF';                    bp = 'on';  buf = "a`r`nb";      a = @('-p', '-r');     want = '<ESC>[200~a<LF>b<ESC>[201~' }
     )
     $k = 0
     foreach ($c in $cases) {

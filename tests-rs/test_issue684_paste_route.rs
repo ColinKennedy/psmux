@@ -191,8 +191,12 @@ fn separator_replaces_every_newline() {
     assert_eq!(apply_separator("nolines", "|"), "nolines");
     assert_eq!(apply_separator("", "|"), "");
     assert_eq!(apply_separator("\n\n", "-"), "--");
-    // A CRLF buffer keeps its CR, exactly as tmux's memchr('\n') split does.
-    assert_eq!(apply_separator("a\r\nb", "|"), "a\r|b");
+    // Issue #719: a CRLF is ONE line break.  tmux's memchr('\n') split would
+    // keep the CR, which on Windows (a CRLF file through load-buffer, a
+    // clipboard paste) submits every line twice once the default CR
+    // separator is applied.  A lone CR is still data.
+    assert_eq!(apply_separator("a\r\nb", "|"), "a|b");
+    assert_eq!(apply_separator("a\rb", "|"), "a\rb");
 }
 
 // ── the default binding ───────────────────────────────────────────────────
