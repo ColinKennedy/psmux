@@ -1170,3 +1170,31 @@ fn issue598_forwarded_characters_expire_with_the_gesture_window() {
         "pasting the same text again later is a deliberate repeat"
     );
 }
+
+// Issue #598, sweep 2026-10-01_01-53-14: a fragmented paste whose pieces arrive
+// 20 to 60 ms apart must stay ONE paste after the 300 ms hold. The old rule cut
+// it at the first loop wake inside such a gap.
+#[cfg(windows)]
+#[test]
+fn stage2_paste_holds_through_fragment_gaps_after_300ms() {
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    // Inside the 300 ms window nothing ends the paste, however quiet.
+    assert!(!stage2_paste_is_over(ms(250), ms(250)));
+    // Past 300 ms, a gap of the size sshd's ConPTY leaves between fragments
+    // (measured 20 to 60 ms) keeps the paste open.
+    for gap in [0u64, 20, 41, 60, 99] {
+        assert!(!stage2_paste_is_over(ms(320), ms(gap)), "gap {gap} ms ended the paste");
+    }
+    // Quiet for PASTE_STAGE2_QUIET since the last character: the paste is over.
+    assert!(stage2_paste_is_over(ms(301), PASTE_STAGE2_QUIET));
+    assert!(stage2_paste_is_over(ms(900), ms(150)));
+}
+
+#[cfg(windows)]
+#[test]
+fn stage2_quiet_is_measured_from_the_last_character_not_from_the_hold() {
+    use std::time::Duration;
+    // A long paste that is still arriving 2 s in is not over.
+    assert!(!stage2_paste_is_over(Duration::from_secs(2), Duration::from_millis(5)));
+}

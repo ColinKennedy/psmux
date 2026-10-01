@@ -1,4 +1,4 @@
-﻿# psmux Comprehensive Test Runner
+# psmux Comprehensive Test Runner
 # Runs ALL test suites sequentially with proper cleanup, captures results,
 # and produces a full report including performance metrics.
 #
@@ -1315,6 +1315,22 @@ function Run-TestFile {
         # 2026-10-01_01-53-14, three injectors) is stamped on the result line.
         $avHits = @(Get-AvDetections -Since $auditStart -Suite $baseName)
         if ($avHits.Count) { $uiNote += "  AV-QUARANTINED(" + ($avHits -join ', ') + ")" }
+
+        # Storage Sense (StorSvc) deletes empty directories (and stale files) in %TEMP%
+        # when the disk runs low, on its own schedule (about every 6 h 10 min on
+        # the dev box). In sweep 2026-10-01_01-53-14 it ran at 06:15:28, in the
+        # middle of test_issue600_bash_rehome, and took that suite's fixture
+        # directories, which read as three product failures. Stamp any run that
+        # overlaps a suite, so a fixture that vanished is never read as psmux.
+        try {
+            $suiteStart = (Get-Date).Add(-$sw.Elapsed).AddSeconds(-1)
+            $ss = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Storsvc/Diagnostic'; Id = 1003; StartTime = $suiteStart } -ErrorAction Stop)
+            if ($ss.Count -gt 0) {
+                $when = ($ss | ForEach-Object { $_.TimeCreated.ToString('HH:mm:ss.fff') }) -join ','
+                $uiNote += "  STORAGE-SENSE-RAN($when)"
+                [System.IO.File]::AppendAllText($suiteLog, "`r`n[RUNNER] Storage Sense (Storsvc event 1003) ran at $when while this suite ran; it deletes unheld files under %TEMP%, so a missing fixture here is external.`r`n")
+            }
+        } catch { }
 
         Write-Log ("{0,-7} {1,-45} {2}P/{3}F  exit={4}  {5}s{6}{7}" -f $status, $baseName, $passCount, $failCount, $exitCode, [math]::Round($sw.Elapsed.TotalSeconds,1), $(if ($leftovers -gt 0) { "  LEFTOVERS=$leftovers" } else { '' }), $uiNote)
 

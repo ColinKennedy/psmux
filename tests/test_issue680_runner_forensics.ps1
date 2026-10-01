@@ -144,7 +144,23 @@ if (-not (Wait-File (Join-Path $rd 'standin.pid') 45)) {
     Stop-Process -Id $spid -Force -ErrorAction SilentlyContinue
     $snap = Join-Path $rd 'runner_vanished.log'
     if (Wait-File $snap 40) {
-        $s = Get-Content $snap -Raw
+        # The watchdog writes this snapshot line by line over a second or more
+        # (chain, verdict, progress tail, kill ledger, process list, event log),
+        # and the file exists from its first line. Reading it the moment it
+        # appears races the writer: in sweep 2026-10-01_01-53-14 the read landed
+        # after the chain lines and before the verdict, so 1.10 and 1.11 passed
+        # and 1.12 to 1.14 failed on a half written file. Judge it only once
+        # the writer has put down its own closing line.
+        $s = ''
+        $snapEnd = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $snapEnd) {
+            $s = Get-Content $snap -Raw -ErrorAction SilentlyContinue
+            if ("$s" -match '===== end of snapshot =====') { break }
+            Start-Sleep -Milliseconds 300
+        }
+        if ("$s" -notmatch '===== end of snapshot =====') {
+            Write-Fail "1.10: the watchdog did not finish its snapshot within 60 s ($("$s".Length) bytes so far); the checks below see a partial file"
+        }
         if ($s -match 'runner pid=')                   { Write-Pass "1.10: the vanish was recorded with the window the death falls in" }
         else                                           { Write-Fail "1.10: the snapshot names no runner" }
         if ($s -match '(?m)^\[.*\] chain pid=')        { Write-Pass "1.11: the snapshot says which ancestors went and which survived" }
