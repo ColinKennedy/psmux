@@ -32,6 +32,8 @@ const FILL: usize = 200;
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
 
+impl crate::pane::PaneInputSink for Captured {}
+
 impl std::io::Write for Captured {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(buf);
@@ -40,7 +42,7 @@ impl std::io::Write for Captured {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-fn make_pane(writer: Box<dyn std::io::Write + Send>) -> crate::types::Pane {
+fn make_pane(writer: Box<dyn crate::pane::PaneInputSink>) -> crate::types::Pane {
     let (master, _sink) = crate::util::stub_pane_pty(portable_pty::PtySize {
         rows: ROWS,
         cols: COLS,

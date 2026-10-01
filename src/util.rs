@@ -59,7 +59,7 @@ impl portable_pty::MasterPty for StubMasterPty {
 #[cfg(test)]
 pub(crate) fn stub_pane_pty(
     size: portable_pty::PtySize,
-) -> (Box<dyn portable_pty::MasterPty>, Box<dyn io::Write + Send>) {
+) -> (Box<dyn portable_pty::MasterPty>, Box<dyn crate::pane::PaneInputSink>) {
     (Box::new(StubMasterPty { size: std::sync::Mutex::new(size) }), Box::new(io::sink()))
 }
 

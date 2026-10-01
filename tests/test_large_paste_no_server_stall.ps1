@@ -33,6 +33,16 @@
 #   5. kill-pane, respawn-pane -k and kill-server while a 1.3 MB paste is still
 #      queued for a child that never reads: the server stays up and answers
 #      (or, for kill-server, exits promptly).
+#   6. The same for the INJECT route (#684: below build 22523, forced here with
+#      PSMUX_PASTE_INJECT=1), where the paste goes out as console KEY_EVENT
+#      records.  That ran on the server thread holding the console lock for
+#      the whole paste: measured on 2358d49, 0.35 s of server freeze for
+#      132 KB, a 3 s CLI timeout for 1.3 MB.  Checked: the route really ran
+#      and the console took all of it (input_debug.log `route=inject ok=true`),
+#      the server answers, pane B keys are live, bytes exact, keys typed before
+#      and after keep their order, a second injected paste and a split go
+#      through while a 1.3 MB injection runs, and kill-pane, respawn-pane -k
+#      (the new child receives nothing) and kill-server mid injection.
 #
 # Numbers go to $env:USERPROFILE\.psmux-test-data\metrics\large_paste_stall-*.json
 #
@@ -50,6 +60,9 @@ function Write-Info($m) { Write-Host "  [INFO] $m" -ForegroundColor DarkGray }
 foreach ($v in 'PSMUX_SESSION_NAME','PSMUX_SESSION','PSMUX_PANE','TMUX','TMUX_PANE') { Remove-Item "Env:\$v" -EA SilentlyContinue }
 $savedDataDir = $env:PSMUX_DATA_DIR
 $savedNoWarm  = $env:PSMUX_NO_WARM
+$savedInject  = $env:PSMUX_PASTE_INJECT
+$savedInDebug = $env:PSMUX_INPUT_DEBUG
+Remove-Item Env:\PSMUX_PASTE_INJECT -EA SilentlyContinue
 $root = Join-Path $env:TEMP "psmux_lpstall_$PID"
 Remove-Item -Recurse -Force $root -EA SilentlyContinue
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -269,6 +282,146 @@ try {
         Stop-ProbeSession $s
     }
 
+    # ---------------------------------------------------------------------
+    # The inject route (#684): below build 22523, or with PSMUX_PASTE_INJECT=1,
+    # a bracketed paste into a VT byte reader goes out as console KEY_EVENT
+    # records.  That ran on the server thread with the console lock held for
+    # the whole paste (0.35 s of server freeze for 132 KB, a 3 s CLI timeout
+    # for 1.3 MB).  The server reads PSMUX_PASTE_INJECT, so these sessions are
+    # started with it set; PSMUX_INPUT_DEBUG proves the route really ran.
+    # ---------------------------------------------------------------------
+    $env:PSMUX_PASTE_INJECT = "1"; $env:PSMUX_INPUT_DEBUG = "1"
+    $dbg = Join-Path $env:PSMUX_DATA_DIR "input_debug.log"
+    function Get-InjectLines([long]$From) {
+        if (-not (Test-Path $dbg)) { return @() }
+        $fs = [IO.File]::Open($dbg, 'Open', 'Read', 'ReadWrite'); [void]$fs.Seek($From, 'Begin')
+        $t = [IO.StreamReader]::new($fs).ReadToEnd(); $fs.Close()
+        return @(([regex]::Matches($t, 'route=inject pid=\d+ text_len=(\d+) ok=(\w+)')) | ForEach-Object { [pscustomobject]@{ len = [int64]$_.Groups[1].Value; ok = $_.Groups[2].Value } })
+    }
+    function Get-DbgLen { if (Test-Path $dbg) { (Get-Item $dbg).Length } else { 0 } }
+    try {
+        foreach ($case in @(
+            @{ name = 'paste-buffer -p'; key = 'inject_paste_buffer_p'; sess = 'ipb' },
+            @{ name = 'client send-paste over TCP (Ctrl+V path)'; key = 'inject_client_send_paste'; sess = 'icv' }
+        )) {
+            Write-Host "`n=== INJECT route: 1.3 MB $($case.name) into a reading pane, while pane B is typed into ===" -ForegroundColor Yellow
+            $s = New-ProbeSession $case.sess
+            $from = Get-DbgLen
+            if ($case.key -eq 'inject_paste_buffer_p') {
+                $paste = { & $PSMUX -L $NS paste-buffer -p -b big -t $s.PaneA 2>&1 | Out-Null }
+            } else {
+                & $PSMUX -L $NS select-pane -t $s.PaneA 2>&1 | Out-Null
+                $paste = { [void](Send-PasteTcp $s.Sess $bufFile) }
+            }
+            $r = Measure-Paste $s $paste $expect.Length "inject $($case.name)"
+            $inj = @(Get-InjectLines $from)
+            $r['inject_log'] = (@($inj | ForEach-Object { "len=$($_.len) ok=$($_.ok)" }) -join '; ')
+            $results[$case.key] = $r
+            Write-Info ("paste call {0} ms, complete {1} ms; display-message during: p50 {2} max {3} ms (idle p50 {4}); key into B: max {5} ms; server private MB max {6}; log: {7}" -f $r.paste_call_ms, $r.paste_complete_ms, $r.rtt_during.p50, $r.rtt_during.max, $r.rtt_idle.p50, $r.key_latency_ms.max, $r.server_private_mb.max, $r.inject_log)
+            if ($inj.Count -eq 1 -and $inj[0].len -eq $text.Length -and $inj[0].ok -eq 'true') { Write-Pass "the paste went through the inject route and the console took all of it (route=inject ok=true)" }
+            else { Write-Fail "inject route not proven: log lines '$($r.inject_log)'" }
+            if ($r.cli_errors -eq 0) { Write-Pass "no CLI call failed during the injected paste" } else { Write-Fail "$($r.cli_errors) CLI calls failed during the injected paste: $($r.cli_error_sample)" }
+            if ($null -ne $r.rtt_during.max -and $r.rtt_during.max -lt $MaxRttMs) { Write-Pass "longest display-message round trip during the injected paste $($r.rtt_during.max) ms < $MaxRttMs ms" }
+            else { Write-Fail "longest display-message round trip during the injected paste $($r.rtt_during.max) ms (threshold $MaxRttMs ms)" }
+            if ($r.keys_got_in_b -eq $r.keys_sent -and $r.key_latency_ms.max -lt $MaxRttMs) { Write-Pass "all $($r.keys_sent) keys typed into pane B arrived there, slowest $($r.key_latency_ms.max) ms" }
+            else { Write-Fail "keys into pane B: $($r.keys_got_in_b) of $($r.keys_sent) arrived, slowest $($r.key_latency_ms.max) ms" }
+            if ($r.bytes_got -eq $r.bytes_expected -and $r.fnv_ok) { Write-Pass "the injected paste arrived complete and byte exact ($($r.bytes_got) bytes, FNV match)" }
+            else { Write-Fail "the injected paste arrived as $($r.bytes_got) of $($r.bytes_expected) bytes, FNV match $($r.fnv_ok)" }
+            Stop-ProbeSession $s
+        }
+
+        Write-Host "`n=== INJECT route: keys before and after an injected paste keep their order ===" -ForegroundColor Yellow
+        $s = New-ProbeSession 'iord'
+        $from = Get-DbgLen
+        & $PSMUX -L $NS send-keys -t $s.PaneA -l 'BEFORE-684' 2>&1 | Out-Null
+        & $PSMUX -L $NS paste-buffer -p -b big -t $s.PaneA 2>&1 | Out-Null
+        & $PSMUX -L $NS send-keys -t $s.PaneA -l 'AFTER-684' 2>&1 | Out-Null
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt 30000 -and [int64](Read-Probe $s.A)['TOTAL'] -lt $expect.Length + 19) { Start-Sleep -Milliseconds 200 }
+        New-Item -ItemType File -Force $s.Stop | Out-Null; Start-Sleep -Milliseconds 800
+        $bin = [IO.File]::ReadAllBytes("$($s.A).bin")
+        $want = [Text.Encoding]::ASCII.GetBytes('BEFORE-684') + $expect + [Text.Encoding]::ASCII.GetBytes('AFTER-684')
+        $inj = @(Get-InjectLines $from)
+        if ($inj.Count -eq 1 -and $inj[0].ok -eq 'true' -and $bin.Length -eq $want.Length -and [LpFnv]::Hash($bin) -eq [LpFnv]::Hash($want)) { Write-Pass "pane A read BEFORE-684, ESC[200~ + 1.3 MB injected + ESC[201~, then AFTER-684, nothing interleaved" }
+        else { Write-Fail "pane A read $($bin.Length) bytes (wanted $($want.Length)) inject log ok=$(@($inj | ForEach-Object { $_.ok }) -join ',')" }
+        & $PSMUX -L $NS kill-session -t $s.Sess 2>&1 | Out-Null
+
+        Write-Host "`n=== INJECT route: another injected paste and a split while a 1.3 MB injection runs ===" -ForegroundColor Yellow
+        # Both take the process wide console lock (the route probe and the
+        # second injection attach to pane B's console, the split spawns a
+        # ConPTY), so they prove the running injection does not hold it.
+        $s = New-ProbeSession 'icon' -BpB 'on'
+        $small = Join-Path $root "small.txt"
+        [IO.File]::WriteAllBytes($small, [Text.Encoding]::ASCII.GetBytes($text.Substring(0, 16384)))
+        & $PSMUX -L $NS load-buffer -b small $small 2>&1 | Out-Null
+        $smallExpect = [Text.Encoding]::ASCII.GetBytes("`e[200~" + $text.Substring(0, 16384).Replace("`n", "`r") + "`e[201~")
+        $from = Get-DbgLen
+        $sw.Restart()
+        & $PSMUX -L $NS paste-buffer -p -b big -t $s.PaneA 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 300
+        $t1 = [Diagnostics.Stopwatch]::StartNew()
+        & $PSMUX -L $NS paste-buffer -p -b small -t $s.PaneB 2>&1 | Out-Null
+        $smallCall = $t1.ElapsedMilliseconds
+        $t1.Restart()
+        & $PSMUX -L $NS split-window -d -t $s.PaneB 2>&1 | Out-Null
+        $splitCall = $t1.ElapsedMilliseconds
+        $t1.Restart()
+        while ($t1.ElapsedMilliseconds -lt 10000 -and [int64](Read-Probe $s.B)['TOTAL'] -lt $smallExpect.Length) { Start-Sleep -Milliseconds 20 }
+        $smallDone = $t1.ElapsedMilliseconds
+        $aAtSmall = [int64](Read-Probe $s.A)['TOTAL']
+        while ($sw.ElapsedMilliseconds -lt 30000 -and [int64](Read-Probe $s.A)['TOTAL'] -lt $expect.Length) { Start-Sleep -Milliseconds 100 }
+        $ra = Read-Probe $s.A; $rb = Read-Probe $s.B
+        $inj = @(Get-InjectLines $from)
+        $results['inject_concurrent'] = [ordered]@{ small_paste_call_ms = $smallCall; split_call_ms = $splitCall; small_arrived_after_ms = $smallDone; big_bytes_when_small_arrived = $aAtSmall; inject_log = (@($inj | ForEach-Object { "len=$($_.len) ok=$($_.ok)" }) -join '; ') }
+        Write-Info ("16 KB paste into B: call {0} ms, arrived {1} ms later while A had {2} of {3} bytes; split-window {4} ms; log {5}" -f $smallCall, $smallDone, $aAtSmall, $expect.Length, $splitCall, $results['inject_concurrent'].inject_log)
+        if ($smallCall -lt $MaxRttMs -and $splitCall -lt 3000 -and $smallDone -lt 2000 -and $aAtSmall -lt $expect.Length) { Write-Pass "a second injected paste and a split went through while the 1.3 MB injection was still running" }
+        else { Write-Fail "a second injected paste or a split waited for the running injection (small call $smallCall ms, arrived $smallDone ms, split $splitCall ms, A at $aAtSmall bytes)" }
+        if ($ra['FNV'] -eq $expectFnv -and $rb['FNV'] -eq [LpFnv]::Hash($smallExpect) -and @($inj | Where-Object { $_.ok -eq 'true' }).Count -eq 2) { Write-Pass "both injected pastes arrived byte exact through the console ($($ra['TOTAL']) and $($rb['TOTAL']) bytes)" }
+        else { Write-Fail "pane A $($ra['TOTAL']) bytes FNV ok $($ra['FNV'] -eq $expectFnv), pane B $($rb['TOTAL']) bytes, inject log $($results['inject_concurrent'].inject_log)" }
+        Stop-ProbeSession $s
+
+        Write-Host "`n=== INJECT route: a pane killed or respawned while a 1.3 MB injection runs ===" -ForegroundColor Yellow
+        foreach ($act in @('kill-pane', 'respawn-pane')) {
+            $s = New-ProbeSession "idie$($act.Length)" -ModeB 'noread' -BpB 'on'
+            $respawned = Join-Path $root "irespawned$($act.Length).log"
+            & $PSMUX -L $NS paste-buffer -p -b big -t $s.PaneB 2>&1 | Out-Null
+            & $PSMUX -L $NS paste-buffer -p -b big -t $s.PaneB 2>&1 | Out-Null
+            Start-Sleep -Milliseconds 300
+            if ($act -eq 'kill-pane') { & $PSMUX -L $NS kill-pane -t $s.PaneB 2>&1 | Out-Null }
+            else { & $PSMUX -L $NS respawn-pane -k -t $s.PaneB -- $probe $respawned on $s.Stop read 2>&1 | Out-Null }
+            $sw.Restart(); $okAll = $true
+            for ($i = 0; $i -lt 10; $i++) { if (((& $PSMUX -L $NS display-message -t $s.PaneA -p x 2>&1) -join '').Trim() -ne 'x') { $okAll = $false } }
+            $panes = ((& $PSMUX -L $NS list-panes -t $s.Sess -F '#{pane_index}' 2>&1) -join ',')
+            $want = if ($act -eq 'kill-pane') { '0' } else { '0,1' }
+            $extra = ''
+            $answerMs = $sw.ElapsedMilliseconds
+            if ($act -eq 'respawn-pane') {
+                [void](Wait-Ready "$($s.Sess):0.1"); Start-Sleep -Milliseconds 1500
+                $got = [int64](Read-Probe $respawned)['TOTAL']
+                if ($got -ne 0) { $okAll = $false; $extra = " the new child read $got bytes meant for the old one" }
+            }
+            if ($okAll -and $panes -eq $want) { Write-Pass "$act during an injection: server answered 10 of 10 queries in $answerMs ms, panes $panes$extra" }
+            else { Write-Fail "$act during an injection: answered all=$okAll, panes '$panes' (want '$want')$extra" }
+            Stop-ProbeSession $s
+        }
+
+        Write-Host "`n=== INJECT route: kill-server while a 1.3 MB injection runs ===" -ForegroundColor Yellow
+        $s = New-ProbeSession 'iks' -ModeB 'noread' -BpB 'on'
+        $spid = Get-PerfServerPid -Ns $NS -Session $s.Sess
+        & $PSMUX -L $NS paste-buffer -p -b big -t $s.PaneB 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 300
+        New-Item -ItemType File -Force $s.Stop | Out-Null
+        $sw.Restart()
+        & $PSMUX -L $NS kill-server 2>&1 | Out-Null
+        $gone = $false
+        while ($sw.ElapsedMilliseconds -lt 10000) { if (-not $spid -or -not (Get-Process -Id $spid -EA SilentlyContinue)) { $gone = $true; break }; Start-Sleep -Milliseconds 100 }
+        if ($gone) { Write-Pass "the server exited $($sw.ElapsedMilliseconds) ms after kill-server during an injection" }
+        else { Write-Fail "the server (pid $spid) was still running 10 s after kill-server during an injection" }
+    } finally {
+        Remove-Item Env:\PSMUX_PASTE_INJECT -EA SilentlyContinue
+        Remove-Item Env:\PSMUX_INPUT_DEBUG -EA SilentlyContinue
+    }
+
     Write-Host "`n=== kill-server while a 1.3 MB paste is queued ===" -ForegroundColor Yellow
     $s = New-ProbeSession 'ks' -ModeB 'noread' -BpB 'on'
     $spid = Get-PerfServerPid -Ns $NS -Session $s.Sess
@@ -290,6 +443,8 @@ try {
     if ($mp) { Write-Info "metrics: $mp" }
     $env:PSMUX_DATA_DIR = $savedDataDir
     $env:PSMUX_NO_WARM = $savedNoWarm
+    $env:PSMUX_PASTE_INJECT = $savedInject
+    $env:PSMUX_INPUT_DEBUG = $savedInDebug
     Start-Sleep -Milliseconds 500
     Remove-Item -Recurse -Force $root -EA SilentlyContinue
 }

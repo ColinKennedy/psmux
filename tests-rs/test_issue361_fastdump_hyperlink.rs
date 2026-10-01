@@ -29,6 +29,8 @@ struct DummyWriter;
 
 struct DummyMaster;
 
+impl crate::pane::PaneInputSink for DummyWriter {}
+
 impl std::io::Write for DummyWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }

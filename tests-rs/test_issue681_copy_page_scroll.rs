@@ -56,7 +56,7 @@ fn open_pane_pty(
 ) -> (
     Box<dyn portable_pty::MasterPty>,
     Box<dyn portable_pty::Child + Send + Sync>,
-    Box<dyn std::io::Write + Send>,
+    Box<dyn crate::pane::PaneInputSink>,
 ) {
     let (master, writer) = crate::util::stub_pane_pty(portable_pty::PtySize {
         rows,
