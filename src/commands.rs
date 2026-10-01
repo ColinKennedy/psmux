@@ -2046,6 +2046,15 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let selected = tree.iter().position(|e| e.is_current_session && e.is_active_window && !e.is_session_header).unwrap_or(0);
             app.mode = Mode::WindowChooser { selected, tree };
         }
+        "command-prompt" if app.mode.in_copy() => {
+            // A copy mode key table binding (tmux's own `:`, `/`, `f`, ... are
+            // written this way). The prompt belongs to the pane's copy mode:
+            // replacing `app.mode` with `Mode::CommandPrompt` below threw copy
+            // mode away and opened a prompt no client draws.
+            let trimmed = cmd.trim_start();
+            let args = trimmed.strip_prefix(parts[0]).unwrap_or("");
+            crate::copy_prompt::open(app, args);
+        }
         "command-prompt" => {
             // Support -I initial_text, -p prompt (ignored), -1 (ignored)
             let initial = parts.windows(2).find(|w| w[0] == "-I").map(|w| w[1].to_string()).unwrap_or_default();

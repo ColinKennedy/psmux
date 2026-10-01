@@ -83,49 +83,122 @@ pub fn run_copy_mode_binding(app: &mut AppState, action: &crate::types::Action) 
     use crate::types::Action;
     if let Action::Command(cmd) = action {
         let parts = crate::commands::parse_command_line(cmd);
-        if matches!(parts.first().map(|s| s.as_str()), Some("send-keys") | Some("send"))
-            && parts.iter().any(|p| p == "-X")
-        {
-            // Mirror the TCP dispatcher's `has_x` arm exactly: tokens with
-            // their quote grouping already stripped, flags dropped, joined
-            // with spaces. The `SendKeysX` arm hands everything after the
-            // copy-mode command name to `pwsh -Command` verbatim, so a quote
-            // character that survives to this point turns the pipe command
-            // into a string literal pwsh evaluates and discards.
-            let mut rest: Vec<&str> = Vec::new();
-            let mut skip_operand = false;
-            let mut count: usize = 1;
-            let mut iter = parts.iter().skip(1);
-            while let Some(p) = iter.next() {
-                if skip_operand { skip_operand = false; continue; }
-                match p.as_str() {
-                    "-t" => { skip_operand = true; }
-                    // `send-keys -X -N 5 scroll-up` (tmux's own WheelUpPane
-                    // binding) repeats the command, as it does from the CLI.
-                    "-N" => {
-                        count = iter.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1);
-                    }
-                    s if s.starts_with('-') => {}
-                    s => rest.push(s),
-                }
+        if let Some((name, count)) = send_keys_x_request(&parts) {
+            let count = count.unwrap_or(1);
+            if let Some(tx) = app.control_tx.as_ref() {
+                let req = if count > 1 {
+                    crate::types::CtrlReq::SendKeysXRun { cmd: name, count, resp: None }
+                } else {
+                    crate::types::CtrlReq::SendKeysX(name)
+                };
+                let _ = tx.send(req);
+                return true;
             }
-            if !rest.is_empty() {
-                if let Some(tx) = app.control_tx.as_ref() {
-                    let req = if count > 1 {
-                        crate::types::CtrlReq::SendKeysXRun { cmd: rest.join(" "), count, resp: None }
-                    } else {
-                        crate::types::CtrlReq::SendKeysX(rest.join(" "))
-                    };
-                    let _ = tx.send(req);
-                    return true;
-                }
-            }
-            // No sender (or nothing after -X): fall through to the built-ins
-            // rather than silently swallowing the key.
+            // No sender: fall through to the built-ins rather than silently
+            // swallowing the key.
+            return false;
+        }
+        if is_send_keys_x(&parts) {
+            // Nothing after -X: fall through to the built-ins.
             return false;
         }
     }
     crate::commands::execute_action(app, action).is_ok()
+}
+
+fn is_send_keys_x(parts: &[String]) -> bool {
+    matches!(parts.first().map(|s| s.as_str()), Some("send-keys") | Some("send"))
+        && parts.iter().any(|p| p == "-X")
+}
+
+/// The copy mode command and repeat count of a `send-keys -X` command line, or
+/// `None` when the line is not one (or names no command).
+///
+/// Mirrors the TCP dispatcher's `has_x` arm: tokens with their quote grouping
+/// already stripped, flags dropped, joined with spaces. The `SendKeysX` arm
+/// hands everything after the copy-mode command name to `pwsh -Command`
+/// verbatim, so a quote character that survives to this point turns the pipe
+/// command into a string literal pwsh evaluates and discards.
+///
+/// Flags end at `--` or at the command name, as in tmux's `args_parse_flags`
+/// (arguments.c:207), so an argument of the command that begins with `-` (a
+/// search for `-x`, typed into a prompt) is kept.
+fn send_keys_x_request(parts: &[String]) -> Option<(String, Option<usize>)> {
+    if !is_send_keys_x(parts) {
+        return None;
+    }
+    let mut rest: Vec<&str> = Vec::new();
+    let mut count: Option<usize> = None;
+    // The copy mode command's own arguments are parsed again with that
+    // command's template (window-copy.c:3838), so `--` after the command name
+    // ends ITS flags: `send -X goto-line -- '%%'` is tmux's own binding.
+    let mut args_done = false;
+    let mut iter = parts.iter().skip(1);
+    while let Some(p) = iter.next() {
+        if args_done {
+            rest.push(p);
+            continue;
+        }
+        match p.as_str() {
+            "--" => { if !rest.is_empty() { args_done = true; } }
+            "-t" if rest.is_empty() => { iter.next(); }
+            // `send-keys -X -N 5 scroll-up` (tmux's own WheelUpPane
+            // binding) repeats the command, as it does from the CLI.
+            "-N" if rest.is_empty() => {
+                count = Some(iter.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).max(1));
+            }
+            s if s.starts_with('-') => {}
+            s => rest.push(s),
+        }
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some((rest.join(" "), count))
+}
+
+/// Run the command a copy mode `command-prompt` built, against the pane that is
+/// still in copy mode (cmd-command-prompt.c:238 runs it with the prompt's own
+/// target state).
+///
+/// `send-keys -X` runs the copy mode command directly: this is called from the
+/// server loop while it handles the key that accepted the prompt, so there is
+/// no request to queue behind. `send-keys -N <n>` with no key sets the repeat
+/// count of the next copy mode command, which is what cmd-send-keys.c:191 to
+/// :196 does with `wme->prefix` and how tmux's own digit keys are written.
+/// Anything else goes through the ordinary command executor.
+pub fn run_copy_mode_command_line(app: &mut AppState, cmd: &str) {
+    let parts = crate::commands::parse_command_line(cmd);
+    if let Some((name, count)) = send_keys_x_request(&parts) {
+        // A count typed before the key that opened the prompt is spent by
+        // the command the prompt runs, as tmux spends `wme->prefix` on the
+        // next copy mode command (window-copy.c window_copy_command).
+        let count = count.or_else(|| app.copy_count.take()).unwrap_or(1);
+        let _ = crate::server::run_send_keys_x(app, &name, count);
+        return;
+    }
+    if matches!(parts.first().map(|s| s.as_str()), Some("send-keys") | Some("send")) {
+        let mut count: Option<usize> = None;
+        let mut keys = 0;
+        let mut it = parts.iter().skip(1);
+        while let Some(p) = it.next() {
+            match p.as_str() {
+                "-N" => { count = it.next().and_then(|n| n.parse::<usize>().ok()); }
+                "-t" => { it.next(); }
+                s if s.starts_with('-') && s.len() > 1 => {}
+                _ => keys += 1,
+            }
+        }
+        if keys == 0 {
+            if let Some(n) = count.filter(|n| *n >= 1) {
+                if app.mode.in_copy() {
+                    app.copy_count = Some(n);
+                }
+                return;
+            }
+        }
+    }
+    let _ = crate::commands::execute_command_string(app, cmd);
 }
 
 /// **This function has no production callers.** Unit tests still invoke it
@@ -1124,6 +1197,23 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     refresh_search_prompt(app);
                 }
                 _ => {}
+            }
+            Ok(false)
+        }
+        Mode::CopyCommandPrompt(_) => {
+            use crate::copy_prompt::{feed, Fed, PromptKey};
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let named;
+            let pk = match key.code {
+                KeyCode::Enter => PromptKey::Enter,
+                KeyCode::Esc => PromptKey::Escape,
+                KeyCode::Backspace => PromptKey::Backspace,
+                KeyCode::Char(c) if ctrl => { named = format!("C-{}", c.to_ascii_lowercase()); PromptKey::Named(&named) }
+                KeyCode::Char(c) => PromptKey::Char(c),
+                _ => PromptKey::Named(""),
+            };
+            if feed(app, pk) == Fed::Reprocess {
+                return handle_key(app, key);
             }
             Ok(false)
         }
@@ -3253,6 +3343,30 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         refresh_goto_prompt(app);
         return Ok(());
     }
+    // A prompt opened by a copy mode binding takes the characters one at a
+    // time: a `-1` prompt is answered by the first, and whatever follows is a
+    // copy mode key again, as it would be if it had arrived separately.
+    if matches!(app.mode, Mode::CopyCommandPrompt(_)) {
+        use crate::copy_prompt::{feed, Fed, PromptKey};
+        for (i, c) in text.char_indices() {
+            let pk = match c {
+                '\r' | '\n' => PromptKey::Enter,
+                '\x1b' => PromptKey::Escape,
+                '\x08' | '\x7f' => PromptKey::Backspace,
+                c => PromptKey::Char(c),
+            };
+            let fed = feed(app, pk);
+            if fed == Fed::Reprocess || !matches!(app.mode, Mode::CopyCommandPrompt(_)) {
+                let from = if fed == Fed::Reprocess { i } else { i + c.len_utf8() };
+                let rest = &text[from..];
+                if !rest.is_empty() && app.mode.in_copy() {
+                    return send_text_to_active(app, rest);
+                }
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
 
     // A focused floating pane (tmux new-pane) receives input instead of the
     // tiled active pane, while the layout keeps rendering underneath.
@@ -3569,6 +3683,22 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 refresh_search_prompt(app);
             }
             _ => {}
+        }
+        return Ok(());
+    }
+
+    // --- A prompt opened by a copy mode binding ---
+    if matches!(app.mode, Mode::CopyCommandPrompt(_)) {
+        use crate::copy_prompt::{feed, Fed, PromptKey};
+        let pk = match k {
+            "enter" => PromptKey::Enter,
+            "esc" | "escape" => PromptKey::Escape,
+            "backspace" | "bspace" => PromptKey::Backspace,
+            "space" => PromptKey::Char(' '),
+            other => PromptKey::Named(other),
+        };
+        if feed(app, pk) == Fed::Reprocess && app.mode.in_copy() {
+            return send_key_to_active(app, k);
         }
         return Ok(());
     }

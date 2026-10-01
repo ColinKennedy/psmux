@@ -22,7 +22,13 @@ fn chain_with_non_ascii_segment_does_not_panic() {
 
 #[test]
 fn substitute_with_non_ascii_wrapper_is_ignored() {
-    assert!(parse_single_modifier("s\u{a7}a\u{a7}b\u{a7}").is_none());
+    // A non ASCII byte is not a wrapper, so tmux reads one bare argument and
+    // then skips `s` for having fewer than two (format.c:4855, :5857). The
+    // modifier is ignored while the rest of the list still applies, which is
+    // what Modifier::Ignored is; `None` would have dropped the whole list
+    // and rendered `#{s\u{a7}s\u{a7}X\u{a7}:session_name}` empty, where tmux 3.4 prints the
+    // session name.
+    assert!(matches!(parse_single_modifier("s\u{a7}a\u{a7}b\u{a7}"), Some(Modifier::Ignored)));
     assert!(parse_single_modifier("e\u{a7}+\u{a7}").is_none());
 }
 
@@ -48,7 +54,8 @@ fn ascii_wrappers_still_work() {
 
 #[test]
 fn bare_letters_after_the_fix() {
-    assert!(parse_single_modifier("s").is_none());
+    // `s` with no arguments is parsed and skipped by tmux (format.c:5857).
+    assert!(matches!(parse_single_modifier("s"), Some(Modifier::Ignored)));
     assert!(parse_single_modifier("e").is_none());
     assert!(parse_single_modifier("").is_none());
 }
