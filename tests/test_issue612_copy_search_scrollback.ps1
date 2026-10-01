@@ -52,6 +52,16 @@ function Write-Pass($m) { Write-Host "[PASS] $m" -ForegroundColor Green; $script
 function Write-Fail($m) { Write-Host "[FAIL] $m" -ForegroundColor Red; $script:fail++ }
 function Write-Skip($m) { Write-Host "[SKIP] $m" -ForegroundColor Yellow; $script:skip++ }
 
+# Layer 2 keystrokes go through Invoke-GuardedInjector. In sweep
+# 2026-10-01_01-53-14 Defender quarantined psmux_injector_612.exe between the
+# '?' search and the 'n' repeat; the raw `& $injector` call failed silently and
+# the suite reported "a real 'n' expected LINE_128, got [LINE_129]" for a key
+# that was never sent. A blocked injector now ends the layer with the evidence.
+. "$PSScriptRoot\injector_guard.ps1"
+function Send-TuiKeys([string]$Keys) {
+    if (-not (Invoke-GuardedInjector $injector $clientPid $Keys -RequireDelivery)) { throw "INJECTOR_BLOCKED" }
+}
+
 # One display-message round trip that returns every copy mode variable at once.
 function Get-CopyState([string]$Target) {
     $fmt = 'cx=#{copy_cursor_x}|cy=#{copy_cursor_y}|line=#{copy_cursor_line}|scroll=#{scroll_position}|match=#{search_match}|present=#{search_present}|hist=#{history_size}|inmode=#{pane_in_mode}'
@@ -87,7 +97,16 @@ function Get-TopVisible([string]$Target) {
 
 function Fill-Pane([string]$Target) {
     & $PSMUX send-keys -t $Target 'for ($i=1;$i -le 400;$i++){"LINE_$i"}' Enter 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    # Wait for the LAST line instead of a fixed 4 s: on a cold first pane (fresh
+    # data dir, freshly built binary still being scanned) the shell was not done
+    # printing after 4 s and every search below ran on a half filled pane.
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 300
+        $cap = (& $PSMUX capture-pane -t $Target -p 2>&1 | Out-String)
+    } while ($cap -notmatch '(?m)^LINE_400\s*$' -and (Get-Date) -lt $deadline)
+    if ($cap -notmatch '(?m)^LINE_400\s*$') { Write-Host "      [WARN] $Target never showed LINE_400 within 30 s" -ForegroundColor Yellow }
+    Start-Sleep -Milliseconds 500
 }
 
 # Drive the interactive prompt exactly as a user does: opener key, then the
@@ -321,52 +340,58 @@ $dataLine
         $TT = "${ST}:0"
         Fill-Pane $TT
 
-        # prefix (C-b) then '[' enters copy mode, exactly as a user does it.
-        & $injector $clientPid "^b" | Out-Null
-        Start-Sleep -Milliseconds 400
-        & $injector $clientPid "[" | Out-Null
-        Start-Sleep -Milliseconds 900
+        try {
+            # prefix (C-b) then '[' enters copy mode, exactly as a user does it.
+            Send-TuiKeys "^b"
+            Start-Sleep -Milliseconds 400
+            Send-TuiKeys "["
+            Start-Sleep -Milliseconds 900
 
-        $t0 = Get-CopyState $TT
-        if ($t0.inmode -ne "1") {
-            Write-Skip "injected prefix+[ never reached the client, no keys were delivered"
-        } else {
-            Write-Pass "injected prefix+[ entered copy mode through the real TUI input path"
-
-            # Real keystrokes: '?' then the term then Enter. LINE_12 is chosen
-            # because it also matches LINE_120 .. LINE_129, so the 'n' repeat
-            # below has somewhere to go.
-            & $injector $clientPid "?{SLEEP:300}LINE_12{SLEEP:300}{ENTER}" | Out-Null
-            Start-Sleep -Milliseconds 1200
-            $t1 = Get-CopyState $TT
-            if ($t1.line -eq "LINE_129" -and [int]$t1.scroll -gt 0) {
-                Write-Pass "TUI: a real '?' LINE_12 Enter reached history and stopped at the nearest match LINE_129 (cy=$($t1.cy) scroll=$($t1.scroll))"
+            $t0 = Get-CopyState $TT
+            if ($t0.inmode -ne "1") {
+                Write-Skip "injected prefix+[ never reached the client, no keys were delivered"
             } else {
-                Write-Fail "TUI: the real '?' search expected LINE_129 with a nonzero scroll, got [$($t1.line)] / scroll $($t1.scroll)"
-            }
-            $tuiTop = Get-TopVisible $TT
-            $tuiRows = [int]((& $PSMUX display-message -t $TT -p '#{pane_height}' 2>&1 | Out-String).Trim())
-            if ($tuiTop -match '^LINE_(\d+)$' -and $t1.line -match '^LINE_(\d+)$') {
-                $topN = [int]($tuiTop -replace 'LINE_', '')
-                $hitN = [int]($t1.line -replace 'LINE_', '')
-                if ($topN -le $hitN -and ($hitN - $topN) -lt $tuiRows) {
-                    Write-Pass "TUI: capture-pane frames the match, top=[$tuiTop] match=[$($t1.line)] rows=$tuiRows"
+                Write-Pass "injected prefix+[ entered copy mode through the real TUI input path"
+
+                # Real keystrokes: '?' then the term then Enter. LINE_12 is chosen
+                # because it also matches LINE_120 .. LINE_129, so the 'n' repeat
+                # below has somewhere to go.
+                Send-TuiKeys "?{SLEEP:300}LINE_12{SLEEP:300}{ENTER}"
+                Start-Sleep -Milliseconds 1200
+                $t1 = Get-CopyState $TT
+                if ($t1.line -eq "LINE_129" -and [int]$t1.scroll -gt 0) {
+                    Write-Pass "TUI: a real '?' LINE_12 Enter reached history and stopped at the nearest match LINE_129 (cy=$($t1.cy) scroll=$($t1.scroll))"
                 } else {
-                    Write-Fail "TUI: capture-pane top [$tuiTop] does not frame the match [$($t1.line)] on $tuiRows rows"
+                    Write-Fail "TUI: the real '?' search expected LINE_129 with a nonzero scroll, got [$($t1.line)] / scroll $($t1.scroll)"
                 }
-            } else {
-                Write-Fail "TUI: expected a numbered top line and a numbered match, got top=[$tuiTop] match=[$($t1.line)]"
-            }
+                $tuiTop = Get-TopVisible $TT
+                $tuiRows = [int]((& $PSMUX display-message -t $TT -p '#{pane_height}' 2>&1 | Out-String).Trim())
+                if ($tuiTop -match '^LINE_(\d+)$' -and $t1.line -match '^LINE_(\d+)$') {
+                    $topN = [int]($tuiTop -replace 'LINE_', '')
+                    $hitN = [int]($t1.line -replace 'LINE_', '')
+                    if ($topN -le $hitN -and ($hitN - $topN) -lt $tuiRows) {
+                        Write-Pass "TUI: capture-pane frames the match, top=[$tuiTop] match=[$($t1.line)] rows=$tuiRows"
+                    } else {
+                        Write-Fail "TUI: capture-pane top [$tuiTop] does not frame the match [$($t1.line)] on $tuiRows rows"
+                    }
+                } else {
+                    Write-Fail "TUI: expected a numbered top line and a numbered match, got top=[$tuiTop] match=[$($t1.line)]"
+                }
 
-            # A real 'n' repeats the search in the same direction.
-            & $injector $clientPid "n" | Out-Null
-            Start-Sleep -Milliseconds 800
-            $t2 = Get-CopyState $TT
-            if ($t2.line -eq "LINE_128") {
-                Write-Pass "TUI: a real 'n' repeated the search upward, [$($t1.line)] -> [$($t2.line)]"
-            } else {
-                Write-Fail "TUI: a real 'n' expected LINE_128, got [$($t2.line)]"
+                # A real 'n' repeats the search in the same direction.
+                Send-TuiKeys "n"
+                Start-Sleep -Milliseconds 800
+                $t2 = Get-CopyState $TT
+                if ($t2.line -eq "LINE_128") {
+                    Write-Pass "TUI: a real 'n' repeated the search upward, [$($t1.line)] -> [$($t2.line)]"
+                } else {
+                    Write-Fail "TUI: a real 'n' expected LINE_128, got [$($t2.line)]"
+                }
             }
+        } catch {
+            # Only a blocked injector is a harness condition; anything else is a real error.
+            if (-not $script:InjectorBlocked) { throw }
+            Write-Skip "HARNESS, not a psmux result: $($script:InjectorBlocked). The remaining TUI checks were not evaluated"
         }
 
         & $PSMUX kill-session -t $ST 2>&1 | Out-Null
