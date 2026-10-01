@@ -1204,7 +1204,7 @@ pub struct ShellEntry {
 pub struct AppState {
     pub windows: Vec<Window>,
     pub active_idx: usize,
-    /// While a temporary -t focus is applied (FocusTargetTemp), holds the
+    /// While a -t target is applied (a CtrlReq::Targeted request), holds the
     /// REAL user-visible active window index saved before the switch.
     /// Format evaluation uses it for "is this the active window" variables
     /// (#{window_active}, the `*` flag) so `display-message -t <win>` does
@@ -2560,6 +2560,33 @@ pub enum WindowDumpFormat {
     PreviewState,
 }
 
+/// The window and/or pane a command's -t names, as `CtrlReq::ValidateTarget`
+/// and `CtrlReq::Targeted` carry it.  `win` is a window index or, when
+/// `win_is_id` is set, an @id; `win_name` is a window name target.  `pane` is
+/// a %id when `pane_is_id` is set, otherwise a positional pane index within
+/// the target window (the active window when there is no window part).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TempTarget {
+    pub win: Option<usize>,
+    pub win_is_id: bool,
+    pub win_name: Option<String>,
+    pub pane: Option<usize>,
+    pub pane_is_id: bool,
+}
+
+impl TempTarget {
+    /// True when the target names objects by their stable ids (@window and
+    /// %pane), the form `ValidateTarget` replies with: a later structural
+    /// change (a kill, a split, a swap) can make it vanish but can never make
+    /// it name a different pane, which an index can.
+    pub fn is_resolved(&self) -> bool {
+        self.win_name.is_none()
+            && (self.win.is_none() || self.win_is_id)
+            && (self.pane.is_none() || self.pane_is_id)
+            && (self.win.is_some() || self.pane.is_some())
+    }
+}
+
 pub enum CtrlReq {
     /// A pane parser thread published new screen state.
     ///
@@ -2644,26 +2671,31 @@ pub enum CtrlReq {
         pane_is_id: bool,
         fire_hook: bool,
     },
-    /// Temporary focus for generic -t targeting, with validation (issue #545).
-    /// The server resolves the window and/or pane FIRST and replies Err when
-    /// the target does not exist, so the connection thread can report
-    /// "can't find window/pane: X" and skip the follow-on command instead of
-    /// letting it run against whatever window happens to be active (the old
-    /// FocusWindow*Temp handlers silently no-opped on a miss, so kill-pane,
-    /// send-keys, rename-window, capture-pane etc. with a stale target
-    /// destroyed/typed-into/read the ACTIVE window at rc=0). On success the
-    /// focus is applied with the same temp-restore bookkeeping as before.
-    /// `win` carries an index or, when `win_is_id` is set, an @id; `win_name`
-    /// carries a window-name target. `pane` carries a %id when `pane_is_id`
-    /// is set, otherwise a positional pane index within the target window.
-    FocusTargetTemp {
-        win: Option<usize>,
-        win_is_id: bool,
-        win_name: Option<String>,
-        pane: Option<usize>,
-        pane_is_id: bool,
-        resp: mpsc::Sender<Result<(), String>>,
+    /// Resolve a generic -t target WITHOUT changing any focus (issue #545).
+    /// Replies Err("can't find window/pane: X") when it does not exist, so the
+    /// connection thread reports it and never runs the command, or Ok with
+    /// the same target rewritten to stable ids (`TempTarget::is_resolved`),
+    /// which the command's requests then carry in `CtrlReq::Targeted`.
+    ValidateTarget {
+        target: TempTarget,
+        resp: mpsc::Sender<Result<TempTarget, String>>,
     },
+    /// A request together with the -t target it acts on.  The server loop
+    /// resolves the target, focuses it, runs `inner` and restores the real
+    /// focus in ONE step, so no other request (another client's command, a
+    /// pane output wake) can run in between and nothing can redirect it.  If
+    /// the target is gone by then, `inner` is dropped, never run elsewhere.
+    ///
+    /// This replaced `FocusTargetTemp`, a separate request that switched the
+    /// focus and left it switched until "the next request that is not a temp
+    /// focus", whoever sent it: under concurrency or a server stall that was
+    /// routinely somebody else's request, and `send-keys -t s:0.1` typed
+    /// into the active pane, `kill-pane -t s:0.2` killed pane 0.0, and
+    /// `send-keys -N 3 -t s:0.1 x` sent one x to its target and two to the
+    /// active pane even with nothing else running.  tmux resolves a command's
+    /// target when the command fires (cmd-queue.c cmdq_fire_command, via
+    /// cmd_find_target) and carries it in the command's own state.
+    Targeted(TempTarget, Box<CtrlReq>),
     SessionInfo(mpsc::Sender<String>),
     /// `list-sessions -F <fmt>` — render the session row using a tmux format
     /// string. Drop-in compat with iTerm2 and other CC clients that always

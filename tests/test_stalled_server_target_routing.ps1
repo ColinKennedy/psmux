@@ -32,7 +32,9 @@
 # Long stalls (7 s) make every CLI give up; short stalls (1.5 s) do not.
 #
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_stalled_server_target_routing.ps1
-param([int]$Iterations = 10, [int[]]$StallMs = @(7000, 1500))
+# -StallMs is a comma separated list ("7000,1500,0"); pwsh -File hands an
+# array argument over as one string.
+param([int]$Iterations = 10, [string]$StallMs = '7000,1500,0')
 $ErrorActionPreference = "Continue"
 $PSMUX = if ($env:PSMUX_TEST_BIN) { $env:PSMUX_TEST_BIN } else { (Get-Command psmux -EA Stop).Source }
 $NS = if ($env:PSMUX_TEST_NS) { $env:PSMUX_TEST_NS } else { "amis_strt$PID" }
@@ -101,9 +103,9 @@ function Invoke-Concurrent([object[]]$Cmds) {
     return $res
 }
 
-$totals = [ordered]@{ wrong_pane_keys = 0; lost_keys = 0; dup_keys = 0; wrong_title = 0; wrong_kill = 0; focus_moved = 0; timed_out = 0; commands = 0 }
+$totals = [ordered]@{ wrong_pane_keys = 0; lost_keys = 0; dup_keys = 0; wrong_title = 0; wrong_kill = 0; wrong_display = 0; focus_moved = 0; timed_out = 0; commands = 0 }
 try {
-    $cases = @(foreach ($m in $StallMs) {
+    $cases = @(foreach ($m in @($StallMs -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })) {
         if ($m -ge 5000) { @{ name = "stall $m ms (longer than the CLI and the old 5 s focus wait)"; ms = $m; tag = 'L' } }
         elseif ($m -gt 0) { @{ name = "stall $m ms (no CLI call gives up)"; ms = $m; tag = 'S' } }
         else { @{ name = 'no stall, concurrent targeted commands only'; ms = 0; tag = 'Z' } }
@@ -129,7 +131,9 @@ try {
                 @('send-keys', '-t', $idB, '-l', "{P$i}"),
                 @('send-keys', '-t', "${S}:1", '-l', "{W$i}"),
                 @('select-pane', '-t', "${S}:0.1", '-T', "T$($case.tag)$i"),
-                @('kill-pane', '-t', "${S}:0.2")
+                @('kill-pane', '-t', "${S}:0.2"),
+                @('display-message', '-p', '-t', "${S}:1", '#{window_index}.#{pane_id}'),
+                @('send-keys', '-N', '3', '-t', "${S}:0.1", '-l', "{N$i}")
             )
             $res = Invoke-Concurrent $cmds
             $to = @($res | Where-Object { $_.out -match 'timed out|no response' }).Count
@@ -144,15 +148,17 @@ try {
             $after = ((& $PSMUX -L $NS display-message -p -t $S '#{window_index}.#{pane_index}') -join '')
 
             $problems = @()
-            $wrong = @($tA) + @($tD) + @($tC | Where-Object { $_ -ne "{W$i}" }) + @($tB | Where-Object { $_ -notin @("{B$i}", "{P$i}") })
+            $wrong = @($tA) + @($tD) + @($tC | Where-Object { $_ -ne "{W$i}" }) + @($tB | Where-Object { $_ -notin @("{B$i}", "{P$i}", "{N$i}") })
             if ($wrong.Count) { $problems += "keys in the wrong pane: A[$($tA -join ',')] D[$($tD -join ',')] C[$($tC -join ',')] B[$($tB -join ',')]"; $totals.wrong_pane_keys += $wrong.Count }
-            foreach ($want in @(@("{B$i}", $tB), @("{P$i}", $tB), @("{W$i}", $tC))) {
+            foreach ($want in @(@("{B$i}", $tB, 1), @("{P$i}", $tB, 1), @("{W$i}", $tC, 1), @("{N$i}", $tB, 3))) {
                 $n = @($want[1] | Where-Object { $_ -eq $want[0] }).Count
-                if ($n -eq 0) { $problems += "$($want[0]) never reached its pane"; $totals.lost_keys++ }
-                elseif ($n -gt 1) { $problems += "$($want[0]) arrived $n times"; $totals.dup_keys++ }
+                if ($n -lt $want[2]) { $problems += "$($want[0]) reached its pane $n of $($want[2]) times"; $totals.lost_keys += $want[2] - $n }
+                elseif ($n -gt $want[2]) { $problems += "$($want[0]) arrived $n times, wanted $($want[2])"; $totals.dup_keys++ }
             }
             if ($titleB -ne "T$($case.tag)$i" -or $titleA -eq "T$($case.tag)$i") { $problems += "select-pane -T landed wrong: A='$titleA' B='$titleB'"; $totals.wrong_title++ }
             if (($panes -join ',') -ne "$idA,$idB") { $problems += "kill-pane -t ${S}:0.2 left panes [$($panes -join ',')], wanted [$idA,$idB] (killed $idD)"; $totals.wrong_kill++ }
+            $dm = $res[5].out.Trim()
+            if ($dm -notmatch 'timed out|no response' -and $dm -notmatch '^1\.%\d+$') { $problems += "display-message -t ${S}:1 answered '$dm', not window 1"; $totals.wrong_display++ }
             if ($after -ne $before) { $problems += "active pane moved from $before to $after"; $totals.focus_moved++ }
             $cli = ($res | ForEach-Object { "{0}={1}ms{2}" -f ($_.args -split ' ')[0], $_.ms, $(if ($_.out) { " '" + $_.out + "'" } else { '' }) }) -join '; '
             if ($problems.Count -eq 0) { Write-Pass "$S every command acted on its own target ($to of $($res.Count) CLI calls timed out)" }
