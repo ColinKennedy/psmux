@@ -1301,6 +1301,7 @@ tmux), and `unbind-key -a -T copy-mode-vi` takes all of them.
 | `middle-line` | Move to the middle visible line |
 | `bottom-line` | Move to the bottom visible line |
 | `history-top` | Move to the top of the scrollback |
+| `goto-line <n>` | Move the view to line `n`, counted the way `copy-mode-line-numbers` counts |
 | `history-bottom` | Move to the live bottom of the scrollback |
 | `next-paragraph` | Move to the next blank line |
 | `previous-paragraph` | Move to the previous blank line |

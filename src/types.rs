@@ -1115,6 +1115,10 @@ pub enum Mode {
         input: String,
         forward: bool,
     },
+    /// Copy-mode goto-line input (tmux `window_copy_goto_line`)
+    CopyGoto {
+        input: String,
+    },
     /// Big clock display (tmux clock-mode)
     ClockMode,
     /// Interactive buffer chooser (prefix =)
@@ -1131,6 +1135,17 @@ pub enum Mode {
         edit_cursor: usize,
         filter: String,
     },
+}
+
+impl Mode {
+    /// True while the focused pane is in copy mode, whichever copy mode prompt
+    /// happens to be open. `copy_mode::in_copy_mode` is this question asked
+    /// about a whole `AppState`; this is it asked about the field alone, which
+    /// is what a caller holding `&mut app.windows` needs, since a call taking
+    /// `&AppState` would borrow the rest of the state along with it.
+    pub fn in_copy(&self) -> bool {
+        matches!(self, Mode::CopyMode | Mode::CopySearch { .. } | Mode::CopyGoto { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

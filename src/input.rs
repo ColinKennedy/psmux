@@ -28,6 +28,31 @@ fn refresh_search_prompt(app: &mut AppState) {
     }
 }
 
+/// Refresh the status-bar prompt shown while the user is typing a line number
+/// for copy-mode goto-line. tmux reaches the same prompt through
+/// `command-prompt -p'(goto line)'` (key-bindings.c:608); copy mode lives in
+/// the server here and the command prompt lives in the client, so the prompt
+/// is the search prompt's twin rather than a command prompt.
+fn refresh_goto_prompt(app: &mut AppState) {
+    if let Mode::CopyGoto { ref input } = app.mode {
+        let prompt = format!("(goto line) {}", input);
+        // display-time = 0 keeps the message sticky until cleared.
+        app.status_message = Some((prompt, Instant::now(), Some(0)));
+    }
+}
+
+/// Open the goto-line prompt on a pane that is already in copy mode.
+fn open_goto_prompt(app: &mut AppState) {
+    app.mode = Mode::CopyGoto { input: String::new() };
+    refresh_goto_prompt(app);
+}
+
+/// Leave a copy-mode prompt and take its sticky status message with it.
+fn close_copy_prompt(app: &mut AppState) {
+    app.mode = Mode::CopyMode;
+    app.status_message = None;
+}
+
 /// Look up a copy-mode key binding for `key`, honouring `mode-keys`.
 ///
 /// The table name selection matches tmux: `mode-keys vi` uses `copy-mode-vi`,
@@ -1042,6 +1067,8 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     app.mode = Mode::CopySearch { input: String::new(), forward: false };
                     refresh_search_prompt(app);
                 }
+                // --- copy-mode goto line ---
+                KeyCode::Char(':') if app.mode_keys != "emacs" => { open_goto_prompt(app); }
                 KeyCode::Char('n') => { search_next(app); }
                 KeyCode::Char('N') => { search_prev(app); }
                 KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1094,6 +1121,29 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char(c) => {
                     if let Mode::CopySearch { ref mut input, .. } = app.mode { input.push(c); }
                     refresh_search_prompt(app);
+                }
+                _ => {}
+            }
+            Ok(false)
+        }
+        Mode::CopyGoto { .. } => {
+            match key.code {
+                KeyCode::Esc => { close_copy_prompt(app); }
+                KeyCode::Enter => {
+                    let typed = match app.mode {
+                        Mode::CopyGoto { ref input } => input.clone(),
+                        _ => String::new(),
+                    };
+                    close_copy_prompt(app);
+                    crate::copy_mode::run_goto_line(app, &typed);
+                }
+                KeyCode::Backspace => {
+                    if let Mode::CopyGoto { ref mut input } = app.mode { let _ = input.pop(); }
+                    refresh_goto_prompt(app);
+                }
+                KeyCode::Char(c) => {
+                    if let Mode::CopyGoto { ref mut input } = app.mode { input.push(c); }
+                    refresh_goto_prompt(app);
                 }
                 _ => {}
             }
@@ -2925,11 +2975,8 @@ pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         app.mode = Mode::Passthrough;
         return Ok(());
     }
-    // In copy / copy-search modes, treat like regular text
-    if matches!(app.mode, Mode::CopyMode) {
-        return send_text_to_active(app, text);
-    }
-    if matches!(app.mode, Mode::CopySearch { .. }) {
+    // In copy mode and its prompts, treat like regular text
+    if app.mode.in_copy() {
         return send_text_to_active(app, text);
     }
 
@@ -3152,6 +3199,17 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         refresh_search_prompt(app);
         return Ok(());
     }
+    // Same for the goto-line prompt: while it is open the copy-mode keys are
+    // inactive and every character is part of the line number.
+    if matches!(app.mode, Mode::CopyGoto { .. }) {
+        if let Mode::CopyGoto { ref mut input } = app.mode {
+            for c in text.chars() {
+                input.push(c);
+            }
+        }
+        refresh_goto_prompt(app);
+        return Ok(());
+    }
 
     // A focused floating pane (tmux new-pane) receives input instead of the
     // tiled active pane, while the layout keeps rendering underneath.
@@ -3259,6 +3317,10 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         // does.  See the g/G note in handle_key.
         'g' if app.mode_keys != "emacs" => { scroll_to_top(app); }
         'G' if app.mode_keys != "emacs" => { scroll_to_bottom(app); }
+        // tmux binds this prompt to `:` in copy-mode-vi (key-bindings.c:608).
+        // The emacs table spells it `g` (key-bindings.c:530), where history-top
+        // is `M-<`; psmux leaves `g` unbound there, which is left alone here.
+        ':' if app.mode_keys != "emacs" => { open_goto_prompt(app); }
         'w' => { for _ in 0..n { crate::copy_mode::move_word_forward(app); } }
         'b' => { for _ in 0..n { crate::copy_mode::move_word_backward(app); } }
         'e' => { for _ in 0..n { crate::copy_mode::move_word_end(app); } }
@@ -3462,6 +3524,27 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             "backspace" => {
                 if let Mode::CopySearch { ref mut input, .. } = app.mode { input.pop(); }
                 refresh_search_prompt(app);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // --- Copy goto-line prompt: handle esc/enter/backspace ---
+    if matches!(app.mode, Mode::CopyGoto { .. }) {
+        match k {
+            "esc" | "escape" => { close_copy_prompt(app); }
+            "enter" => {
+                let typed = match app.mode {
+                    Mode::CopyGoto { ref input } => input.clone(),
+                    _ => String::new(),
+                };
+                close_copy_prompt(app);
+                crate::copy_mode::run_goto_line(app, &typed);
+            }
+            "backspace" | "bspace" => {
+                if let Mode::CopyGoto { ref mut input } = app.mode { input.pop(); }
+                refresh_goto_prompt(app);
             }
             _ => {}
         }
@@ -3953,3 +4036,7 @@ mod tests_issue623_far_fkeys;
 #[cfg(test)]
 #[path = "../tests-rs/test_copy_mode_parity_keys.rs"]
 mod tests_copy_mode_parity_keys;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue722_goto_line.rs"]
+mod tests_issue722_goto_line;

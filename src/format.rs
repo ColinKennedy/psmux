@@ -1513,9 +1513,10 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_in_mode" => {
             let target_id = target_pane().map(|p| p.id);
             if target_id.is_some() && target_id == crate::copy_mode::active_pane_id(app) {
-                match app.mode {
-                    Mode::CopyMode | Mode::CopySearch { .. } | Mode::ClockMode => "1".into(),
-                    _ => "0".into(),
+                if app.mode.in_copy() || matches!(app.mode, Mode::ClockMode) {
+                    "1".into()
+                } else {
+                    "0".into()
                 }
             } else if target_pane().map_or(false, |p| p.copy_state.is_some()) {
                 "1".into()
@@ -1526,10 +1527,12 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "pane_mode" => {
             let target_id = target_pane().map(|p| p.id);
             if target_id.is_some() && target_id == crate::copy_mode::active_pane_id(app) {
-                match app.mode {
-                    Mode::CopyMode | Mode::CopySearch { .. } => "copy-mode".into(),
-                    Mode::ClockMode => "clock-mode".into(),
-                    _ => String::new(),
+                if app.mode.in_copy() {
+                    "copy-mode".into()
+                } else if matches!(app.mode, Mode::ClockMode) {
+                    "clock-mode".into()
+                } else {
+                    String::new()
                 }
             } else if target_pane().map_or(false, |p| p.copy_state.is_some()) {
                 "copy-mode".into()

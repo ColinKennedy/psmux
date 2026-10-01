@@ -482,7 +482,7 @@ pub fn pane_mouse_is_inert_motion(app: &AppState, pane_id: usize, button: u8) ->
     if button != 35 {
         return false;
     }
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         return false;
     }
     let Some(win) = app.windows.get(app.active_idx) else { return true };
@@ -1210,7 +1210,7 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         }
     }
 
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         app.copy_anchor = None;
         app.copy_pos_published = None;
         if let Some(area) = active_area {
@@ -1304,7 +1304,7 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         // Prefer the pane under the pointer; fall back to the active
         // (copy-mode) pane so a drag that leaves every pane rect still
         // extends the selection and can auto-scroll at the edges.
@@ -1373,7 +1373,7 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
     compute_rects(&win.root, app.last_window_area, &mut rects);
 
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         // The release cell, kept for the #199 click guard only.  It must not
         // become the selection endpoint: tmux's `window_copy_drag_release`
         // only clears the drag state, and the cursor moves on drag or
@@ -1574,7 +1574,7 @@ fn remote_scroll_wheel(app: &mut AppState, x: u16, y: u16, up: bool) {
     }
 
     // Handle scroll while already in copy mode
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         mouse_log("  -> already in copy mode, scrolling within");
         if up {
             scroll_copy_up(app, 3);
@@ -1690,7 +1690,7 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
     }
 
     // Handle copy mode: position cursor with pane-relative coordinates
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         // Visible pane extent, for clamping and edge detection.  The client
         // sends drag/release coordinates unclamped, so an out-of-range row
         // is the signal that the pointer crossed a pane edge.
@@ -1866,7 +1866,7 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
 /// handle_pane_mouse).
 pub fn copy_drag_begin(app: &mut AppState, pane_id: usize, anchor_col: i16, anchor_row: i16,
                        col: i16, row: i16, rect_sel: bool) {
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. } | Mode::PopupMode { .. }) {
+    if app.mode.in_copy() || matches!(app.mode, Mode::PopupMode { .. }) {
         return;
     }
 
@@ -1968,7 +1968,7 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Opti
     }
 
     // Handle scroll while already in copy mode (coordinates irrelevant)
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         mouse_log("  -> already in copy mode, scrolling within");
         if up {
             scroll_copy_up(app, 3);
@@ -3503,7 +3503,7 @@ pub fn break_pane_to_window(app: &mut AppState) {
 /// is the frozen snapshot, so clearing it would wipe the screen the user is
 /// reading and leave the live scrollback untouched.
 pub fn clear_active_pane_history(app: &mut AppState) {
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         exit_copy_mode(app);
     }
     let history_limit = app.history_limit;
@@ -3546,7 +3546,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     // pane in copy mode leaves it on respawn. Leaving it here also puts the
     // LIVE parser back in `pane.term` (copy mode shows a snapshot), which is
     // the one whose history the new process inherits below.
-    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {
+    if app.mode.in_copy() {
         exit_copy_mode(app);
     }
     {

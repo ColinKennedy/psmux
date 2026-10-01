@@ -2,7 +2,7 @@ use std::io;
 
 use serde::{Serialize, Deserialize};
 
-use crate::types::{AppState, Node, LayoutKind, Mode};
+use crate::types::{AppState, Node, LayoutKind};
 use crate::tree::get_split_mut;
 
 /// Serialize a vt100 screen region into run-length-encoded rows (rows_v2 format).
@@ -370,7 +370,7 @@ fn sync_copy_freeze(app: &mut AppState, in_copy_mode: bool) {
 }
 
 fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::Result<LayoutJson> {
-    let in_copy_mode = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    let in_copy_mode = app.mode.in_copy();
     if win_id_override.is_none() {
         sync_copy_freeze(app, in_copy_mode);
     }
@@ -763,7 +763,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
 /// allocations **and** the `serde_json::to_string` traversal.  Produces the
 /// identical JSON format that the client deserialises into `LayoutJson`.
 pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
-    let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    let in_copy = app.mode.in_copy();
     sync_copy_freeze(app, in_copy);
     let scroll_off = app.copy_scroll_offset;
     let anchor = app.copy_anchor;
