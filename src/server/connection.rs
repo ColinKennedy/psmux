@@ -34,7 +34,7 @@ fn clear_inherit(_s: &TcpStream) {}
 /// server thread to expand it with the same CtrlReq the bind-key path uses.
 /// Without `-F`, or for an empty value, this is the identity.
 fn expand_set_option_value(
-    tx: &mpsc::Sender<CtrlReq>,
+    tx: &TargetedSender,
     format_expand: bool,
     value: String,
 ) -> String {
@@ -50,12 +50,63 @@ fn expand_set_option_value(
     rrx.recv_timeout(Duration::from_secs(5)).unwrap_or(value)
 }
 
+/// The sender a command's handler sends its requests through.  When the
+/// command has a validated -t target, EVERY request it sends goes out as
+/// `CtrlReq::Targeted(target, request)`, so the server applies the target to
+/// that request and to nothing else, whatever other clients or panes queue in
+/// between.  Without a target it passes requests through untouched.
+///
+/// Deliberately not `Deref` to the raw sender: a handler cannot reach the
+/// server except through `send`, so no request of a targeted command can
+/// silently go out untargeted.
+pub(crate) struct TargetedSender<'a> {
+    inner: &'a mpsc::Sender<CtrlReq>,
+    target: Option<crate::types::TempTarget>,
+}
+
+impl<'a> TargetedSender<'a> {
+    pub(crate) fn new(inner: &'a mpsc::Sender<CtrlReq>, target: Option<crate::types::TempTarget>) -> Self {
+        TargetedSender { inner, target }
+    }
+
+    pub(crate) fn send(&self, req: CtrlReq) -> Result<(), mpsc::SendError<CtrlReq>> {
+        match &self.target {
+            Some(t) => self.inner.send(CtrlReq::Targeted(t.clone(), Box::new(req))),
+            None => self.inner.send(req),
+        }
+    }
+}
+
+/// Validate a command's -t target on the server, read only.  Ok is the
+/// target in stable id form for `TargetedSender`; Err is tmux's message and
+/// the command must not run.
+///
+/// The old wait gave up after 5 s and then sent the command anyway, without
+/// its focus having been applied in any way the command could rely on.  The
+/// reply cannot be overtaken (the command's own requests queue behind this
+/// one in the same FIFO), so waiting longer delays nothing.  A server that
+/// does not answer within a minute does not get the command at all.
+fn validate_target(
+    tx: &mpsc::Sender<CtrlReq>,
+    target: crate::types::TempTarget,
+) -> Result<crate::types::TempTarget, String> {
+    let (s, r) = mpsc::channel::<Result<crate::types::TempTarget, String>>();
+    if tx.send(CtrlReq::ValidateTarget { target, resp: s }).is_err() {
+        return Err("server is shutting down".to_string());
+    }
+    match r.recv_timeout(Duration::from_secs(60)) {
+        Ok(result) => result,
+        Err(_) => Err("no response from server (timed out)".to_string()),
+    }
+}
+
 /// SetPaneOption/ShowPaneOptions resolve only "" (the active pane) and bare
 /// "%N"/"N" pane ids. set-option keeps its -t in the argument list for the
 /// shared parser (unlike every other command, whose -t without_outer_target
 /// strips), so a richer form like "session:win.pane" reaches these arms
 /// verbatim. That form was already resolved AND validated by the
-/// FocusTargetTemp issued before dispatch, making the active pane the target;
+/// ValidateTarget issued before dispatch, and each request then runs with that
+/// pane focused (CtrlReq::Targeted), making the active pane the target;
 /// forwarding the raw text made the bare-id parse fail and reported a pane
 /// that provably exists as missing (#583 arm 6 regression).
 fn pane_scope_target(raw: String) -> String {
@@ -1188,6 +1239,8 @@ if control_echo || control_noecho {
         // same %error path as an unresolvable -t, and skips dispatch (and the
         // temp focus below) entirely, so control clients see tmux's message
         // and nothing is mutated.
+        // The validated target every request of this command carries.
+        let mut ctrl_command_target: Option<crate::types::TempTarget> = None;
         let mut focus_err = crate::cli::validate_flag_arguments(cmd_name, &cmd_args)
             .err()
             .or_else(|| {
@@ -1243,25 +1296,26 @@ if control_echo || control_noecho {
                     }
                 }
             } else {
-                // Validated temporary focus (issue #545): on an unresolvable
-                // window/pane target the command must not run — reply %error
+                // Validated target (issue #545): on an unresolvable
+                // window/pane target the command must not run, reply %error
                 // instead of silently executing against the active window.
+                // On success every request of the command carries the
+                // resolved target (TargetedSender).
                 let want_win = (ctrl_target_win.is_some()
                     || ctrl_target_win_name.is_some())
                     && !skip_target_focus;
                 let want_pane = ctrl_target_pane.is_some() && !skip_pane_focus;
                 if want_win || want_pane {
-                    let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
-                    let _ = tx_ctrl.send(CtrlReq::FocusTargetTemp {
+                    let spec = crate::types::TempTarget {
                         win: if want_win { ctrl_target_win } else { None },
                         win_is_id: ctrl_target_win_is_id,
                         win_name: if want_win { ctrl_target_win_name.clone() } else { None },
                         pane: if want_pane { ctrl_target_pane } else { None },
                         pane_is_id: ctrl_pane_is_id,
-                        resp: focus_s,
-                    });
-                    if let Ok(Err(e)) = focus_r.recv_timeout(Duration::from_secs(5)) {
-                        focus_err = Some(e);
+                    };
+                    match validate_target(&tx_ctrl, spec) {
+                        Ok(resolved) => ctrl_command_target = Some(resolved),
+                        Err(e) => focus_err = Some(e),
                     }
                 }
             }
@@ -1275,8 +1329,9 @@ if control_echo || control_noecho {
             // same as dispatcher-signalled errors).
             Some(Ok(format!("\u{0001}ERR\u{0001}{}", err)))
         } else {
+            let targeted_tx = TargetedSender::new(&tx_ctrl, ctrl_command_target.take());
             let dispatched = dispatch_control_command(
-                cmd_name, &filtered_args, &tx_ctrl, resp_s,
+                cmd_name, &filtered_args, &targeted_tx, resp_s,
                 ctrl_target_pane, ctrl_pane_is_id, ctrl_raw_target.as_deref(),
                 ctrl_client_id,
             );
@@ -1599,6 +1654,9 @@ let selectw_owns_window_target = matches!(cmd, "select-window" | "selectw");
 // included, for the same reason. Focusing the window part here fired
 // `after-select-window` for a command tmux gives `after-select-pane`.
 let selectp_owns_target = matches!(cmd, "select-pane" | "selectp");
+// The validated target every request of this command carries (None: the
+// command has no -t, or owns it, and acts on the real focus).
+let mut command_target: Option<crate::types::TempTarget> = None;
 if is_focus_cmd {
     if selectp_owns_target {
         for req in select_pane_requests(
@@ -1628,35 +1686,40 @@ if is_focus_cmd {
         }
     }
 } else {
-    // Validated temporary focus (issue #545): the server resolves the
-    // window/pane target and replies Err on a miss, in which case the
-    // command must NOT run — the old fire-and-forget temp focus silently
-    // no-opped on a bad target and the untargeted command then executed
-    // against the ACTIVE window (kill-pane destroyed it, send-keys typed
-    // into it, capture-pane read it) at rc=0.
+    // Validated target (issue #545): the server resolves the window/pane
+    // target and replies Err on a miss, in which case the command must NOT
+    // run (the old fire-and-forget temp focus silently no-opped on a bad
+    // target and the untargeted command then executed against the ACTIVE
+    // window at rc=0).  On success every request the command sends carries
+    // the resolved target (TargetedSender), so it acts on that pane however
+    // its requests interleave with anyone else's.
     let want_win = (target_win.is_some() || target_win_name.is_some()) && !skip_target_focus;
     let want_pane = target_pane.is_some() && !skip_pane_focus && targeted_kill_pane_id.is_none();
     if want_win || want_pane {
-        let (focus_s, focus_r) = mpsc::channel::<Result<(), String>>();
-        let _ = tx.send(CtrlReq::FocusTargetTemp {
+        let spec = crate::types::TempTarget {
             win: if want_win { target_win } else { None },
             win_is_id: target_win_is_id,
             win_name: if want_win { target_win_name.clone() } else { None },
             pane: if want_pane { target_pane } else { None },
             pane_is_id,
-            resp: focus_s,
-        });
-        if let Ok(Err(e)) = focus_r.recv_timeout(Duration::from_secs(5)) {
-            // Unresolvable target: report (tmux: "can't find window: X",
-            // exit 1, zero side effects) and skip the command entirely.
-            let _ = writeln!(write_stream, "ERROR: {}", e);
-            let _ = write_stream.flush();
-            if !persistent { break; }
-            line.clear();
-            continue;
+        };
+        match validate_target(&tx, spec) {
+            Ok(resolved) => command_target = Some(resolved),
+            Err(e) => {
+                // Unresolvable target: report (tmux: "can't find window: X",
+                // exit 1, zero side effects) and skip the command entirely.
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+                if !persistent { break; }
+                line.clear();
+                continue;
+            }
         }
     }
 }
+let targeted_tx = TargetedSender::new(&tx, command_target);
+{
+let tx = &targeted_tx;
 match cmd {
     "new-window" | "neww" => {
         let name: Option<String> = args.windows(2).find(|w| w[0] == "-n").map(|w| w[1].trim_matches('"').to_string());
@@ -3794,6 +3857,14 @@ match cmd {
     "clear-history" | "clearhist" => {
         let _ = tx.send(CtrlReq::ClearHistory);
     }
+    // TEST ONLY: `debug-stall <ms>` stalls the server loop so a test can
+    // reproduce a long stall on demand.  Inert (an unknown command) unless
+    // the server process was started with PSMUX_TEST_STALL_HOOK=1; the CLI
+    // has no verb for it, tests send it as a raw line over the TCP port.
+    "debug-stall" if std::env::var("PSMUX_TEST_STALL_HOOK").as_deref() == Ok("1") => {
+        let ms = args.first().and_then(|a| a.parse::<u64>().ok()).unwrap_or(0);
+        let _ = tx.send(CtrlReq::DebugStall(ms));
+    }
     "save-buffer" | "saveb" => {
         let path = args.iter().find(|a| **a == "-" || !a.starts_with('-')).unwrap_or(&"").to_string();
         let _ = tx.send(CtrlReq::SaveBuffer(path));
@@ -4678,6 +4749,7 @@ match cmd {
     }
     _ => {}
 }
+}
     // Process pending chained commands before reading from socket
     if !pending_chain.is_empty() {
         line = pending_chain.remove(0);
@@ -4744,7 +4816,7 @@ match cmd {
 fn dispatch_control_command(
     cmd: &str,
     args: &[&str],
-    tx: &mpsc::Sender<CtrlReq>,
+    tx: &TargetedSender,
     resp_tx: mpsc::Sender<String>,
     target_pane: Option<usize>,
     pane_is_id: bool,

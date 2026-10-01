@@ -1210,8 +1210,8 @@ pub(crate) fn apply_separator(text: &str, sep: &str) -> String {
 /// equivalent is to move that cursor, paste, and move it back, all inside one
 /// server request so nothing else can observe the move.
 ///
-/// The CLI route also issues a validated `FocusTargetTemp` before this, but
-/// that focus is spent by the first non-focus request the server handles, which
+/// The CLI route used to issue a `FocusTargetTemp` before this, a focus that
+/// was spent by the first non-focus request the server handled, which
 /// is why a `-t` used to reach the buffer lookup and never the paste
 /// (gabri-ns, #684 follow up).
 ///
@@ -2069,8 +2069,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             // (server/connection.rs) honoured -p and -b.
             //
             // A -t target used to be forwarded to the control port so the CLI
-            // dispatch's FocusTargetTemp would resolve it.  That focus is spent
-            // by the first non-focus request the server handles, so the paste
+            // dispatch's FocusTargetTemp would resolve it.  That focus was spent
+            // by the first non-focus request the server handled, so the paste
             // still landed in the active pane; `run_paste_buffer` resolves the
             // target itself now, the way cmd-paste-buffer.c does with
             // cmd_find_pane, and both dispatches share it.

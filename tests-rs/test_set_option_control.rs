@@ -28,7 +28,7 @@ fn dispatched_assignment(args: &[&str], expansion: &str) -> (String, String) {
     assert!(dispatch_control_command(
         "set-option",
         args,
-        &request_tx,
+        &crate::server::connection::TargetedSender::new(&request_tx, None),
         response_tx,
         None,
         false,
@@ -45,7 +45,7 @@ fn rejected_control_command(command: &str, args: &[&str]) -> String {
     assert!(dispatch_control_command(
         command,
         args,
-        &request_tx,
+        &crate::server::connection::TargetedSender::new(&request_tx, None),
         response_tx,
         None,
         false,

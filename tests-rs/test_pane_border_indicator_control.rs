@@ -54,7 +54,7 @@ fn rejected_control_command(command: &str, args: &[&str]) -> String {
     assert!(dispatch_control_command(
         command,
         args,
-        &request_tx,
+        &crate::server::connection::TargetedSender::new(&request_tx, None),
         response_tx,
         None,
         false,
@@ -349,7 +349,7 @@ fn persistent_control_accepts_global_window_forms() {
         assert!(dispatch_control_command(
             command,
             &args,
-            &request_tx,
+            &crate::server::connection::TargetedSender::new(&request_tx, None),
             response_tx,
             None,
             false,

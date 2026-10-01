@@ -2,6 +2,7 @@ pub(crate) mod helpers;
 pub(crate) mod options;
 pub(crate) mod option_catalog;
 pub(crate) mod connection;
+pub(crate) mod temp_target;
 
 use std::io::{self, Write};
 use std::sync::mpsc;
@@ -18,7 +19,7 @@ use crate::types::{AppState, CtrlReq, Mode, FocusDir, LayoutKind, PipePaneState,
 use crate::platform::install_console_ctrl_handler;
 use crate::pane::{create_window, create_window_with_env, create_window_raw, split_active_with_env, kill_active_pane, kill_pane_by_id, spawn_warm_pane};
 use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all_children,
-    find_window_index_by_id, focus_pane_by_id, focus_pane_by_id_no_mru, focus_pane_by_index, get_active_pane_id,
+    find_window_index_by_id, focus_pane_by_id, focus_pane_by_index, get_active_pane_id,
     get_split_mut, path_exists};
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
@@ -2248,9 +2249,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // (250ms is imperceptible to users).
     let mut last_reap = Instant::now();
 
-    // Persist temp_focus_restore across batch boundaries so that a
-    // FocusWindowTemp/FocusPaneByIndexTemp in one batch plus the actual
-    // command (e.g. CapturePane) in the next batch still works correctly.
+    // The real focus (active window index, active pane id) while a
+    // CtrlReq::Targeted request runs with its target focused; Some only
+    // inside that one request's iteration (see server::temp_target).
     let mut temp_focus_restore: Option<(usize, usize)> = None;
 
     // ── Background spare shell spawner ──────────────────────────────────────
@@ -2680,16 +2681,30 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     CtrlReq::WindowDump(..) => 1,
                     _ => 0,
                 });
-                // Track temporary -t focus: save (active_idx, pane_id) when
-                // FocusWindowTemp/FocusPaneTemp is seen, restore after next
-                // non-temp command so the user's view doesn't jump.
-                // We store the pane ID (not path) because kill-pane
-                // restructures the tree, invalidating saved paths (#71).
-                // NOTE: temp_focus_restore lives outside the loop so it
-                // persists across batch boundaries (prevents race where
-                // FocusWindowTemp and the actual command land in different
-                // batches).
                 for req in pending {
+                    // A -t target applies to the one request that carries it
+                    // and to nothing else.  Any focus a previous request left
+                    // switched (one whose arm skipped the restore at the end
+                    // of its iteration) is put back before this one runs.
+                    temp_target::restore_temp_focus(&mut app, &mut temp_focus_restore);
+                    let req = match req {
+                        CtrlReq::Targeted(target, inner) => {
+                            match temp_target::apply_temp_target(&mut app, &mut temp_focus_restore, &target) {
+                                Ok(()) => *inner,
+                                Err(msg) => {
+                                    // The target went away after the command
+                                    // was validated: the request does not run
+                                    // at all, it never falls back to the
+                                    // active pane.  Its reply channels drop
+                                    // with it, so a waiting caller returns.
+                                    app.status_message = Some((msg, Instant::now(), None));
+                                    state_dirty = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        other => other,
+                    };
                     let mutates_state = !matches!(&req,
                         CtrlReq::DumpState(..)
                         | CtrlReq::SendText(_)
@@ -2700,7 +2715,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         | CtrlReq::PtyWake
                         | CtrlReq::ClientActivity(_)
                     );
-                    let is_temp_focus = matches!(&req, CtrlReq::FocusTargetTemp { .. });
                     let mut hook_event: Option<&str> = None;
                     // Notification hooks (issue #691). `hook_event` is the ONE
                     // `after-<command>` a request may fire, the #690 rule; the
@@ -2721,7 +2735,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         CtrlReq::FocusWindow(_) => "FocusWindow",
                         CtrlReq::FocusWindowById(_) => "FocusWindowById",
                         CtrlReq::FocusWindowByName(_) => "FocusWindowByName",
-                        CtrlReq::FocusTargetTemp { .. } => "FocusTargetTemp",
+                        CtrlReq::ValidateTarget { .. } => "ValidateTarget",
                         CtrlReq::FocusWindowCmd(_) => "FocusWindowCmd",
                         CtrlReq::LastWindow => "LastWindow",
                         CtrlReq::MouseDown(..) => "MouseDown",
@@ -3169,103 +3183,29 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     meta_dirty = true;
                 }
-                // ── Temporary focus for -t targeting ─────────────────────
-                // Switches active_idx/active_path so the NEXT command in
-                // the batch operates on the correct window/pane. After the
-                // entire pending batch is processed, we restore the original
-                // focus (see temp_focus_restore below).
-                //
-                // Resolution happens BEFORE any focus change: an
-                // unresolvable target must be an error with zero side
-                // effects, never a silent fallback to the active window
-                // (issue #545 — the old per-kind Temp handlers had no miss
-                // path, so the untargeted command that followed ran against
-                // whatever was focused). Same convention as KillWindowTarget.
-                CtrlReq::FocusTargetTemp { win, win_is_id, win_name, pane, pane_is_id, resp } => {
-                    let win_idx: Option<usize> = if let Some(w) = win {
-                        if win_is_id {
-                            app.windows.iter().position(|x| x.id == w)
-                        } else {
-                            app.win_pos(w)
-                        }
-                    } else if let Some(ref n) = win_name {
-                        app.windows.iter().position(|x| x.name == *n)
-                    } else {
-                        Some(app.active_idx)
-                    };
-                    let err: Option<String> = match win_idx {
-                        None => {
-                            let spec = if let Some(w) = win {
-                                if win_is_id { format!("@{}", w) } else { w.to_string() }
-                            } else {
-                                win_name.clone().unwrap_or_default()
-                            };
-                            Some(format!("can't find window: {}", spec))
-                        }
-                        Some(idx) => match pane {
-                            Some(p) if pane_is_id => {
-                                if crate::tree::find_pane_by_id_global(&app, p).is_none() {
-                                    Some(format!("can't find pane: %{}", p))
-                                } else {
-                                    None
-                                }
-                            }
-                            Some(p) => {
-                                // Positional index within the target window,
-                                // matching what focus_pane_by_index resolves.
-                                if p >= crate::tree::count_panes(&app.windows[idx].root) {
-                                    Some(format!("can't find pane: {}", p))
-                                } else {
-                                    None
-                                }
-                            }
-                            None => None,
-                        },
-                    };
-                    match err {
-                        Some(msg) => {
+                // ── -t target validation ─────────────────────────────────
+                // Read only: resolve the target and answer, change nothing.
+                // An unresolvable target is an error with zero side effects
+                // (issue #545), never a silent fallback to the active window.
+                // The resolved form (stable ids) is what the command's own
+                // requests then carry in CtrlReq::Targeted.
+                CtrlReq::ValidateTarget { target, resp } => {
+                    match temp_target::resolve_temp_target(&app, &target) {
+                        Ok(resolved) => { let _ = resp.send(Ok(resolved)); }
+                        Err(msg) => {
                             // Surface in the status bar for attached clients,
                             // same convention as join-pane (#437) and
                             // kill-window (8edd1cb). The Err reply makes the
-                            // connection thread skip the follow-on command.
+                            // connection thread skip the command.
                             app.status_message = Some((msg.clone(), Instant::now(), None));
                             state_dirty = true;
                             let _ = resp.send(Err(msg));
                         }
-                        None => {
-                            if temp_focus_restore.is_none() {
-                                let pane_id = crate::tree::get_active_pane_id(
-                                    &app.windows[app.active_idx].root,
-                                    &app.windows[app.active_idx].active_path,
-                                ).unwrap_or(usize::MAX);
-                                temp_focus_restore = Some((app.active_idx, pane_id));
-                                // Remember the REAL active window so format
-                                // evaluation of #{window_active} and the `*`
-                                // flag is not fooled by the temporary switch
-                                // (issue #551).
-                                app.temp_focus_saved_active = Some(app.active_idx);
-                            }
-                            if win.is_some() || win_name.is_some() {
-                                if let Some(internal_idx) = win_idx {
-                                    app.active_idx = internal_idx;
-                                    app.last_window_area = app.windows[internal_idx].area;
-                                }
-                            }
-                            match pane {
-                                Some(p) if pane_is_id => {
-                                    // Use no-MRU variant: temporary -t targeting
-                                    // should not pollute the recency list (#71).
-                                    focus_pane_by_id_no_mru(&mut app, p);
-                                }
-                                Some(p) => {
-                                    focus_pane_by_index(&mut app, p);
-                                }
-                                None => {}
-                            }
-                            let _ = resp.send(Ok(()));
-                        }
                     }
                 }
+                // Unwrapped at the top of this loop; TargetedSender never
+                // nests one inside another.
+                CtrlReq::Targeted(..) => {}
                 CtrlReq::SessionInfo(resp) => {
                     let num_attached = app.client_registry.len();
                     let attached = if num_attached > 0 { " (attached)" } else { "" };
@@ -6933,6 +6873,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // tmux does; see clear_active_pane_history.
                     crate::window_ops::clear_active_pane_history(&mut app);
                 }
+                CtrlReq::DebugStall(ms) => {
+                    // TEST ONLY, see CtrlReq::DebugStall: a deliberate stall
+                    // of the server loop, reachable only through the env
+                    // gated `debug-stall` wire command.
+                    std::thread::sleep(Duration::from_millis(ms.min(60_000)));
+                }
                 CtrlReq::SaveBuffer(path) => {
                     if let Some(content) = app.paste_buffers.first() {
                         let _ = std::fs::write(&path, content);
@@ -7931,25 +7877,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         _pre_hook_idx, app.active_idx, event));
                 }
             }
-            // Restore temporary -t focus after non-temp command completes.
-            // Use pane ID (not path) because kill-pane restructures the
-            // tree and invalidates saved paths (#71).
-            if !is_temp_focus {
-                if let Some((restore_idx, restore_pane_id)) = temp_focus_restore.take() {
-                    if restore_idx < app.windows.len() {
-                        app.active_idx = restore_idx;
-                        let win = &mut app.windows[restore_idx];
-                        if let Some(path) = crate::tree::find_path_by_id(&win.root, restore_pane_id) {
-                            win.active_path = path;
-                        }
-                        app.last_window_area = win.area;
-                        // If the pane was killed, keep whatever active_path
-                        // kill_pane_at_path already set (MRU target).
-                    }
-                    // Temporary focus is over; active_idx is real again.
-                    app.temp_focus_saved_active = None;
-                }
-            }
+            // The request that carried a -t target is done: put the real
+            // focus back (by pane id, see restore_temp_focus).
+            temp_target::restore_temp_focus(&mut app, &mut temp_focus_restore);
             if mutates_state {
                 state_dirty = true;
             }
@@ -7962,10 +7892,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 state_dirty = true;
             }
         }
-                // No trailing cleanup: temp_focus_restore persists across
-                // batch boundaries so the actual command that follows in a
-                // later batch can still benefit from the temp focus (and
-                // will restore when it processes as a non-temp-focus req).
             }
         }
         // Drain async run-shell results (non-blocking).

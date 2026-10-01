@@ -197,7 +197,7 @@ fn cli_pane_index_exists(idx_spec: &str) -> Option<bool> {
 /// its window identity (a bare `list-panes` is scoped to the ACTIVE window,
 /// which is not necessarily the target). Issue #554: needed because focus
 /// commands (select-pane/select-window) use the permanent focus path, which
-/// has no reply channel — the server-side FocusTargetTemp check that covers
+/// has no reply channel, so the server-side ValidateTarget check that covers
 /// targeted commands never runs for them, so a stale numeric pane index in
 /// an explicit window had no error signal at all.
 fn cli_pane_index_exists_in_window(window_spec: &str, idx_spec: &str) -> Option<bool> {
@@ -233,7 +233,7 @@ fn cli_pane_index_exists_in_window(window_spec: &str, idx_spec: &str) -> Option<
 /// definitively does not resolve. Conservative by design: relative/special
 /// specifiers (+, -, ^, !, $, {, *, =) are never validated, and an
 /// unreachable server (None from the validators) never blocks the command.
-/// The server-side FocusTargetTemp check independently prevents execution
+/// The server-side ValidateTarget check independently prevents execution
 /// against the wrong window for anything not validated here.
 /// Return the sessions in this namespace that contain the given `%<id>` pane id.
 ///
@@ -500,7 +500,7 @@ fn cli_validate_window_pane_target(ns: Option<&str>) {
             {
                 // Numeric pane index inside an explicit window (issue #554).
                 // Targeted commands get this from the server-side
-                // FocusTargetTemp check, but focus commands (select-pane)
+                // ValidateTarget check, but focus commands (select-pane)
                 // take the permanent focus path with no reply channel, so
                 // the CLI must resolve it for an exit-code signal.
                 eprintln!("psmux: can't find pane: {}", p);
