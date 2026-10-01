@@ -286,7 +286,7 @@ backslashes, with or without `.exe`, in any letter case, quoted, and with argume
 | `pwsh`, `powershell` | `cd '<dir>'; [System.IO.Directory]::SetCurrentDirectory(...); cls` (the second call keeps the Win32 working directory in step so `#{pane_current_path}` follows) |
 | `cmd` | `cd /d "<dir>" & cls` |
 | `bash`, `zsh`, `sh`, `fish`, `dash`, `ksh`, `tcsh`, `csh`, `ash`, `busybox` | `cd '<dir>'; clear` with the path written with forward slashes |
-| `nu`, `nushell` | `cd '<dir>'; clear` with the path written with forward slashes; a path containing an apostrophe switches to double quotes (`cd "<dir>"`) because a nushell single-quoted string has no quote escape at all |
+| `nu`, `nushell` | `cd '<dir>'; clear` with the path as given (a backslash is an ordinary character in nu single quotes); a path containing an apostrophe switches to double quotes (`cd "<dir>"`, every backslash doubled) because a nushell single-quoted string has no quote escape at all |
 | anything else | the PowerShell form |
 
 `git-bash.exe` (Git Bash's GUI launcher, which psmux runs as the console `bash.exe` beside it)

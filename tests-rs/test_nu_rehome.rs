@@ -56,17 +56,13 @@ fn nushell_with_arguments_resolves_the_program() {
 // ────────────────────────────── wire forms ───────────────────────────────
 
 /// Exact Nushell wire form for an ordinary path: single quotes (fully
-/// literal, so no escaping can go wrong), forward separators on Windows,
+/// literal, so no escaping can go wrong), the path's own separators,
 /// `clear` to hide the echo. It must contain no PowerShell tokens at all —
 /// `$PWD`, `try`, braces and parens are exactly what nushell choked on.
 #[test]
 fn nu_rehome_exact_form_has_no_powershell_tokens() {
     let cmd = rehome_command(r"C:\code\project", RehomeSyntax::Nu);
-    if cfg!(windows) {
-        assert_eq!(cmd, " cd 'C:/code/project'; clear\r");
-    } else {
-        assert_eq!(cmd, " cd 'C:\\code\\project'; clear\r");
-    }
+    assert_eq!(cmd, " cd 'C:\\code\\project'; clear\r");
     assert!(!cmd.contains("SetCurrentDirectory"), "the .NET sync is PowerShell-only, got {cmd:?}");
     assert!(!cmd.contains("$PWD"), "the PowerShell automatic variable, got {cmd:?}");
     for tok in ['(', ')', '{', '}'] {
@@ -77,17 +73,19 @@ fn nu_rehome_exact_form_has_no_powershell_tokens() {
     assert!(cmd.ends_with("; clear\r"), "must chain a clear to hide the echo, got {cmd:?}");
 }
 
-/// Windows separators are normalised exactly like the POSIX form: `cd`
-/// accepts forward slashes and a backslash would only invite confusion.
+/// Unlike the POSIX form, the path keeps its backslashes. Inside nu single
+/// quotes a backslash is an ordinary character, so there is nothing to
+/// protect, and nu keeps the spelling it was handed: a UNC directory written
+/// with forward slashes came out as `//localhost/C$\Windows` in `$env.PWD`
+/// (observed on nushell 0.116), so rewriting the separators is not harmless.
 #[test]
-fn nu_rehome_normalises_windows_separators() {
+fn nu_rehome_keeps_windows_separators() {
     let cmd = rehome_command(r"C:\Users\UserName1\My Code", RehomeSyntax::Nu);
-    if cfg!(windows) {
-        assert!(cmd.contains("cd 'C:/Users/UserName1/My Code'"), "got {cmd:?}");
-        assert!(!cmd.contains('\\'), "no backslash may survive on Windows, got {cmd:?}");
-    } else {
-        assert!(cmd.contains(r"cd 'C:\Users\UserName1\My Code'"), "got {cmd:?}");
-    }
+    assert_eq!(cmd, " cd 'C:\\Users\\UserName1\\My Code'; clear\r");
+    let unc = rehome_command(r"\\localhost\C$\Windows", RehomeSyntax::Nu);
+    assert_eq!(unc, " cd '\\\\localhost\\C$\\Windows'; clear\r");
+    let root = rehome_command(r"C:\", RehomeSyntax::Nu);
+    assert_eq!(root, " cd 'C:\\'; clear\r");
 }
 
 /// The apostrophe fallback. Nushell single quotes cannot hold a quote by any
@@ -97,12 +95,20 @@ fn nu_rehome_normalises_windows_separators() {
 #[test]
 fn nu_rehome_apostrophe_switches_to_double_quotes() {
     let cmd = rehome_command(r"C:\code\weird's dir", RehomeSyntax::Nu);
-    if cfg!(windows) {
-        assert_eq!(cmd, " cd \"C:/code/weird's dir\"; clear\r");
-    } else {
-        assert_eq!(cmd, " cd \"C:\\code\\weird's dir\"; clear\r");
-    }
+    assert_eq!(cmd, r#" cd "C:\\code\\weird's dir"; clear"#.to_string() + "\r");
     assert_eq!(cmd.matches('\r').count(), 1, "exactly one submitted line, got {cmd:?}");
+}
+
+/// Inside nu double quotes a backslash starts an escape, and `\U`, `\c` are
+/// not escapes nu knows, so an unescaped Windows path there is a parse error
+/// (`unrecognized escape sequence '\U' in string`). Segments that DO look
+/// like real escapes (`\n`, `\t`, `\u`) are the dangerous ones: they would
+/// parse and silently name a different directory. Every backslash must be
+/// doubled.
+#[test]
+fn nu_rehome_double_quote_form_doubles_every_backslash() {
+    let cmd = rehome_command(r"C:\Users\new's dir\table\unicode", RehomeSyntax::Nu);
+    assert_eq!(cmd, r#" cd "C:\\Users\\new's dir\\table\\unicode"; clear"#.to_string() + "\r");
 }
 
 /// The double-quoted fallback must escape the characters nushell double

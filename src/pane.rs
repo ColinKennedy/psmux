@@ -549,11 +549,15 @@ pub(crate) fn rehome_command(dir: &str, syntax: RehomeSyntax) -> String {
             // before a quote does nothing but close the string. A path with
             // an apostrophe therefore cannot travel in single quotes at all,
             // while Windows paths may legally contain one. Double quotes can
-            // hold it — they escape \\ \" \$ — so an apostrophe switches
-            // the form. Separators are normalised like the POSIX form:
-            // `cd` accepts forward slashes, which leaves nothing to escape
-            // for the ordinary single-quoted spelling.
-            let dir = if cfg!(windows) { dir.replace('\\', "/") } else { dir.to_string() };
+            // hold it, and there a backslash IS an escape (`"C:\Users"` is
+            // a parse error, `\U` is not a known escape), so the backslash
+            // and the double quote are escaped; `\$` is accepted too.
+            //
+            // The path keeps its own separators. Unlike bash, a backslash is
+            // an ordinary character inside nu single quotes, and rewriting
+            // it to `/` is not harmless here: nu keeps the spelling it was
+            // given, so `\\server\share\dir` became `//server/share\dir` in
+            // `$env.PWD`.
             if dir.contains('\'') {
                 let escaped = dir.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
                 format!(" cd \"{}\"; clear\r", escaped)
