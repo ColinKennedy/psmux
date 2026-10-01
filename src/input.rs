@@ -2909,15 +2909,19 @@ fn deliver_paste_to_pane(pane: &mut crate::types::Pane, text: &str, use_bracket:
     write_paste_bytes(&mut pane.writer, text.as_bytes(), use_bracket, normalize);
 }
 
-/// Chunked PTY write for paste delivery.  The PTY pipe can silently
-/// drop bytes when a large payload (140+ lines) is written in a single
-/// call because the OS pipe buffer fills up.  We split the text into
-/// ~2 KiB chunks with small yields between them so the consumer
-/// (shell / PSReadLine / nvim) has time to drain.  Bracket sequences
-/// are tiny and always written in one shot.
+/// Paste write with terminal / clipboard line ending normalisation.  See
+/// [`write_paste_bytes`].
 fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool) {
     write_paste_bytes(writer, text, bracket, true)
 }
+
+/// Size of one slice a paste is handed to the pane writer in.
+///
+/// The pane writer (`pane::spawn_pane_write_queue`) copies every write into
+/// its queue, so the paste is streamed through a buffer of this size rather
+/// than normalised into a second full size copy first: the server holds the
+/// paste once in the queue, never twice.
+pub(crate) const PASTE_SLICE: usize = 64 * 1024;
 
 /// [`write_paste_chunked`] with the line ending normalisation optional.
 ///
@@ -2927,53 +2931,76 @@ fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bo
 /// separator the way cmd-paste-buffer.c:103 to :122 does, so whatever is left
 /// (the LF of `-r`, a CR that was in the buffer) is what tmux would write and
 /// must reach the pane unchanged (issue #719).
+///
+/// The whole paste is handed to `writer` at once, in [`PASTE_SLICE`] slices,
+/// and this returns without waiting for the pane child to read any of it.
+/// `writer` is the pane's queued writer (`pane::spawn_pane_write_queue`),
+/// whose own thread performs the blocking pipe writes in order, so the server
+/// loop is never held by a paste.  That is tmux's contract: cmd-paste-buffer.c
+/// and window_pane_paste (window.c) `bufferevent_write` the whole paste into
+/// the pane's non blocking bufferevent and return; libevent drains it as the
+/// pty accepts it.
+///
+/// Until this change the loop below wrote 512 bytes and slept 5 ms after each
+/// slice ON THE SERVER THREAD (96f3e89, for #74's 350 line pastes), so a
+/// 132 KB paste froze every pane, every client and every CLI call for 1.4 s
+/// and a 1.3 MB one for 13.6 s, with CLI calls timing out.  The sleep never
+/// paced the pipe either: the pane writer queue already decoupled the two.
+/// The back pressure that matters is the blocking pipe write on the pane
+/// writer thread, which waits for conhost to take each slice; nothing is
+/// dropped (1.3 MB byte exact into a raw VT reader, PSReadLine and nvim
+/// measured line exact with and without the old pacing, see
+/// tests\test_large_paste_no_server_stall.ps1).
+///
+/// The bytes are a single ordered run, `ESC[200~`, text, `ESC[201~`, written
+/// in one call from the server thread, the only producer for this writer, so
+/// nothing written to the pane later (a key typed after the paste) can land
+/// inside the brackets or ahead of the paste.
 fn write_paste_bytes(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool, normalize: bool) {
-    const CHUNK: usize = 512;
-    // Normalize line endings to CR for ConPTY.  Clipboard text may arrive
-    // with LF (\n) or CRLF (\r\n), but ConPTY's input parser expects CR
-    // (\r) for Enter.  Bare LF is misinterpreted by PSReadLine, causing
-    // multi-line pastes to appear in reverse order.
-    let text = if !normalize { text.to_vec() } else {
-        let mut out = Vec::with_capacity(text.len());
+    // Append to the slice, handing each full slice to the writer.  False once
+    // a write fails, which means the pane writer thread is gone (the pane is
+    // closing) and the rest of the paste has nowhere to go.
+    fn push(writer: &mut dyn std::io::Write, slice: &mut Vec<u8>, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let take = (PASTE_SLICE - slice.len()).min(bytes.len());
+            slice.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if slice.len() >= PASTE_SLICE {
+                let ok = writer.write_all(slice).is_ok();
+                slice.clear();
+                if !ok { return false; }
+            }
+        }
+        true
+    }
+    let mut slice: Vec<u8> = Vec::with_capacity(PASTE_SLICE.min(text.len() + 12));
+    if bracket && !push(writer, &mut slice, b"\x1b[200~") { return; }
+    if !normalize {
+        if !push(writer, &mut slice, text) { return; }
+    } else {
+        // Normalize line endings to CR for ConPTY.  Clipboard text may arrive
+        // with LF (\n) or CRLF (\r\n), but ConPTY's input parser expects CR
+        // (\r) for Enter.  Bare LF is misinterpreted by PSReadLine, causing
+        // multi-line pastes to appear in reverse order.  Runs over the whole
+        // input, so a CRLF pair is one line break wherever the slices fall.
         let mut i = 0;
+        let mut run = 0; // start of the current run of bytes copied as is
         while i < text.len() {
-            if text[i] == b'\r' && i + 1 < text.len() && text[i + 1] == b'\n' {
-                out.push(b'\r');
-                i += 2; // CRLF → CR
-            } else if text[i] == b'\n' {
-                out.push(b'\r');
-                i += 1; // LF → CR
+            let b = text[i];
+            if b == b'\n' || (b == b'\r' && text.get(i + 1) == Some(&b'\n')) {
+                if !push(writer, &mut slice, &text[run..i]) || !push(writer, &mut slice, b"\r") { return; }
+                i += if b == b'\r' { 2 } else { 1 };
+                run = i;
             } else {
-                out.push(text[i]);
                 i += 1;
             }
         }
-        out
-    };
-    let text = &text[..];
-    if bracket { let _ = writer.write_all(b"\x1b[200~"); }
-    let mut offset: usize = 0;
-    while offset < text.len() {
-        let remaining = (text.len() - offset).min(CHUNK);
-        let chunk = &text[offset..offset + remaining];
-        match writer.write(chunk) {
-            Ok(0) => {
-                // Zero bytes written — yield and retry once
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                match writer.write(chunk) {
-                    Ok(n) if n > 0 => { offset += n; }
-                    _ => break, // give up on persistent failure
-                }
-            }
-            Ok(n) => { offset += n; }
-            Err(_) => break,
-        }
-        // Yield between chunks to let the consumer drain the buffer
-        if offset < text.len() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        if !push(writer, &mut slice, &text[run..]) { return; }
     }
-    if bracket { let _ = writer.write_all(b"\x1b[201~"); }
+    if bracket && !push(writer, &mut slice, b"\x1b[201~") { return; }
+    if !slice.is_empty() {
+        let _ = writer.write_all(&slice);
+    }
     let _ = writer.flush();
 }
 
