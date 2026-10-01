@@ -26,6 +26,17 @@ A: Session creation takes < 100ms. New windows/panes add < 80ms overhead. The bo
 **Q: Does psmux support mouse?**
 A: Full mouse support: click to focus panes, drag to resize borders, scroll wheel, click status-bar tabs, drag-select text (including tmux-like copy-on-release with `pwsh-mouse-selection on`), and right-click copy/paste paths. Plus VT mouse forwarding for TUI apps like vim, htop, and midnight commander.
 
+**Q: When I select lines with the mouse, the selection runs across every pane. How do I copy from just one pane?**
+A: A selection that spans panes, covers whole rows of the window and runs straight through the pane border is drawn by your terminal (Windows Terminal, conhost, WezTerm), not by psmux. The terminal only sees one big grid of characters and knows nothing about panes, so its selection cannot stop at a pane edge. tmux behaves exactly the same way. You get the terminal's selection in two cases:
+
+- `mouse` is off in your config (`set -g mouse off`). psmux then leaves every mouse event to the terminal. psmux turns `mouse` on by default; tmux defaults it to off.
+- You hold **Shift** while dragging. Windows Terminal and most other terminals treat Shift+drag as "select it myself" even when the program inside asks for the mouse. That is handy for grabbing text from several panes at once, and it is how you get the terminal's selection back while `mouse` is on.
+
+To copy from one pane only, let psmux do the selecting:
+
+- With the mouse: make sure your config has `set -g mouse on` (or no `mouse` line at all), then drag inside the pane. psmux enters copy mode, keeps the selection inside the pane you started in even if the pointer wanders into the next one, and copies to the paste buffer and the Windows clipboard when you release the button.
+- With the keyboard: press `Prefix` then `[` to enter copy mode in the active pane, move to the start, press `Space`, move to the end, press `Enter`. Paste with `Prefix` then `]`. Add `set -g mode-keys vi` if you prefer vi movement keys (`h j k l`, `w`, `b`, `/` to search). See [Copy/Scroll Mode](keybindings.md#copyscroll-mode-vi).
+
 **Q: The scroll wheel does nothing inside some full screen program. Why?**
 A: Because that program never asked for the mouse, and psmux follows tmux here. tmux only writes a mouse report to a pane whose application has enabled a mouse mode (`input_key_mouse` in `input-keys.c` returns immediately otherwise), and its default `WheelUpPane` binding treats the alternate screen only as a reason NOT to fall through to copy mode. So over a full screen program with no mouse support the wheel is a no-op in tmux, and now in psmux too. Before psmux 3.3.9 psmux forwarded the report anyway, and a program that does not parse mouse reports read the bytes as keystrokes: htop opened its `Search:` prompt and typed the report into it, and codex lost its transcript ([#598](https://github.com/psmux/psmux/issues/598)). Turn the program's own mouse support on (`:set mouse=a` in vim and neovim, `--mouse` for `less`, the mouse setting in htop) and the wheel starts working again. Over a plain shell prompt the wheel still enters copy mode and scrolls psmux's own scrollback, unchanged.
 
