@@ -43,6 +43,17 @@ pub fn conpty_preemptive_dsr_response(_writer: &mut dyn std::io::Write) {
 /// exactly like tmux's event buffer.
 struct QueuedPaneWriter {
     tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Set when the pane drops its writer.  Whatever is still queued then
+    /// (the rest of a large paste into a pane being killed or respawned) is
+    /// discarded instead of being written to a pane that no longer exists,
+    /// the way tmux frees a closing pane's bufferevent with its pending output.
+    closed: Arc<AtomicBool>,
+}
+
+impl Drop for QueuedPaneWriter {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 impl std::io::Write for QueuedPaneWriter {
@@ -61,6 +72,10 @@ impl std::io::Write for QueuedPaneWriter {
     }
 }
 
+/// Largest single write the pane writer thread builds by coalescing queued
+/// buffers.  One buffer larger than this is still written whole.
+pub(crate) const WRITE_COALESCE_MAX: usize = 64 * 1024;
+
 /// Wrap a raw PTY writer in a queue drained by a dedicated thread.
 ///
 /// The inner writer's lifetime must match the pane's: dropping the ConPTY
@@ -73,16 +88,24 @@ pub fn spawn_pane_write_queue(
     mut inner: Box<dyn std::io::Write + Send>,
 ) -> Box<dyn std::io::Write + Send> {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_rx = closed.clone();
     let _ = std::thread::Builder::new()
         .name("pane-writer".to_string())
         .spawn(move || {
             let mut broken = false;
             while let Ok(mut buf) = rx.recv() {
-                // Coalesce whatever else is already queued into one write.
-                while let Ok(more) = rx.try_recv() {
-                    buf.extend_from_slice(&more);
+                // Coalesce whatever else is already queued into one write, up
+                // to a cap: a large paste is queued in 64 KiB slices
+                // (input::PASTE_SLICE) and gluing all of them back together
+                // here would make a second full size copy of it.
+                while buf.len() < WRITE_COALESCE_MAX {
+                    match rx.try_recv() {
+                        Ok(more) => buf.extend_from_slice(&more),
+                        Err(_) => break,
+                    }
                 }
-                if broken {
+                if broken || closed_rx.load(Ordering::Acquire) {
                     continue;
                 }
                 if inner.write_all(&buf).is_err() {
@@ -93,7 +116,7 @@ pub fn spawn_pane_write_queue(
                 crate::pty_trace::mark("w", 0, &buf);
             }
         });
-    Box::new(QueuedPaneWriter { tx })
+    Box::new(QueuedPaneWriter { tx, closed })
 }
 
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
@@ -1631,8 +1654,11 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id, child_pid);
-    let mut pty_writer = pair.master.take_writer()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    // Queued like every other pane (78cebea missed this cold split path), so a
+    // paste or keys into a split that was given a command never write the
+    // pipe from the server thread.
+    let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;
