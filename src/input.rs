@@ -2944,13 +2944,17 @@ pub(crate) const PASTE_SLICE: usize = 64 * 1024;
 /// Until this change the loop below wrote 512 bytes and slept 5 ms after each
 /// slice ON THE SERVER THREAD (96f3e89, for #74's 350 line pastes), so a
 /// 132 KB paste froze every pane, every client and every CLI call for 1.4 s
-/// and a 1.3 MB one for 13.6 s, with CLI calls timing out.  The sleep never
-/// paced the pipe either: the pane writer queue already decoupled the two.
-/// The back pressure that matters is the blocking pipe write on the pane
-/// writer thread, which waits for conhost to take each slice; nothing is
-/// dropped (1.3 MB byte exact into a raw VT reader, PSReadLine and nvim
-/// measured line exact with and without the old pacing, see
-/// tests\test_large_paste_no_server_stall.ps1).
+/// and a 1.3 MB one for about 14 s, with CLI calls timing out.  The sleep
+/// never paced the pipe either: the pane writer queue already decoupled the
+/// two.  The back pressure that matters is the blocking pipe write on the
+/// pane writer thread, which waits for conhost to take each slice, and
+/// nothing is dropped without the sleep: 1.3 MB arrives byte exact in a raw
+/// VT reader (tests\test_large_paste_no_server_stall.ps1), and 132 KB and
+/// 1.3 MB pastes into PSReadLine and nvim arrive line exact.
+///
+/// The inject route (`deliver_paste_to_pane`, below build 22523 or with
+/// PSMUX_PASTE_INJECT=1) does not come through here; its one
+/// WriteConsoleInputW call still runs on the server thread.
 ///
 /// The bytes are a single ordered run, `ESC[200~`, text, `ESC[201~`, written
 /// in one call from the server thread, the only producer for this writer, so
