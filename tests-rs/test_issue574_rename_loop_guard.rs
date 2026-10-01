@@ -35,6 +35,10 @@ fn key(suffix: &str) -> String {
 #[test]
 #[cfg(windows)]
 fn the_auto_named_slot_survives_ten_rename_cycles() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     // "0" stands in for the name the auto-namer keeps re-picking.
     let slot = key("slot");
 
@@ -77,6 +81,10 @@ fn the_auto_named_slot_survives_ten_rename_cycles() {
 #[test]
 #[cfg(windows)]
 fn a_freed_slot_is_reacquirable_by_a_different_owner() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     // The release has to be visible to a DIFFERENT acquirer, not just to the
     // thread that performed the rename. Windows mutex ownership is per thread,
     // so a release that only satisfies the owning thread would still fail the
@@ -118,6 +126,10 @@ fn a_freed_slot_is_reacquirable_by_a_different_owner() {
 #[test]
 #[cfg(windows)]
 fn interleaved_sessions_each_keep_their_own_guard() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     // The loop leaves every renamed session running, so by iteration ten there
     // are ten live guards plus a free slot. Nothing may collide.
     let slot = key("multi-slot");

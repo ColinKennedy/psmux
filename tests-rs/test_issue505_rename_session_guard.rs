@@ -34,6 +34,10 @@ fn key(suffix: &str) -> String {
 #[test]
 #[cfg(windows)]
 fn rekey_frees_the_old_name() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let old = key("old-a");
     let new = key("new-a");
 
@@ -57,6 +61,10 @@ fn rekey_frees_the_old_name() {
 #[test]
 #[cfg(windows)]
 fn rekey_guards_the_new_name() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let old = key("old-b");
     let new = key("new-b");
 
@@ -81,6 +89,10 @@ fn rekey_guards_the_new_name() {
 #[test]
 #[cfg(windows)]
 fn chained_renames_free_every_intermediate_name() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let names: Vec<String> = (0..4).map(|i| key(&format!("chain-{}", i))).collect();
 
     let mut guard = crate::platform::acquire_session_mutex(&names[0]);
@@ -107,6 +119,10 @@ fn chained_renames_free_every_intermediate_name() {
 #[test]
 #[cfg(windows)]
 fn rename_back_to_the_original_name_reacquires_it() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let original = key("round-orig");
     let temp = key("round-temp");
 
@@ -127,6 +143,10 @@ fn rename_back_to_the_original_name_reacquires_it() {
 #[test]
 #[cfg(windows)]
 fn rekey_onto_the_same_name_keeps_it_guarded() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let name = key("same");
 
     let mut guard = crate::platform::acquire_session_mutex(&name);
@@ -142,6 +162,10 @@ fn rekey_onto_the_same_name_keeps_it_guarded() {
 #[test]
 #[cfg(windows)]
 fn warm_name_is_guarded_like_any_other_name() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let old = key("warm-old");
     // Namespaced warm base, so this test never contends with the real
     // `__warm__` server that may be running on this machine.
@@ -166,6 +190,10 @@ fn warm_name_is_guarded_like_any_other_name() {
 #[test]
 #[cfg(windows)]
 fn claiming_a_warm_server_guards_the_claimed_name() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let claimed = key("claimed");
 
     // A warm server reaches the claim holding the `__warm__` name (issue #459);
@@ -186,6 +214,10 @@ fn claiming_a_warm_server_guards_the_claimed_name() {
 #[test]
 #[cfg(windows)]
 fn rekey_onto_a_name_owned_elsewhere_runs_unguarded_instead_of_dying() {
+    // The mutex name carries a tag of the data directory, and other tests
+    // repoint PSMUX_DATA_DIR for a moment under this lock. Without it an
+    // acquire and its probe can run under two different tags.
+    let _env = crate::util::lock_test_env();
     let old = key("busy-old");
     let busy = key("busy-target");
 
