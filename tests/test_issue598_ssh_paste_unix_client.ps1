@@ -211,8 +211,18 @@ function Invoke-SshPaste([string]$tag, [string]$payloadFile, [string]$recMode,
     Remove-Item $recLog -EA SilentlyContinue
     $outLog = Join-Path $root "$tag.ssh.bin"
     Remove-Item $outLog -EA SilentlyContinue
+    $stopFile = Join-Path $root "$tag.stop"
+    Remove-Item $stopFile -EA SilentlyContinue
 
-    & $PSMUX -L $NS new-session -d -s $SESS "$recorder `"$recLog`" 20 $recMode" 2>&1 | Out-Null
+    # The recorder used to live a fixed 20 s, while the driver detaches at
+    # 3 s + wsl/ssh start up + 16 s.  When start up took more than about a
+    # second the pane exited first, the session ended, and the client's own
+    # teardown (ESC[?2004l among it) landed before MARK:DETACH, which [5] then
+    # reported as "bracketed paste turned off before detach" (sweep
+    # 2026-10-01_01-53-14; 2 s more before attach failed it 2 of 2).  The
+    # recording now ends on a stop file written after the driver has
+    # detached, with 90 s only as a ceiling.
+    & $PSMUX -L $NS new-session -d -s $SESS "$recorder `"$recLog`" 90 $recMode `"$stopFile`"" 2>&1 | Out-Null
     Start-Sleep -Seconds 3
     if ((& $PSMUX -L $NS list-sessions 2>&1 | Out-String) -notmatch [regex]::Escape($SESS)) {
         return @{ ok = $false; why = "session did not start" }
@@ -223,6 +233,12 @@ function Invoke-SshPaste([string]$tag, [string]$payloadFile, [string]$recMode,
     $cmd = "export PSMUX_SSH_USER='$sshUser'; R=`$(echo $b64 | base64 -d); " +
            "python3 /tmp/psmux_i598_drv.py '$hostIp' '$keyWsl' `"`$R`" '$(To-WslPath $outLog)' '$(To-WslPath $payloadFile)' 7 9 $chunkSize $chunkDelay"
     & wsl -d $distro -e bash -lc $cmd 2>&1 | Out-Null
+
+    # The driver has detached.  The pane must still be alive here, or the
+    # stream's teardown came from the session ending and not from the detach.
+    & $PSMUX -L $NS has-session -t $SESS 2>&1 | Out-Null
+    $aliveAtDetach = ($LASTEXITCODE -eq 0)
+    Set-Content -Path $stopFile -Value "stop"
 
     $deadline = (Get-Date).AddSeconds(30)
     while (-not (Test-Path $recLog) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
@@ -235,6 +251,7 @@ function Invoke-SshPaste([string]$tag, [string]$payloadFile, [string]$recMode,
     $totLine = $rl | Where-Object { $_ -like "TOTAL *" } | Select-Object -First 1
     return @{
         ok    = $true
+        alive = $aliveAtDetach
         hex   = if ($hexLine) { $hexLine.Substring(4).Trim() } else { "" }
         total = if ($totLine) { [int]$totLine.Split(' ')[1] } else { -1 }
         ssh   = if (Test-Path $outLog) { [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($outLog)) } else { "" }
@@ -302,6 +319,11 @@ Write-Host "`n[5] bracketed paste stays ON for the whole attachment" -Foreground
 # turned it off mid session the Mac would send raw text and the user would say
 # pasting stopped working, so the disable must come only after detach.
 if (-not $r2.ok -or -not $r2.ssh) { Write-Fail "no ssh output stream was captured" }
+elseif (-not $r2.alive) {
+    # Without a live pane at detach the client exited because its session
+    # ended, and its teardown says nothing about what a detach sends.
+    Write-Fail "the multi line shape's session was gone before the driver detached, so [5] cannot be judged from this stream"
+}
 else {
     $enable  = $r2.ssh.IndexOf("[?2004h")
     $disable = $r2.ssh.IndexOf("[?2004l")

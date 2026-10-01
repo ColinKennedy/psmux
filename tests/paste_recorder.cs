@@ -7,7 +7,13 @@
 // a pane child that announces bracketed paste, paints one line so the inbox
 // conhost flushes its output, then records every byte that reaches it.
 //
-//   paste_recorder.exe <logfile> <seconds> [vt|records]
+//   paste_recorder.exe <logfile> <seconds> [vt|records] [stopfile]
+//
+//     stopfile (optional) the recorder also ends, and writes its log, as soon
+//              as this file exists.  A caller whose schedule is not fixed (the
+//              ssh suite, whose start up time varies by seconds) passes a long
+//              <seconds> as a ceiling and ends the recording when it is done,
+//              so the pane never dies in the middle of the thing measured.
 //
 //     vt       (default) ENABLE_VIRTUAL_TERMINAL_INPUT on, cooked bits off,
 //              reads raw bytes with ReadFile.  This is the node / nvim shape:
@@ -83,6 +89,7 @@ internal static class PasteRecorder
         string path = argv.Length > 0 ? argv[0] : "paste_recorder.log";
         int seconds = argv.Length > 1 ? int.Parse(argv[1]) : 10;
         string mode = argv.Length > 2 ? argv[2] : "vt";
+        string stopFile = argv.Length > 3 ? argv[3] : null;
 
         // Read stdin as UTF-8, the way node and nvim do.  Without this conhost
         // converts the UTF-16 it holds down to the console's ANSI code page on
@@ -131,7 +138,12 @@ internal static class PasteRecorder
         reader.IsBackground = true;
         reader.Start();
 
-        Thread.Sleep(seconds * 1000);
+        if (string.IsNullOrEmpty(stopFile)) {
+            Thread.Sleep(seconds * 1000);
+        } else {
+            var until = DateTime.UtcNow.AddSeconds(seconds);
+            while (DateTime.UtcNow < until && !File.Exists(stopFile)) Thread.Sleep(100);
+        }
 
         byte[] got;
         lock (Gate) { got = Collected.ToArray(); }

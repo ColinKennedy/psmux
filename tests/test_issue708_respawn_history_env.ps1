@@ -130,7 +130,14 @@ function New-Pane($cmd) {
     return $id
 }
 
-$before = (& $PSMUX ls 2>&1 | Out-String)
+# The default namespace is judged on which sessions exist, not on the whole
+# `ls` line: a live session of the person running this may gain a window or
+# an attached client while the suite runs, and that is not this suite's doing.
+function Get-DefaultSessionNames {
+    $names = @(& $PSMUX ls -F '#{session_name}' 2>$null | Where-Object { $_ -and $_ -notmatch '^psmux:' } | Sort-Object)
+    return ($names -join ',')
+}
+$before = Get-DefaultSessionNames
 
 try {
     P new-session -d -s $SESS -x 120 -y 30 | Out-Null
@@ -348,8 +355,8 @@ finally {
     Remove-Item $TMP -Recurse -Force -EA SilentlyContinue
 }
 
-$after = (& $PSMUX ls 2>&1 | Out-String)
-if ($before -eq $after) { Write-Pass "default namespace untouched" } else { Write-Fail "default namespace session list changed" }
+$after = Get-DefaultSessionNames
+if ($before -eq $after) { Write-Pass "default namespace untouched" } else { Write-Fail "default namespace session list changed: before=[$before] after=[$after]" }
 
 Write-Host ""
 Write-Host "Passed: $script:TestsPassed  Failed: $script:TestsFailed"

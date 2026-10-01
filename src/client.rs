@@ -2880,9 +2880,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // Set to true when Ctrl+V Release is seen — confirms the burst was a paste.
     #[cfg(windows)]
     let mut paste_confirmed: bool = false;
-    // Buffer size at previous stage2 timeout check — for growth detection.
+    // Length of paste_pend when it last grew, and when that was.  Stage 2
+    // ends on a real gap between characters, measured from the last arrival
+    // (see stage2_paste_is_over), not on whether two loop wake ups happened
+    // to straddle one.
     #[cfg(windows)]
-    let mut paste_stage2_last_len: usize = 0;
+    let mut paste_seen_len: usize = 0;
+    #[cfg(windows)]
+    let mut paste_last_growth: Option<Instant> = None;
+    // Set when a paste went out because stage 2 ran quiet.  It keeps a late
+    // Ctrl+V Release from reading the clipboard back (that would paste the
+    // same text twice), and, unlike paste_suppress_until, it never discards
+    // characters: what arrives after a stage 2 send was never sent, so it is
+    // more of the user's input, not a duplicate of it.
+    #[cfg(windows)]
+    let mut paste_fallback_suppress_until: Option<Instant> = None;
     // Suppression window: after right-click copy, discard text key events
     // for a short period to prevent VS Code ConPTY duplicate injection.
     // Declared on every platform because the right-click handler assigns it
@@ -3563,6 +3575,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // Flush or promote chars based on how long they've been buffered.
         #[cfg(windows)]
         {
+            if paste_pend.len() != paste_seen_len {
+                paste_seen_len = paste_pend.len();
+                paste_last_growth = if paste_pend.is_empty() { None } else { Some(Instant::now()) };
+            }
             if let Some(start) = paste_pend_start {
                 let elapsed = start.elapsed();
                 if paste_confirmed {
@@ -3592,7 +3608,6 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // because IME routinely generates 3+ chars in <20ms and would
                         // trigger a false-positive 300ms delay (fixes #91).
                         paste_stage2 = true;
-                        paste_stage2_last_len = paste_pend.len();
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2: {} chars in 20ms, waiting for Ctrl+V Release", paste_pend.len()));
                         }
@@ -3601,7 +3616,6 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // containing Unicode content (em-dashes, CJK, etc.), not
                         // IME composition (which rarely exceeds a few chars).
                         paste_stage2 = true;
-                        paste_stage2_last_len = paste_pend.len();
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2 (large non-ASCII): {} chars in 20ms", paste_pend.len()));
                         }
@@ -3660,18 +3674,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         paste_pend_start = None;
                     }
                 } else if paste_stage2 && elapsed > Duration::from_millis(300) {
-                    // Stage 2 timeout — no Ctrl+V Release arrived.
-                    // Growth detection: if the buffer grew since last check,
-                    // ConPTY is still injecting characters (large paste).
-                    // Extend the window instead of splitting the paste.
-                    if paste_pend.len() > paste_stage2_last_len {
-                        paste_stage2_last_len = paste_pend.len();
-                        paste_pend_start = Some(Instant::now() - Duration::from_millis(280));
-                    } else {
-                        // Buffer stopped growing — send accumulated chars as
-                        // send-paste so the server wraps in bracketed paste.
+                    // Stage 2 timeout — no Ctrl+V Release arrived.  While
+                    // characters keep arriving the paste is still coming in
+                    // (a large paste, or one sshd's ConPTY hands over in
+                    // fragments), so it is held until it has been quiet for
+                    // PASTE_STAGE2_QUIET since its LAST character.
+                    let quiet = paste_last_growth.map_or(Duration::MAX, |t| t.elapsed());
+                    if stage2_paste_is_over(elapsed, quiet) {
+                        // Quiet: send accumulated chars as send-paste so the
+                        // server wraps them in one bracketed paste.
                         if input_log_enabled() {
-                            input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste", paste_pend.len()));
+                            input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste (quiet {} ms)", paste_pend.len(), quiet.as_millis()));
                         }
                         paste_gesture.record(&paste_pend);
                         let encoded = base64_encode(&paste_pend);
@@ -3679,11 +3692,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         paste_pend.clear();
                         paste_pend_start = None;
                         paste_stage2 = false;
-                        paste_stage2_last_len = 0;
                         // Suppress the clipboard-read fallback that fires
                         // when Ctrl+V Release arrives later (the paste was
-                        // already sent via stage2).
-                        paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                        // already sent via stage2).  Characters are NOT
+                        // suppressed: this paste went out because input went
+                        // quiet, so anything after it is input nobody has
+                        // forwarded yet.  Dropping it lost the middle of a
+                        // fragmented paste (issue #598, sweep 2026-10-01).
+                        paste_fallback_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                     }
                 }
             }
@@ -6545,7 +6561,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // already sent via stage2 timeout or Event::Paste, the
                 // suppress window prevents a redundant clipboard read.
                 let suppressed = paste_suppress_until
-                    .map_or(false, |t| Instant::now() < t);
+                    .map_or(false, |t| Instant::now() < t)
+                    || paste_fallback_suppress_until.map_or(false, |t| Instant::now() < t);
                 if !suppressed {
                     // No recent paste — read clipboard as fallback
                     if let Some(text) = read_from_system_clipboard() {
@@ -8718,6 +8735,28 @@ struct PasteHeadEvidence<'a> {
 /// keystroke.
 #[cfg(windows)]
 const PASTE_HEAD_PREFIX_HOLD: Duration = Duration::from_millis(3);
+
+/// How long a held paste must go without a new character, counted from its
+/// LAST character, before stage 2 sends it.
+///
+/// The old rule extended the 300 ms hold by 20 ms whenever the buffer had
+/// grown since the previous loop pass, so whether a gap ended the paste
+/// depended on where the client's wake ups happened to fall, not on the gap.
+/// sshd's ConPTY hands a fragmented paste over in pieces 20 to 60 ms apart
+/// (measured with tests/test_issue598_ssh_paste_unix_client.ps1), so once a
+/// paste outlasted 300 ms the first wake inside such a gap cut it in two: two
+/// bracketed pastes, the second starting mid word.
+/// 100 ms is above every inter fragment gap measured there and is paid once,
+/// at the end of a paste that has already been held for 300 ms.
+#[cfg(windows)]
+const PASTE_STAGE2_QUIET: Duration = Duration::from_millis(100);
+
+/// Stage 2 is over once the paste has been held past the 300 ms window AND
+/// nothing has arrived for [`PASTE_STAGE2_QUIET`].
+#[cfg(windows)]
+fn stage2_paste_is_over(held_for: Duration, since_last_char: Duration) -> bool {
+    held_for > Duration::from_millis(300) && since_last_char >= PASTE_STAGE2_QUIET
+}
 
 #[cfg(windows)]
 impl<'a> PasteHeadEvidence<'a> {

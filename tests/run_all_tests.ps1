@@ -1,4 +1,4 @@
-﻿# psmux Comprehensive Test Runner
+# psmux Comprehensive Test Runner
 # Runs ALL test suites sequentially with proper cleanup, captures results,
 # and produces a full report including performance metrics.
 #
@@ -338,6 +338,36 @@ function Test-UiAccess {
         $script:UiAccessState = $r
     }
     return $r
+}
+
+# ── Antivirus: harness binaries quarantined while a suite runs ───────────────
+#
+# Sweep 2026-10-01_01-53-14: Defender cloud protection issued a FastPath
+# verdict (Trojan:Win32/Bearfoos.A!ml) for three freshly compiled copies of
+# tests\injector.cs and quarantined each in the middle of its suite (588, 596,
+# 612). The suites read the untouched panes as psmux regressions, and the
+# -Only rerun passed because the verdict had moved on. Every Defender
+# detection (event 1116) inside a suite's window is now written to
+# av_detections.log and returned as "<threat> <file>" for the result line.
+$script:AvLog = Join-Path $script:RunDir "av_detections.log"
+function Get-AvDetections {
+    param([datetime]$Since, [string]$Suite)
+    $out = @()
+    try {
+        $ev = Get-WinEvent -ErrorAction Stop -FilterHashtable @{
+            LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1116; StartTime = $Since }
+    } catch { return @() }   # none found, or the log is not readable here
+    foreach ($e in ($ev | Sort-Object TimeCreated)) {
+        $name = ([regex]'Name:\s*(\S+)').Match($e.Message).Groups[1].Value
+        $path = ([regex]'(?m)^\s*Path:\s*(?:file:_)?(.+?)\s*$').Match($e.Message).Groups[1].Value
+        if (-not $path) { $path = '?' }
+        $line = "[{0}] {1}: {2} {3}" -f $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $Suite, $name, $path
+        try { [System.IO.File]::AppendAllText($script:AvLog, "$line`r`n") } catch { }
+        $out += ("{0} {1}" -f $name, (Split-Path $path -Leaf))
+    }
+    $out = @($out | Select-Object -Unique)
+    if ($out.Count) { $null = Write-Log "AV-DETECTION $Suite $($out -join ', ') (a harness file was quarantined; this suite's verdict is not about psmux)" }
+    return $out
 }
 
 # ── Desktop hygiene: console windows a suite leaves behind ───────────────────
@@ -1281,6 +1311,26 @@ function Run-TestFile {
         $uiAfter = Test-UiAccess "after $baseName"
         $uiNote = ''
         if ($uiBefore -or $uiAfter) { $uiNote = "  UI-ACCESS-DENIED(" + $(if ($uiBefore) { "before" } else { "after" }) + ")" }
+        # Same idea for antivirus: a harness exe quarantined mid suite (sweep
+        # 2026-10-01_01-53-14, three injectors) is stamped on the result line.
+        $avHits = @(Get-AvDetections -Since $auditStart -Suite $baseName)
+        if ($avHits.Count) { $uiNote += "  AV-QUARANTINED(" + ($avHits -join ', ') + ")" }
+
+        # Storage Sense (StorSvc) deletes empty directories (and stale files) in %TEMP%
+        # when the disk runs low, on its own schedule (about every 6 h 10 min on
+        # the dev box). In sweep 2026-10-01_01-53-14 it ran at 06:15:28, in the
+        # middle of test_issue600_bash_rehome, and took that suite's fixture
+        # directories, which read as three product failures. Stamp any run that
+        # overlaps a suite, so a fixture that vanished is never read as psmux.
+        try {
+            $suiteStart = (Get-Date).Add(-$sw.Elapsed).AddSeconds(-1)
+            $ss = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Storsvc/Diagnostic'; Id = 1003; StartTime = $suiteStart } -ErrorAction Stop)
+            if ($ss.Count -gt 0) {
+                $when = ($ss | ForEach-Object { $_.TimeCreated.ToString('HH:mm:ss.fff') }) -join ','
+                $uiNote += "  STORAGE-SENSE-RAN($when)"
+                [System.IO.File]::AppendAllText($suiteLog, "`r`n[RUNNER] Storage Sense (Storsvc event 1003) ran at $when while this suite ran; it deletes unheld files under %TEMP%, so a missing fixture here is external.`r`n")
+            }
+        } catch { }
 
         Write-Log ("{0,-7} {1,-45} {2}P/{3}F  exit={4}  {5}s{6}{7}" -f $status, $baseName, $passCount, $failCount, $exitCode, [math]::Round($sw.Elapsed.TotalSeconds,1), $(if ($leftovers -gt 0) { "  LEFTOVERS=$leftovers" } else { '' }), $uiNote)
 
