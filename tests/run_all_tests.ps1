@@ -1,4 +1,4 @@
-﻿# psmux Comprehensive Test Runner
+# psmux Comprehensive Test Runner
 # Runs ALL test suites sequentially with proper cleanup, captures results,
 # and produces a full report including performance metrics.
 #
@@ -1282,7 +1282,7 @@ function Run-TestFile {
         $uiNote = ''
         if ($uiBefore -or $uiAfter) { $uiNote = "  UI-ACCESS-DENIED(" + $(if ($uiBefore) { "before" } else { "after" }) + ")" }
 
-        # Storage Sense (StorSvc) deletes whatever nothing holds open in %TEMP%
+        # Storage Sense (StorSvc) deletes empty directories (and stale files) in %TEMP%
         # when the disk runs low, on its own schedule (about every 6 h 10 min on
         # the dev box). In sweep 2026-10-01_01-53-14 it ran at 06:15:28, in the
         # middle of test_issue600_bash_rehome, and took that suite's fixture

@@ -60,7 +60,9 @@ $PWSHEXE = (Get-Command pwsh -EA SilentlyContinue).Source
 
 # ---- isolated data root + fixture dirs --------------------------------------
 $TAG = [guid]::NewGuid().ToString('N').Substring(0, 8)
-# NOT under %TEMP%. Storage Sense deletes whatever nothing holds open in %TEMP%
+# NOT under %TEMP%. Storage Sense deletes EMPTY directories under %TEMP% (seen:
+# a 90 minute old canary lost dirA, dirB and 'target dir' at 12:25:17 while its
+# file survived)
 # when the disk runs low; in sweep 2026-10-01_01-53-14 it ran at 06:15:28
 # (Storsvc event 1003) between sections 2 and 3, took dirA, dirB and
 # "target dir", and every later -c fell back to the client's cwd, which read
