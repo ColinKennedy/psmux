@@ -13,10 +13,24 @@ use winapi::um::wincon::COORD;
 /// kernel transitions during high-throughput output (e.g. `cat large_file`).
 /// Using 64 KB matches Windows Terminal's approach and reduces syscall
 /// overhead for both input (mouse/keyboard) and output.
-fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
+///
+/// Both ends are created NON inheritable.  Nothing needs them inheritable:
+/// CreatePseudoConsole duplicates the conhost side ends into the conhost it
+/// starts, and pane children are created with bInheritHandles=FALSE.  What
+/// an inheritable end did do is ride along into every child the server
+/// spawns with bInheritHandles=TRUE (std::process::Command always passes
+/// TRUE: pipe-pane, run-shell, if-shell, `#()` status jobs, hooks), so a
+/// long running job child held the master ends of every pane that existed
+/// when it started, and passed them on to its own children.  Measured on
+/// cb783dc: a server with three panes held 22 inheritable pipe handles and
+/// a `pipe-pane` child (pwsh, then its PING) held copies of 6 of them.
+/// The same rule as the socket fix: every handle the server keeps must
+/// have HANDLE_FLAG_INHERIT clear.
+#[doc(hidden)]
+pub fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
     use std::os::windows::io::FromRawHandle;
     use std::ptr;
-    use winapi::shared::minwindef::TRUE;
+    use winapi::shared::minwindef::FALSE;
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
     use winapi::um::namedpipeapi::CreatePipe;
@@ -25,7 +39,7 @@ fn create_pipe_with_buffer(size: u32) -> anyhow::Result<(FileDescriptor, FileDes
     let mut sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
-        bInheritHandle: TRUE as _,
+        bInheritHandle: FALSE as _,
     };
     let mut read: HANDLE = INVALID_HANDLE_VALUE;
     let mut write: HANDLE = INVALID_HANDLE_VALUE;

@@ -4422,6 +4422,10 @@ mod tests_issue495_direct_spawn_cwd_hook;
 #[path = "../tests-rs/test_pane_writer_queue.rs"]
 mod tests_pane_writer_queue;
 
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_pty_pipes_not_inheritable.rs"]
+mod tests_pty_pipes_not_inheritable;
+
 #[cfg(test)]
 #[path = "../tests-rs/test_inject_paste_queue.rs"]
 mod tests_inject_paste_queue;
