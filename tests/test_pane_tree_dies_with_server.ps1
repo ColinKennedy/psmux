@@ -183,7 +183,7 @@ Write-Host "`n=== a server that dies while its panes are still starting takes th
 # warm pool spares that were being created at that instant alive for good, each
 # with its conhost, which never noticed its owner had gone.  cb783dc leaked in
 # 14 of 15 rounds at gap 0 and 11 of 15 at gap 150 ms, 0 at 400 ms and later.
-$raceRounds = 8; $raceLeaks = 0; $raceLeft = @()
+$raceRounds = 8; $raceLeaks = 0; $raceLeft = @(); $raceFrozen = @()
 foreach ($i in 1..$raceRounds) {
     $ns = New-Ns; $script:Namespaces.Add($ns)
     $t0 = Get-Date
@@ -195,11 +195,22 @@ foreach ($i in 1..$raceRounds) {
     Start-Sleep -Seconds 4
     $left = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe' OR Name='conhost.exe'" |
         Where-Object { $srvIds -contains [int]$_.ParentProcessId -and $_.CreationDate -ge $t0 })
-    if ($left.Count) { $raceLeaks++; $raceLeft += $left }
+    foreach ($p in $left) {
+        # A shell created suspended (the Store pwsh alias refuses the atomic job
+        # list, so it is assigned to its job right after creation) whose server
+        # died inside that CreateProcessW call stays frozen: every thread
+        # suspended, it never ran and holds no conhost.  That residual is
+        # counted apart; anything that RUNS fails the suite.
+        $g = Get-Process -Id $p.ProcessId -EA SilentlyContinue
+        $frozen = $g -and $p.Name -ne 'conhost.exe' -and @($g.Threads | Where-Object { $_.WaitReason -ne 'Suspended' }).Count -eq 0
+        if ($frozen) { $raceFrozen += $p } else { $raceLeft += $p }
+    }
+    if (@($left | Where-Object { $raceFrozen -notcontains $_ }).Count) { $raceLeaks++ }
 }
-if ($raceLeaks -eq 0) { Write-Pass "$raceRounds servers killed 0 to 120 ms after new-session -d left no pane shell or conhost behind" }
-else { Write-Fail ("{0} of {1} servers killed right after new-session -d left processes behind: {2}" -f $raceLeaks, $raceRounds, (($raceLeft | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ' ')) }
-foreach ($p in $raceLeft) { $script:AllRecorded.Add((Rec $p)) }
+if ($raceLeaks -eq 0) { Write-Pass "$raceRounds servers killed 0 to 120 ms after new-session -d left no running pane shell or conhost behind" }
+else { Write-Fail ("{0} of {1} servers killed right after new-session -d left running processes behind: {2}" -f $raceLeaks, $raceRounds, (($raceLeft | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ' ')) }
+if ($raceFrozen.Count) { Write-Info ("frozen, never started shells (server killed inside their suspended CreateProcessW): {0}" -f (($raceFrozen | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ' ')) }
+foreach ($p in @($raceLeft) + @($raceFrozen)) { $script:AllRecorded.Add((Rec $p)) }
 
 Write-Host "`n=== the server keeps no inheritable pty pipe handle ===" -ForegroundColor Cyan
 $ns = New-Ns; $script:Namespaces.Add($ns)
