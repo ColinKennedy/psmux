@@ -67,9 +67,12 @@ pub struct WinChild {
 ///
 /// Residual, measured: an image that refuses the job list (the alias) is
 /// created suspended, and a server killed while that CreateProcessW is in the
-/// kernel leaves the new shell suspended and outside the job (2 of 25 rounds
-/// when the server is killed 150 ms after `new-session -d`).  Such a shell
-/// never ran and holds no conhost; the test runner's orphan reaper ends it.
+/// kernel leaves the new shell suspended and outside the job (0 to 4 of 20
+/// rounds when the server is killed 0 to 150 ms after `new-session -d`, where
+/// cb783dc left a RUNNING shell and its conhost in 11 to 14 of 15).  Such a
+/// shell never ran and holds no conhost; the test runner's orphan reaper ends
+/// it.  Launching the alias's real image path would close it, at the price of
+/// starting the Store pwsh outside its package activation.
 /// `PSMUX_NO_PANE_JOB=1` skips the job, for diagnosis.
 #[derive(Debug)]
 pub(crate) struct PaneJob(OwnedHandle);

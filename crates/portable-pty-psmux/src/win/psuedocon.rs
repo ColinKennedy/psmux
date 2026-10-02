@@ -29,6 +29,14 @@ pub type HPCON = HANDLE;
 static JOBLIST_REFUSED: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
 
 fn joblist_refused(exe: &[u16]) -> bool {
+    // An app execution alias (a WindowsApps path, as the Store pwsh is
+    // launched) is known to refuse: skip the failing CreateProcessW that would
+    // otherwise cost the first spawn of every server.
+    let lower: Vec<u16> = exe.iter().map(|&c| if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }).collect();
+    let needle: Vec<u16> = "\\windowsapps\\".encode_utf16().collect();
+    if lower.windows(needle.len()).any(|w| w == needle.as_slice()) {
+        return true;
+    }
     JOBLIST_REFUSED.lock().map(|v| v.iter().any(|e| e.as_slice() == exe)).unwrap_or(false)
 }
 
