@@ -898,6 +898,15 @@ if ($script:AuditProtectHwnd.Count -gt 0) {
 # window on the desktop.
 $env:PSMUX_TEST_RUNNER = '1'
 
+# Every pane shell a suite starts loads PSReadLine, and by default PSReadLine
+# reads and writes the owner's ConsoleHost_history.txt: every line a suite types
+# landed in the owner's real history, and an Up arrow (or a stray ESC [ A) then
+# Enter in a test pane would recall and RUN whatever the owner typed last.
+# psmux honours PSMUX_PSREADLINE_HISTORY in its pane init, so the run gets a
+# throwaway history file of its own.
+$env:PSMUX_PSREADLINE_HISTORY = Join-Path $script:RunDir "psreadline_history.txt"
+$script:RunStartedAt = Get-Date
+
 $script:CurrentSuiteFile = Join-Path $script:RunDir "current_suite.txt"
 [System.IO.File]::WriteAllText($script:CurrentSuiteFile, '<starting>')
 $script:SpawnTrace = Join-Path $script:RunDir "spawn_trace.log"
@@ -1040,6 +1049,110 @@ function Show-ProgressDashboard {
     }
 }
 
+# ── Orphaned pane trees ───────────────────────────────────────────────────────
+# A pane shell is a pwsh/powershell whose command line carries psmux's pane init
+# ("PredictionSource None").  An ORPHAN is one whose parent (its server) is gone:
+# the parent pid is not running, or it now belongs to a process created later
+# (pid reuse).  Its tree is every descendant by PID, each link checked by
+# creation time (parent created no later than child), so the walk never wanders
+# into an unrelated process that inherited a recycled pid.
+#
+# Never reaped, only logged as KEPT: a tree containing a psmux/tmux/pmux server
+# (a detached server started from a pane is a daemon by design), Windows
+# Terminal, Claude Code, an editor host, or any process of this runner's own
+# ancestry.  Everything is by PID with the start time re-checked at kill time.
+$script:OrphanKeepNames = '^(psmux|tmux|pmux|WindowsTerminal|OpenConsole|claude|node|Code|wezterm-gui|alacritty)\.exe$'
+
+function Get-ProcSnapshot {
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $byId = @{}; $kids = @{}
+    foreach ($p in $all) {
+        $byId[[int]$p.ProcessId] = $p
+        $pp = [int]$p.ParentProcessId
+        if (-not $kids.ContainsKey($pp)) { $kids[$pp] = New-Object System.Collections.Generic.List[object] }
+        $kids[$pp].Add($p)
+    }
+    $protect = @{}
+    $id = $PID
+    while ($byId.ContainsKey($id) -and -not $protect.ContainsKey($id)) {
+        $protect[$id] = $true
+        $par = [int]$byId[$id].ParentProcessId
+        if (-not $byId.ContainsKey($par) -or $byId[$par].CreationDate -gt $byId[$id].CreationDate) { break }
+        $id = $par
+    }
+    [pscustomobject]@{ All = $all; ById = $byId; Kids = $kids; Protect = $protect }
+}
+
+function New-ProcRec($p) {
+    [pscustomobject]@{ Pid = [int]$p.ProcessId; Name = $p.Name; Start = $p.CreationDate; ParentPid = [int]$p.ParentProcessId }
+}
+
+# The root and every descendant, as records.  Returns $null when the tree holds
+# a process that must never be touched (see OrphanKeepNames) or one of the
+# runner's own ancestry.
+function Get-ProcTreeRecs($snap, [int]$root) {
+    $r = $snap.ById[$root]; if (-not $r) { return @() }
+    $out = New-Object System.Collections.Generic.List[object]
+    $q = [System.Collections.Queue]::new(); $q.Enqueue($r)
+    while ($q.Count) {
+        $p = $q.Dequeue()
+        if ($snap.Protect.ContainsKey([int]$p.ProcessId) -or $p.Name -match $script:OrphanKeepNames) { return $null }
+        $out.Add((New-ProcRec $p))
+        if ($snap.Kids.ContainsKey([int]$p.ProcessId)) {
+            foreach ($c in $snap.Kids[[int]$p.ProcessId]) {
+                if ([int]$c.ProcessId -ne [int]$p.ProcessId -and $c.CreationDate -ge $p.CreationDate) { $q.Enqueue($c) }
+            }
+        }
+    }
+    , $out.ToArray()
+}
+
+function Get-OrphanPaneTrees {
+    param([datetime]$Since = [datetime]::MinValue)
+    $snap = Get-ProcSnapshot
+    $res = New-Object System.Collections.Generic.List[object]
+    foreach ($p in $snap.All) {
+        if ($p.Name -notmatch '^(pwsh|powershell)\.exe$') { continue }
+        if (-not $p.CommandLine -or $p.CommandLine -notmatch 'PredictionSource None') { continue }
+        if ($p.CreationDate -lt $Since) { continue }
+        $par = $snap.ById[[int]$p.ParentProcessId]
+        if ($par -and $par.CreationDate -le $p.CreationDate) { continue }   # parent alive: not an orphan
+        $tree = Get-ProcTreeRecs $snap ([int]$p.ProcessId)
+        $res.Add([pscustomobject]@{ Shell = (New-ProcRec $p); Tree = $tree; Keep = ($null -eq $tree) })
+    }
+    $res.ToArray()
+}
+
+function Stop-ProcRecs($recs) {
+    $n = 0
+    foreach ($r in $recs) {
+        $g = Get-Process -Id $r.Pid -ErrorAction SilentlyContinue
+        if (-not $g) { continue }
+        $same = $false; try { $same = [Math]::Abs(($g.StartTime - $r.Start).TotalSeconds) -lt 2 } catch { }
+        if (-not $same) { continue }   # the pid was reused: never touch the newcomer
+        Stop-Process -Id $r.Pid -Force -ErrorAction SilentlyContinue; $n++
+    }
+    $n
+}
+
+# Log and reap orphaned pane trees.  $Since limits it to processes created at or
+# after that time (the per suite sweep uses the run start; the pre sweep audit
+# uses no limit).  PSMUX_RUN_KEEP_ORPHANS=1 logs without reaping.
+function Invoke-OrphanPaneReap {
+    param([string]$Phase, [datetime]$Since = [datetime]::MinValue)
+    $orph = @(Get-OrphanPaneTrees -Since $Since)
+    if (-not $orph.Count) { return 0 }
+    $reaped = 0
+    foreach ($o in $orph) {
+        $desc = if ($o.Keep) { "KEPT (tree holds a server, terminal, agent or runner process)" } else { ($o.Tree | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Pid }) -join ' ' }
+        $line = "ORPHAN-PANE {0} shell pid={1} started={2} parent={3}(dead) tree: {4}" -f $Phase, $o.Shell.Pid, $o.Shell.Start.ToString('MM-dd HH:mm:ss'), $o.Shell.ParentPid, $desc
+        Write-Log $line; Write-KillNote $line
+        if (-not $o.Keep -and $env:PSMUX_RUN_KEEP_ORPHANS -ne '1') { $reaped += Stop-ProcRecs $o.Tree }
+    }
+    Write-KillNote ("ORPHAN-PANE {0} found {1} orphaned pane tree(s), stopped {2} process(es) by pid" -f $Phase, $orph.Count, $reaped)
+    $reaped
+}
+
 function Clean-Server {
     # If no psmux processes exist there is nothing to tear down; just clear files.
     $alive = @(Get-Process psmux -ErrorAction SilentlyContinue)
@@ -1063,13 +1176,23 @@ function Clean-Server {
         # Record the children of every surviving server BY PID before the kill,
         # and stop them afterwards. Only direct children of a psmux server, and
         # only pwsh/cmd/conhost images, so nothing unrelated is ever touched.
+        # The DESCENDANTS of each pane shell are recorded too (sweep 2026-10-02
+        # ended with pwsh -> htop -> pstop trees whose pstop each burned half a
+        # core), each link checked by creation time.  A tree that holds a
+        # psmux server, a terminal or an agent process is left alone.
         $orphanCandidates = @()
+        $treeRecs = @()
+        $snap = Get-ProcSnapshot
         foreach ($srv in @(Get-Process psmux -ErrorAction SilentlyContinue)) {
-            try {
-                $orphanCandidates += @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($srv.Id)" -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -match '^(pwsh|powershell|cmd|conhost)\.exe$' } |
-                    ForEach-Object { $_.ProcessId })
-            } catch {}
+            $srvP = $snap.ById[$srv.Id]
+            if (-not $srvP -or -not $snap.Kids.ContainsKey($srv.Id)) { continue }
+            foreach ($c in $snap.Kids[$srv.Id]) {
+                if ($c.Name -notmatch '^(pwsh|powershell|cmd|conhost)\.exe$') { continue }
+                if ($c.CreationDate -lt $srvP.CreationDate) { continue }
+                $orphanCandidates += [int]$c.ProcessId
+                $t = Get-ProcTreeRecs $snap ([int]$c.ProcessId)
+                if ($null -ne $t) { $treeRecs += $t }
+            }
         }
         # Force-kill any lingering processes, then poll (up to 3s) instead of fixed sleeps
         Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -1079,7 +1202,8 @@ function Clean-Server {
                 Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
             }
         }
-        if ($orphanCandidates.Count -gt 0) { Write-KillNote ("CLEAN-SERVER reaped {0} pane shell(s) of the killed server(s) by pid: {1}" -f $orphanCandidates.Count, ($orphanCandidates -join ',')) }
+        $stoppedTree = Stop-ProcRecs $treeRecs
+        if ($orphanCandidates.Count -gt 0) { Write-KillNote ("CLEAN-SERVER reaped {0} pane shell(s) of the killed server(s) by pid: {1}; {2} process(es) of their trees were still alive and stopped: {3}" -f $orphanCandidates.Count, ($orphanCandidates -join ','), $stoppedTree, (($treeRecs | Where-Object { $orphanCandidates -notcontains $_.Pid } | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Pid }) -join ',')) }
         $deadline = [DateTime]::Now.AddSeconds(3)
         while ([DateTime]::Now -lt $deadline) {
             if (-not (Get-Process psmux -ErrorAction SilentlyContinue)) { break }
@@ -1096,6 +1220,13 @@ function Clean-Server {
     Remove-Item "$env:USERPROFILE\.psmux.conf" -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:USERPROFILE\.psmuxrc" -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $script:RunDir "ks_*.tmp") -Force -ErrorAction SilentlyContinue
+    # The reap above only sees the panes of servers still ALIVE when it runs.
+    # A pane whose server had already died (killed by the suite itself by pid,
+    # crashed, or ended in a namespace the by-name kill raced) was invisible to
+    # it: sweep 2026-10-02 ended with 51 idle pane shells nobody reaped.  So
+    # every orphaned pane tree created since this run started is reaped here,
+    # whether or not a psmux process was alive.
+    if ($script:RunStartedAt) { [void](Invoke-OrphanPaneReap -Phase "before-suite" -Since $script:RunStartedAt) }
 }
 
 function Run-TestFile {
@@ -1385,6 +1516,20 @@ Write-Host "  Categories: " -ForegroundColor DarkGray -NoNewline
 $catNames = ($catGroups.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "{0}({1})" -f $_.Key,$_.Value })
 Write-Host ($catNames -join "  ") -ForegroundColor DarkGray
 Write-Host ""
+
+# ── Pre sweep audit: orphaned pane trees left by EARLIER runs ──
+# Sweep 2026-10-02 failed five perf gates because 48 pstop processes left by
+# earlier standalone runs were spinning.  Before the first suite, every orphaned
+# pane tree on the machine (any age) is logged, and reaped by PID unless it holds
+# a server, a terminal, an agent or this runner (see Get-ProcTreeRecs).
+$preOrphans = @(Get-OrphanPaneTrees)
+if ($preOrphans.Count) {
+    Write-Host ("  Pre sweep audit: {0} orphaned pane tree(s) from earlier runs" -f $preOrphans.Count) -ForegroundColor Yellow
+    $preReaped = Invoke-OrphanPaneReap -Phase "pre-sweep"
+    Write-Log ("PRE-SWEEP orphaned pane trees: {0}, processes stopped: {1}" -f $preOrphans.Count, $preReaped)
+} else {
+    Write-Log "PRE-SWEEP orphaned pane trees: 0"
+}
 
 # ── Run each test ──
 $suiteIndex = 0
