@@ -259,6 +259,7 @@ for ($i = 1; $i -le $N; $i++) {
 Add-PerfLoadSample "end" | Out-Null
 $loadSummary = Get-PerfLoadSummary
 $wasQuiet = Test-PerfMachineQuiet $QuietLoadPct
+$topTxt = Get-PerfLoadTopText; if ($topTxt) { Write-Host "[INFO] $topTxt" -ForegroundColor Cyan }
 
 $bareMed = Median $bare
 $muxMed  = Median $mux

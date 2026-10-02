@@ -2269,6 +2269,17 @@ const PSRL_PRED_RESTORE: &str = concat!(
     "}",
 );
 
+/// Opt in history redirect: when `PSMUX_PSREADLINE_HISTORY` names a file,
+/// the pane's PSReadLine reads and writes its history there instead of the
+/// user's ConsoleHost_history.txt.  The test runner sets it so a suite's
+/// keystrokes never land in the owner's history and a recalled line (Up,
+/// a stray `ESC [ A`) can only ever be a line some test typed.  PSReadLine
+/// loads history at the first prompt, after this init has run.  Unset (the
+/// normal case) it is a single `if` that does nothing.
+const PSRL_HISTORY_REDIRECT: &str = concat!(
+    "if ($env:PSMUX_PSREADLINE_HISTORY) { try { Set-PSReadLineOption -HistorySavePath $env:PSMUX_PSREADLINE_HISTORY -ErrorAction Stop } catch {} }",
+);
+
 /// Source all four PowerShell profile scripts in the standard order.
 /// Used with -NoProfile to give us control over execution order — we disable
 /// PSReadLine predictions BEFORE the profile loads (preventing the
@@ -2338,7 +2349,10 @@ fn build_psrl_init(env_shim: bool, allow_predictions: bool) -> String {
     } else {
         (PSRL_FIX, PSRL_FIX)
     };
-    let mut s = format!("{}; {}; {}; {}", pre_profile, PROFILE_SOURCE, post_profile, CWD_SYNC);
+    let mut s = format!(
+        "{}; {}; {}; {}; {}; {}",
+        PSRL_HISTORY_REDIRECT, pre_profile, PROFILE_SOURCE, post_profile, PSRL_HISTORY_REDIRECT, CWD_SYNC
+    );
     if env_shim {
         s.push_str("; ");
         s.push_str(ENV_SHIM_PS);
@@ -2352,7 +2366,7 @@ fn build_psrl_init(env_shim: bool, allow_predictions: bool) -> String {
 /// `cd` (#495) — it is unrelated to profiles and must not be dropped just
 /// because profile sourcing is skipped.
 fn build_psrl_init_noprofile(env_shim: bool) -> String {
-    let mut s = format!("{}; {}", PSRL_FIX, CWD_SYNC);
+    let mut s = format!("{}; {}; {}", PSRL_HISTORY_REDIRECT, PSRL_FIX, CWD_SYNC);
     if env_shim {
         s.push_str("; ");
         s.push_str(ENV_SHIM_PS);
@@ -4421,6 +4435,18 @@ mod tests_issue495_direct_spawn_cwd_hook;
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_writer_queue.rs"]
 mod tests_pane_writer_queue;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_psrl_history_redirect.rs"]
+mod tests_psrl_history_redirect;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_pane_job.rs"]
+mod tests_pane_job;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_pty_pipes_not_inheritable.rs"]
+mod tests_pty_pipes_not_inheritable;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_inject_paste_queue.rs"]

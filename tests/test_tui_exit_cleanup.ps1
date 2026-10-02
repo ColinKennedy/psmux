@@ -251,7 +251,13 @@ if ($pstopPath) {
     # Ctrl+C (sets ctrl_c_at) then immediately force-kill
     psmux send-keys -t tui_pstop_fk C-c
     Start-Sleep -Milliseconds 200
-    Get-Process -Name "pstop" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+    # Force-kill THIS pane's pstop by PID.  A by-name kill here used to end
+    # every pstop on the machine, the user's own included.
+    $fkPane = psmux display-message -p -t tui_pstop_fk '#{pane_pid}' 2>$null
+    if ($fkPane -match '^\d+$') {
+        Get-CimInstance Win32_Process -Filter "ParentProcessId=$fkPane AND Name='pstop.exe'" -ErrorAction SilentlyContinue |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
     
     # Wait for 2s timeout + buffer
     Start-Sleep -Milliseconds 750

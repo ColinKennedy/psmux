@@ -17,13 +17,36 @@ use winapi::shared::winerror::{HRESULT, S_OK};
 use winapi::um::handleapi::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::winbase::{
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW,
 };
 use winapi::um::wincon::COORD;
 use winapi::um::winnt::HANDLE;
 
 #[allow(clippy::upper_case_acronyms)]
 pub type HPCON = HANDLE;
+
+/// Images for which CreateProcessW refused a job list (see spawn_command).
+static JOBLIST_REFUSED: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
+
+fn joblist_refused(exe: &[u16]) -> bool {
+    // An app execution alias (a WindowsApps path, as the Store pwsh is
+    // launched) is known to refuse: skip the failing CreateProcessW that would
+    // otherwise cost the first spawn of every server.
+    let lower: Vec<u16> = exe.iter().map(|&c| if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }).collect();
+    let needle: Vec<u16> = "\\windowsapps\\".encode_utf16().collect();
+    if lower.windows(needle.len()).any(|w| w == needle.as_slice()) {
+        return true;
+    }
+    JOBLIST_REFUSED.lock().map(|v| v.iter().any(|e| e.as_slice() == exe)).unwrap_or(false)
+}
+
+fn remember_joblist_refused(exe: &[u16]) {
+    if let Ok(mut v) = JOBLIST_REFUSED.lock() {
+        if !v.iter().any(|e| e.as_slice() == exe) {
+            v.push(exe.to_vec());
+        }
+    }
+}
 
 /// Deliberately absent from base_flags() (see the doc comment there): only the
 /// regression test asserting that absence references it, hence test-gated.
@@ -415,8 +438,19 @@ impl PsuedoCon {
         // regardless of dwFlags.  bInheritHandles=FALSE prevents leaking
         // any other inheritable handles.
 
-        let mut attrs = ProcThreadAttributeList::with_capacity(1)?;
+        // The pane process is created INSIDE a job of its own (see PaneJob),
+        // atomically: no window exists in which it, or anything it starts,
+        // lives outside that job.
+        let mut job = super::PaneJob::create();
+        let mut attrs = ProcThreadAttributeList::with_capacity(2)?;
         attrs.set_pty(self.con)?;
+        if let Some(j) = job.as_ref() {
+            if attrs.set_job(j.handle()).is_err() {
+                job = None;
+                attrs = ProcThreadAttributeList::with_capacity(1)?;
+                attrs.set_pty(self.con)?;
+            }
+        }
         si.lpAttributeList = attrs.as_mut_ptr();
 
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
@@ -443,23 +477,69 @@ impl PsuedoCon {
         // (issue #686).
         let _console_guard = crate::ConPtySpawnGuard::acquire();
 
-        let res = unsafe {
+        let exe_key = exe.clone();
+        let mut env_block = cmd.environment_block();
+        let mut create = |si: &mut STARTUPINFOEXW, pi: &mut PROCESS_INFORMATION, extra: DWORD| unsafe {
             CreateProcessW(
                 exe.as_mut_slice().as_mut_ptr(),
                 cmdline.as_mut_slice().as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                cmd.environment_block().as_mut_slice().as_mut_ptr() as *mut _,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | extra,
+                env_block.as_mut_slice().as_mut_ptr() as *mut _,
                 cwd.as_ref()
                     .map(|c| c.as_slice().as_ptr())
                     .unwrap_or(ptr::null()),
                 &mut si.StartupInfo,
-                &mut pi,
+                pi,
             )
         };
-        let create_err = IoError::last_os_error();
+        // Three ways in, best first:
+        //  1. the job list attribute: the process is born in its pane job.
+        //  2. Windows refuses a job list for some images with
+        //     ERROR_ACCESS_DENIED, measured for the WindowsApps execution alias
+        //     of the Store pwsh (the default shell) when the caller is a
+        //     detached process like the server; the real image path and
+        //     cmd.exe are accepted.  Such an image is created suspended,
+        //     assigned to the job that already exists, then resumed, so the
+        //     window outside the job is the one assign call.  The refusal is
+        //     remembered per image, so it is paid once per process.
+        //  3. Without a job, exactly as before.
+        let mut res = 0;
+        let mut create_err = IoError::from_raw_os_error(0);
+        if job.is_some() && !joblist_refused(&exe_key) {
+            res = create(&mut si, &mut pi, 0);
+            create_err = IoError::last_os_error();
+            if res == 0 {
+                remember_joblist_refused(&exe_key);
+                // The refused attempt leaves THAT job unusable for the assign
+                // below (measured: the first spawn of every server failed to
+                // assign), so the suspended path gets a fresh one.
+                job = super::PaneJob::create();
+            }
+        }
+        let mut assign_after = false;
+        if res == 0 {
+            attrs = ProcThreadAttributeList::with_capacity(1)?;
+            attrs.set_pty(self.con)?;
+            si.lpAttributeList = attrs.as_mut_ptr();
+            let suspended = job.is_some();
+            res = create(&mut si, &mut pi, if suspended { CREATE_SUSPENDED } else { 0 });
+            create_err = IoError::last_os_error();
+            assign_after = suspended && res != 0;
+            if res == 0 && suspended {
+                job = None;
+                res = create(&mut si, &mut pi, 0);
+                create_err = IoError::last_os_error();
+            }
+        }
+        if assign_after {
+            if !job.as_ref().map_or(false, |j| j.assign(pi.hProcess)) {
+                job = None;
+            }
+            unsafe { ResumeThread(pi.hThread) };
+        }
         // The std handle slots are restored when `_console_guard` drops, by the
         // last spawn still inside the console state.
         if res == 0 {
@@ -481,6 +561,7 @@ impl PsuedoCon {
 
         Ok(WinChild {
             proc: Mutex::new(proc),
+            job,
         })
     }
 }

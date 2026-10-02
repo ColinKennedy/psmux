@@ -24,7 +24,118 @@ use filedescriptor::OwnedHandle;
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,
+    /// The pane process's own job; see [`PaneJob`].
+    #[allow(dead_code)]
+    job: Option<PaneJob>,
 }
+
+/// A job object holding one pane's process and everything it starts, armed
+/// with KILL_ON_JOB_CLOSE while psmux holds it.
+///
+/// tmux closes a pane's pty master when the pane or the server goes away, so
+/// the pane's processes get SIGHUP (window.c window_pane_destroy, server exit).
+/// On Windows the pseudoconsole's conhost plays that part when its owner
+/// closes it or exits.  It does not when the owner dies while that conhost is
+/// still starting: measured on cb783dc, a server TerminateProcess'd 0 to 150 ms
+/// after `new-session -d` left the warm pool's freshly spawned shells alive,
+/// each with its conhost, in 25 of 30 rounds (a sweep collected 51 of them).
+/// The handle lives in the server, so when the server ends in ANY way the
+/// kernel closes it and ends every process still in the job, and the conhost,
+/// left without clients, exits on its own.
+///
+/// A job of its own per pane that the process enters at creation (the job list
+/// attribute, or for an image that refuses it, created suspended and assigned
+/// before it runs), rather than one inherited from the server: measured, a
+/// server's children are born outside its job (the server's own job allows
+/// silent breakaway) and a Store packaged shell did not reliably stay in an
+/// inherited job, so a server wide job let pane processes escape.  Nor is the
+/// conhost put in a job: a conhost the kernel terminates skips the CTRL_CLOSE
+/// round it does when it exits on its own, and a client that ignores console
+/// errors (`ping -t`) then ran on.
+///
+/// BREAKAWAY_OK lets a process the pane starts leave on purpose
+/// (CREATE_BREAKAWAY_FROM_JOB): a psmux server started from inside a pane does,
+/// and survives, as `tmux new -d` inside tmux does.
+///
+/// When psmux lets go of a pane (its `WinChild` is dropped: the pane is
+/// killed, exits, or a warm spare is retired), the handle closes ARMED, so
+/// whatever is left of that pane's tree ends with it, as closing a pty master
+/// hangs up its process group.  kill-pane, kill-window, kill-session and
+/// kill-server already ended the whole tree (measured on cb783dc, a program
+/// the pane started with Start-Process included); this makes a pane psmux
+/// drops in any other way behave the same.
+///
+/// Residual, measured: an image that refuses the job list (the alias) is
+/// created suspended, and a server killed while that CreateProcessW is in the
+/// kernel leaves the new shell suspended and outside the job (0 to 4 of 20
+/// rounds when the server is killed 0 to 150 ms after `new-session -d`, where
+/// cb783dc left a RUNNING shell and its conhost in 11 to 14 of 15).  Such a
+/// shell never ran and holds no conhost; the test runner's orphan reaper ends
+/// it.  Launching the alias's real image path would close it, at the price of
+/// starting the Store pwsh outside its package activation.
+/// `PSMUX_NO_PANE_JOB=1` skips the job, for diagnosis.
+#[derive(Debug)]
+pub(crate) struct PaneJob(OwnedHandle);
+
+extern "system" {
+    fn CreateJobObjectW(attrs: *mut winapi::shared::minwindef::LPVOID, name: *const u16) -> winapi::um::winnt::HANDLE;
+    fn SetInformationJobObject(job: winapi::um::winnt::HANDLE, class: i32, info: winapi::shared::minwindef::LPVOID, len: DWORD) -> i32;
+    fn AssignProcessToJobObject(job: winapi::um::winnt::HANDLE, process: winapi::um::winnt::HANDLE) -> i32;
+}
+
+/// JobObjectExtendedLimitInformation.
+const JOB_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+pub(crate) const PANE_JOB_ARMED: DWORD =
+    winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+
+fn set_job_limits(job: winapi::um::winnt::HANDLE, flags: DWORD) -> bool {
+    let mut info: winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = flags;
+    unsafe {
+        SetInformationJobObject(
+            job,
+            JOB_EXTENDED_LIMIT_INFORMATION_CLASS,
+            &mut info as *mut _ as winapi::shared::minwindef::LPVOID,
+            std::mem::size_of::<winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as DWORD,
+        ) != 0
+    }
+}
+
+impl PaneJob {
+    /// A new, empty, armed job for one pane process, which enters it at
+    /// creation (see spawn_command).  `None` when the job could not be made;
+    /// the process then runs as it did before.
+    pub(crate) fn create() -> Option<PaneJob> {
+        if std::env::var_os("PSMUX_NO_PANE_JOB").map_or(false, |v| v == "1") {
+            return None;
+        }
+        unsafe {
+            // NULL security attributes: the handle is not inheritable, so no
+            // child can keep the job open after the server is gone.
+            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let owned = <OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(job as _);
+            if !set_job_limits(job, PANE_JOB_ARMED) {
+                return None;
+            }
+            Some(PaneJob(owned))
+        }
+    }
+
+    pub(crate) fn handle(&self) -> winapi::um::winnt::HANDLE {
+        self.0.as_raw_handle() as _
+    }
+
+    /// Put a process created suspended into the job (the image refused the
+    /// job list attribute).
+    pub(crate) fn assign(&self, process: winapi::um::winnt::HANDLE) -> bool {
+        unsafe { AssignProcessToJobObject(self.handle(), process) != 0 }
+    }
+}
+
+
 
 impl WinChild {
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
@@ -187,6 +298,7 @@ mod tests_issue446 {
         (
             WinChild {
                 proc: Mutex::new(proc),
+                job: None,
             },
             child,
         )
