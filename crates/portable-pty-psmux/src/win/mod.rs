@@ -106,7 +106,7 @@ impl PaneJob {
     /// creation (see spawn_command).  `None` when the job could not be made;
     /// the process then runs as it did before.
     pub(crate) fn create() -> Option<PaneJob> {
-        if std::env::var_os("PSMUX_NO_PANE_JOB").map_or(false, |v| v == "1") {
+        if std::env::var_os("PSMUX_NO_PANE_JOB").is_some_and(|v| v == "1") {
             return None;
         }
         unsafe {

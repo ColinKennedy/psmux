@@ -535,7 +535,7 @@ impl PsuedoCon {
             }
         }
         if assign_after {
-            if !job.as_ref().map_or(false, |j| j.assign(pi.hProcess)) {
+            if !job.as_ref().is_some_and(|j| j.assign(pi.hProcess)) {
                 job = None;
             }
             unsafe { ResumeThread(pi.hThread) };
