@@ -5,9 +5,11 @@
 # wp->fd; server.c server_loop/server_exit tears every pane down), so a shell
 # and what it runs die with it.  On Windows the pane's pseudoconsole conhost
 # plays the pty: when its owner goes away, conhost ends every client attached
-# to it.  What must NOT die is anything deliberately detached from the pane:
-# a psmux server started from inside a pane (`tmux new -d` inside tmux keeps
-# running) and a program the pane started in its own console (Start-Process).
+# to it.  What must NOT die with the server is what a pane deliberately
+# detaches: a psmux server started from inside a pane (`tmux new -d` inside tmux
+# keeps running) and a program it started with Start-Process (ShellExecute), both
+# of which leave the pane's job.  (kill-server itself still ends the latter
+# through psmux's descendant reap, as it did before.)
 #
 # Background: a sweep on 2026-10-02 ended with 48 pwsh -> htop -> pstop trees
 # and 51 idle pane shells alive with their servers dead.  None of the endings
@@ -175,6 +177,30 @@ foreach ($pl in $payloads.Keys) {
     }
 }
 
+Write-Host "`n=== a server that dies while its panes are still starting takes them along ===" -ForegroundColor Cyan
+# The 51 idle shells: `new-session -d` and then the server's death within about
+# 150 ms (the runner's by-name kill, a suite killing its fresh server) left the
+# warm pool spares that were being created at that instant alive for good, each
+# with its conhost, which never noticed its owner had gone.  cb783dc leaked in
+# 14 of 15 rounds at gap 0 and 11 of 15 at gap 150 ms, 0 at 400 ms and later.
+$raceRounds = 8; $raceLeaks = 0; $raceLeft = @()
+foreach ($i in 1..$raceRounds) {
+    $ns = New-Ns; $script:Namespaces.Add($ns)
+    $t0 = Get-Date
+    & $PSMUX -L $ns new-session -d -s r 2>$null
+    if ($i % 2 -eq 0) { Start-Sleep -Milliseconds 120 }
+    $srvs = @(Get-CimInstance Win32_Process -Filter "Name='psmux.exe'" | Where-Object { $_.CommandLine -match "-L $ns(\s|$)" })
+    foreach ($s in $srvs) { Stop-Process -Id $s.ProcessId -Force -EA SilentlyContinue }
+    $srvIds = @($srvs | ForEach-Object { [int]$_.ProcessId })
+    Start-Sleep -Seconds 4
+    $left = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe' OR Name='conhost.exe'" |
+        Where-Object { $srvIds -contains [int]$_.ParentProcessId -and $_.CreationDate -ge $t0 })
+    if ($left.Count) { $raceLeaks++; $raceLeft += $left }
+}
+if ($raceLeaks -eq 0) { Write-Pass "$raceRounds servers killed 0 to 120 ms after new-session -d left no pane shell or conhost behind" }
+else { Write-Fail ("{0} of {1} servers killed right after new-session -d left processes behind: {2}" -f $raceLeaks, $raceRounds, (($raceLeft | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ' ')) }
+foreach ($p in $raceLeft) { $script:AllRecorded.Add((Rec $p)) }
+
 Write-Host "`n=== the server keeps no inheritable pty pipe handle ===" -ForegroundColor Cyan
 $ns = New-Ns; $script:Namespaces.Add($ns)
 & $PSMUX -L $ns new-session -d -s s -x 120 -y 30 2>$null
@@ -204,7 +230,7 @@ else {
 foreach ($k in $jobKids) { $script:AllRecorded.Add((Rec $k)) }
 & $PSMUX -L $ns kill-server 2>$null
 
-Write-Host "`n=== what a pane deliberately detaches survives it ===" -ForegroundColor Cyan
+Write-Host "`n=== what a pane deliberately detaches survives the server ===" -ForegroundColor Cyan
 $ns = New-Ns; $script:Namespaces.Add($ns)
 $inner = New-Ns; $script:Namespaces.Add($inner)
 $marker = Join-Path $rig 'detached_pid.txt'
@@ -227,8 +253,8 @@ else {
     if (Test-Alive $innerRec) { Write-Pass "a psmux server started inside the pane (pid $($innerRec.Pid)) survives the outer server's death" }
     else { Write-Fail "the nested detached psmux server died with the outer server" }
     if (-not $detRec) { Write-Fail "the pane's Start-Process child was not recorded" }
-    elseif (Test-Alive $detRec) { Write-Pass "a program the pane started with Start-Process (pid $($detRec.Pid)) survives the pane"; $script:AllRecorded.Add($detRec) }
-    else { Write-Fail "the pane's Start-Process child died with the pane" }
+    elseif (Test-Alive $detRec) { Write-Pass "a program the pane started with Start-Process (pid $($detRec.Pid)) survives the server's death"; $script:AllRecorded.Add($detRec) }
+    else { Write-Fail "the pane's Start-Process child died with the server" }
 }
 & $PSMUX -L $inner kill-server 2>$null
 
