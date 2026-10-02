@@ -3044,6 +3044,188 @@ pub mod mouse_inject {
 }
 
 // ---------------------------------------------------------------------------
+// Process tree walks that a recycled parent pid cannot fool
+// ---------------------------------------------------------------------------
+
+/// The one place psmux follows a Toolhelp `ParentProcessId` link.
+///
+/// Windows reuses pids, and `ParentProcessId` is a number recorded when the
+/// child was created, never updated.  Once the real parent exits, its pid can
+/// be handed to an unrelated process, and every survivor that still names the
+/// old pid now LOOKS like a child of the newcomer.  A desktop is full of such
+/// survivors at any moment: `explorer.exe` (userinit exited), `vctip.exe`
+/// (the MSVC linker that started it exited), every orphan of a short lived
+/// launcher.  When a pane process is created with one of those recycled pids,
+/// a walk that trusts the number adopts the survivor (and its whole subtree)
+/// into the pane.  That is how `#{pane_current_command}` named `vctip` for a
+/// pane running a completely different program (test_issue657, sweep
+/// 2026-10-02), and how a tree kill once walked into session 0 and
+/// terminated svchost (the BSOD behind `process_kill::is_protected_image`).
+///
+/// tmux never has this problem because it asks the kernel: `osdep_get_name`
+/// reads the tty's foreground process group (`tcgetpgrp`), which no pid
+/// recycling can forge.  Windows has no such answer for a console, so the
+/// ordering of creation times is the guard: a genuine child is always created
+/// at or after its parent, a survivor of a recycled pid is always older than
+/// the newcomer.  Every walk below validates each edge it FOLLOWS (never the
+/// whole table) with [`edge_is_genuine`], and gets creation times from an
+/// injected source so the walks stay pure and testable.
+#[cfg(windows)]
+pub(crate) mod proc_tree {
+    /// A row of a process table: what a walk needs from it.
+    pub(crate) trait ProcRow {
+        fn pid(&self) -> u32;
+        fn ppid(&self) -> u32;
+    }
+
+    /// The kill path's table: `(pid, ppid)`.
+    impl ProcRow for (u32, u32) {
+        fn pid(&self) -> u32 { self.0 }
+        fn ppid(&self) -> u32 { self.1 }
+    }
+
+    /// The process_info table: `(pid, ppid, lowercased exe name)`.
+    impl ProcRow for (u32, u32, String) {
+        fn pid(&self) -> u32 { self.0 }
+        fn ppid(&self) -> u32 { self.1 }
+    }
+
+    /// Creation time (FILETIME ticks) of a pid, `None` when it cannot be read.
+    pub(crate) type CreationOf<'a> = &'a mut dyn FnMut(u32) -> Option<u64>;
+
+    /// A parent to child edge in a Toolhelp snapshot is only trustworthy if
+    /// the child was created at or after the parent (see the module doc).
+    /// Equal stamps are accepted: process creation times are taken from the
+    /// system clock at tick granularity, so a shell and the command it starts
+    /// at once routinely share one.  An unknown time on either side is NOT
+    /// genuine: a process psmux cannot query is never walked into.  Every pane
+    /// descendant runs under the server's own token in the server's own
+    /// session, where `PROCESS_QUERY_LIMITED_INFORMATION` succeeds (elevated
+    /// same session targets included, measured for #650), so "unknown" in a
+    /// pane walk means the process has already exited or is not the pane's.
+    pub(crate) fn edge_is_genuine(parent_creation: Option<u64>, child_creation: Option<u64>) -> bool {
+        match (parent_creation, child_creation) {
+            (Some(parent), Some(child)) => child >= parent,
+            _ => false,
+        }
+    }
+
+    /// Bound on how deep a single chain walk goes.  With every edge validated
+    /// a cycle needs equal creation stamps all the way round, but the bound
+    /// costs nothing and keeps any table, however malformed, finite.
+    pub(crate) const MAX_CHAIN: usize = 64;
+
+    /// The highest pid child of `parent` that `keep` accepts AND whose edge is
+    /// genuine.  Highest pid is psmux's long standing "most recently created"
+    /// heuristic; candidates are tried in descending pid order and only until
+    /// one validates, so a walk pays one creation lookup per level in the
+    /// common case, not one per process on the machine.
+    pub(crate) fn highest_genuine_child<'r, R: ProcRow>(
+        rows: &'r [R],
+        parent: u32,
+        creation_of: CreationOf<'_>,
+        keep: &dyn Fn(&R) -> bool,
+    ) -> Option<&'r R> {
+        let mut candidates: Vec<&R> = rows
+            .iter()
+            .filter(|r| r.ppid() == parent && r.pid() != parent && keep(r))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // An unqueryable parent has no genuine children (see edge_is_genuine);
+        // bail before paying for any child lookups.
+        let parent_created = creation_of(parent)?;
+        candidates.sort_unstable_by_key(|r| std::cmp::Reverse(r.pid()));
+        candidates
+            .into_iter()
+            .find(|r| edge_is_genuine(Some(parent_created), creation_of(r.pid())))
+    }
+
+    /// Follow [`highest_genuine_child`] from `root` down to the deepest
+    /// descendant.  `None` when the root has no genuine child at all.
+    pub(crate) fn deepest_genuine_descendant<'r, R: ProcRow>(
+        rows: &'r [R],
+        root: u32,
+        creation_of: CreationOf<'_>,
+        keep: &dyn Fn(&R) -> bool,
+    ) -> Option<&'r R> {
+        let mut cur = root;
+        let mut leaf = None;
+        for _ in 0..MAX_CHAIN {
+            match highest_genuine_child(rows, cur, &mut *creation_of, keep) {
+                Some(r) => {
+                    cur = r.pid();
+                    leaf = Some(r);
+                }
+                None => break,
+            }
+        }
+        leaf
+    }
+
+    /// Breadth first walk of `root`'s genuine descendants.  `visit` sees each
+    /// accepted row as it is discovered and returns `true` to stop the walk.
+    /// Returns the pids discovered, in discovery order.
+    pub(crate) fn genuine_descendants<R: ProcRow>(
+        rows: &[R],
+        root: u32,
+        creation_of: CreationOf<'_>,
+        visit: &mut dyn FnMut(&R) -> bool,
+    ) -> Vec<u32> {
+        let mut descendants = Vec::new();
+        let mut queue: Vec<u32> = vec![root];
+        let mut head = 0;
+        while head < queue.len() {
+            let parent = queue[head];
+            head += 1;
+            for r in rows {
+                let pid = r.pid();
+                if r.ppid() == parent && pid != root && !queue.contains(&pid)
+                    && edge_is_genuine(creation_of(parent), creation_of(pid))
+                {
+                    queue.push(pid);
+                    descendants.push(pid);
+                    if visit(r) {
+                        return descendants;
+                    }
+                }
+            }
+        }
+        descendants
+    }
+
+    /// Is `pid` a genuine descendant of `root`?  Walks UP from `pid`, so the
+    /// cost is the depth of `pid`, and every step validates the edge it climbs.
+    /// `pid == root` is not answered here (a pid is not its own descendant).
+    pub(crate) fn is_genuine_descendant<R: ProcRow>(
+        rows: &[R],
+        root: u32,
+        pid: u32,
+        creation_of: CreationOf<'_>,
+    ) -> bool {
+        let mut cur = pid;
+        for _ in 0..MAX_CHAIN {
+            let Some(row) = rows.iter().find(|r| r.pid() == cur) else {
+                return false;
+            };
+            let ppid = row.ppid();
+            if ppid == 0 || ppid == cur {
+                return false;
+            }
+            if !edge_is_genuine(creation_of(ppid), creation_of(cur)) {
+                return false;
+            }
+            if ppid == root {
+                return true;
+            }
+            cur = ppid;
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process tree killing — ensures all descendant processes are terminated
 // ---------------------------------------------------------------------------
 
@@ -3137,52 +3319,15 @@ pub mod process_kill {
 
     /// Collect all descendant PIDs of `root_pid` (children, grandchildren, etc.).
     /// Uses a breadth-first traversal of the process tree snapshot.
+    ///
+    /// Every edge is validated against process creation time before being
+    /// followed (`proc_tree::genuine_descendants`): a stale ParentProcessId
+    /// link (the parent PID has been reused by an unrelated process since the
+    /// real parent exited) is not traversed, which is what keeps this BFS
+    /// from walking out of the pane's process tree into the OS process
+    /// hierarchy.
     fn collect_descendants(root_pid: u32) -> Vec<u32> {
-        let mut descendants = Vec::new();
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE || snap == 0 { return descendants; }
-
-            // Build full process table from snapshot
-            let mut entries: Vec<(u32, u32)> = Vec::with_capacity(256); // (pid, parent_pid)
-            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
-            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-            if Process32FirstW(snap, &mut pe) != 0 {
-                entries.push((pe.th32_process_id, pe.th32_parent_process_id));
-                while Process32NextW(snap, &mut pe) != 0 {
-                    entries.push((pe.th32_process_id, pe.th32_parent_process_id));
-                }
-            }
-            CloseHandle(snap);
-
-            // BFS from root_pid. Every edge is validated against process
-            // creation time before being followed: a stale ParentProcessId
-            // link (the parent PID has been reused by an unrelated process
-            // since the real parent exited) fails `edge_is_genuine` and is
-            // not traversed, which is what keeps this BFS from walking out
-            // of the pane's process tree into the OS process hierarchy.
-            let mut creation_cache: std::collections::HashMap<u32, Option<u64>> =
-                std::collections::HashMap::new();
-            let mut creation_of = |pid: u32| -> Option<u64> {
-                *creation_cache.entry(pid).or_insert_with(|| process_creation_filetime(pid))
-            };
-            let mut queue: Vec<u32> = vec![root_pid];
-            let mut head = 0;
-            while head < queue.len() {
-                let parent = queue[head];
-                head += 1;
-                for &(pid, ppid) in &entries {
-                    if ppid == parent && pid != root_pid && !queue.contains(&pid)
-                        && edge_is_genuine(creation_of(parent), creation_of(pid))
-                    {
-                        queue.push(pid);
-                        descendants.push(pid);
-                    }
-                }
-            }
-        }
-        descendants
+        collect_descendants_from_table(&snapshot_process_table(), root_pid)
     }
 
     /// Executable base names (no extension, lowercase) that must never be
@@ -3200,22 +3345,11 @@ pub mod process_kill {
         PROTECTED.contains(&stripped)
     }
 
-    /// A parent→child edge in the Toolhelp32 snapshot is only trustworthy if
-    /// the child was actually created after the parent. Windows reuses PIDs;
-    /// once a real parent process exits, its PID can be handed to an
-    /// unrelated process, and any process that still lists the old (now
-    /// reused) PID as its `ParentProcessId` produces a stale edge that BFS
-    /// would otherwise happily walk into the OS process hierarchy. A real
-    /// child is always created strictly after its parent, so this is a
-    /// necessary (not just heuristic) property of a genuine edge. Either
-    /// creation time being unknown fails safe to "not genuine" so an
-    /// unqueryable process is never traversed into.
-    pub(crate) fn edge_is_genuine(parent_creation: Option<u64>, child_creation: Option<u64>) -> bool {
-        match (parent_creation, child_creation) {
-            (Some(parent), Some(child)) => child >= parent,
-            _ => false,
-        }
-    }
+    /// The creation time ordering guard every tree walk shares; it lives in
+    /// `platform::proc_tree` with the walks themselves.  Re-exported here
+    /// because the kill path is where it was born (the BSOD) and its tests
+    /// reach it as `process_kill::edge_is_genuine`.
+    pub(crate) use super::proc_tree::edge_is_genuine;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -3358,6 +3492,16 @@ pub mod process_kill {
         if let Some(ppid) = current_parent_pid() {
             // Sanity check: don't terminate PID 0 / 4 (System / kernel).
             if ppid == 0 || ppid == 4 { return false; }
+            // The recorded parent may have exited and its pid been handed to
+            // an unrelated process since (the same stale edge every tree walk
+            // guards against, see `proc_tree`).  Only a process created no
+            // later than this one can be the parent that started it.
+            if !edge_is_genuine(
+                process_creation_filetime(ppid),
+                process_creation_filetime(std::process::id()),
+            ) {
+                return false;
+            }
             // detach-client -P intentionally targets the caller's own parent
             // shell; there is no snapshot cutoff to verify against, so kill
             // unconditionally.
@@ -3508,22 +3652,7 @@ pub mod process_kill {
         root_pid: u32,
         creation_of: &mut dyn FnMut(u32) -> Option<u64>,
     ) -> Vec<u32> {
-        let mut descendants = Vec::new();
-        let mut queue: Vec<u32> = vec![root_pid];
-        let mut head = 0;
-        while head < queue.len() {
-            let parent = queue[head];
-            head += 1;
-            for &(pid, ppid) in entries {
-                if ppid == parent && pid != root_pid && !queue.contains(&pid)
-                    && edge_is_genuine(creation_of(parent), creation_of(pid))
-                {
-                    queue.push(pid);
-                    descendants.push(pid);
-                }
-            }
-        }
-        descendants
+        super::proc_tree::genuine_descendants(entries, root_pid, creation_of, &mut |_| false)
     }
 
     // ── Orphaned-server reaper support (issue #448) ───────────────────────
@@ -4017,7 +4146,8 @@ pub mod process_info {
 
     /// Shared tail of both `get_deepest_foreground_process_name` variants.
     fn resolve_deepest_foreground(pid: u32, entries: ProcTable) -> Option<String> {
-        let (leaf_pid, snapshot_name) = deepest_descendant(&entries, pid)?;
+        let (leaf_pid, snapshot_name) =
+            deepest_descendant(&entries, pid, &mut |p| entries.creation_of(p))?;
         // The snapshot name is lowercased and carries `.exe`; the live query
         // gives the real casing. Fall back to the snapshot when the leaf is
         // gone or unopenable (an elevated process) rather than reporting the
@@ -4033,27 +4163,26 @@ pub mod process_info {
     ///
     /// Highest PID is this module's established "most recently created"
     /// heuristic (Windows exposes no console foreground process group, and
-    /// Toolhelp32 carries no creation time). The iteration guard stops a
-    /// pathological loop from PID reuse inside one snapshot.
+    /// Toolhelp32 carries no creation time). Each level only considers
+    /// GENUINE children (`proc_tree`): a survivor whose dead parent's pid was
+    /// recycled into this pane (the `vctip.exe` an MSVC link leaves behind,
+    /// `explorer.exe`) is older than the pane process and is not followed.
+    /// An unknown creation time is not followed either: a pane descendant
+    /// runs under the server's token, so "unknown" means it already exited,
+    /// and the parent is then the honest answer.  `MAX_CHAIN` stops a
+    /// pathological loop.
     fn deepest_descendant(
-        entries: &[(u32, u32, String)],
+        entries: &[ProcRowT],
         root_pid: u32,
+        creation_of: super::proc_tree::CreationOf<'_>,
     ) -> Option<(u32, String)> {
-        let mut cur = root_pid;
-        let mut leaf: Option<(u32, String)> = None;
-        for _ in 0..64 {
-            let next = entries.iter()
-                .filter(|(pid, ppid, name)| *ppid == cur && *pid != cur && !is_system_exe(name))
-                .max_by_key(|(pid, _, _)| *pid);
-            match next {
-                Some((pid, _, name)) => {
-                    cur = *pid;
-                    leaf = Some((*pid, name.clone()));
-                }
-                None => break,
-            }
-        }
-        leaf
+        super::proc_tree::deepest_genuine_descendant(
+            entries,
+            root_pid,
+            creation_of,
+            &|r: &ProcRowT| !is_system_exe(&r.2),
+        )
+        .map(|r| (r.0, r.2.clone()))
     }
 
     /// Is a VT bridge (`wsl.exe`, `wslhost.exe`, `ssh.exe`, a distro launcher)
@@ -4076,21 +4205,32 @@ pub mod process_info {
             Some(t) => t,
             None => return false,
         };
-        let mut queue: Vec<u32> = vec![root_pid];
-        let mut head = 0;
-        while head < queue.len() {
-            let parent = queue[head];
-            head += 1;
-            for (pid, ppid, name) in entries.iter() {
-                if *ppid == parent && *pid != root_pid && !queue.contains(pid) {
-                    if is_vt_bridge_exe(name) {
-                        return true;
-                    }
-                    queue.push(*pid);
-                }
-            }
-        }
-        false
+        tree_has_vt_bridge(&entries, root_pid, &mut |p| entries.creation_of(p))
+    }
+
+    /// The walk both bridge questions share (`tree_has_vt_bridge_cached` on
+    /// the render path, `has_vt_bridge_descendant` for Ctrl+C and mouse
+    /// transport): breadth first over the pane's GENUINE descendants only.
+    ///
+    /// A stale edge here is not a cosmetic error.  `explorer.exe` always
+    /// carries the pid of the long dead userinit as its parent; a pane shell
+    /// that is handed that pid would otherwise adopt every program on the
+    /// desktop, and any `wsl.exe` / `ssh.exe` among them would make this pane
+    /// trust OSC 7 over its own PEB, route its mouse as VT, and drop the
+    /// CTRL_C_EVENT that a plain shell needs.  An unknown creation time is not
+    /// followed: a bridge the pane started runs under the server's token and
+    /// is always queryable, so an unqueryable one has exited or is not ours.
+    fn tree_has_vt_bridge(
+        entries: &[ProcRowT],
+        root_pid: u32,
+        creation_of: super::proc_tree::CreationOf<'_>,
+    ) -> bool {
+        let mut found = false;
+        super::proc_tree::genuine_descendants(entries, root_pid, creation_of, &mut |r| {
+            found = is_vt_bridge_exe(&r.2);
+            found
+        });
+        found
     }
 
     /// Get the CWD of the foreground process in the pane.
@@ -4149,47 +4289,47 @@ pub mod process_info {
         };
 
         autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
+        foreground_child_in(&entries, root_pid, &mut |p| entries.creation_of(p))
+    }
 
-        // Immediate children of root_pid, skipping system processes.
-        let direct: Vec<(u32, String)> = entries.iter()
-            .filter(|(_, ppid, name)| *ppid == root_pid && !is_system_exe(name))
-            .map(|(pid, _, name)| (*pid, name.clone()))
-            .collect();
-
-        for (pid, name) in &direct {
-            autorename_log(&format!("  direct_child: pid={} name={}", pid, name));
-        }
-
-        if direct.is_empty() {
+    /// The pure core of [`find_foreground_child_pid`], creation time source
+    /// injected.  Only GENUINE children count (`proc_tree`): a survivor whose
+    /// dead parent's pid was recycled into this pane is older than the pane
+    /// process, and adopting it named the window after it (automatic-rename),
+    /// reported ITS working directory as `#{pane_current_path}` (so
+    /// `split-window -c` opened in the wrong folder), and fed the wheel's
+    /// legacy pager check the wrong name.  Unknown creation time: not followed
+    /// (an exited child), the same rule as every other walk in this module.
+    fn foreground_child_in(
+        entries: &[ProcRowT],
+        root_pid: u32,
+        creation_of: super::proc_tree::CreationOf<'_>,
+    ) -> Option<u32> {
+        let not_system = |r: &ProcRowT| !is_system_exe(&r.2);
+        // Pick the immediate child.  When several exist, prefer the largest
+        // PID (most recently created) among the genuine ones.
+        let Some(direct) = super::proc_tree::highest_genuine_child(
+            entries, root_pid, &mut *creation_of, &not_system,
+        ) else {
             autorename_log(&format!("root={} no_direct_children", root_pid));
             return None;
-        }
-
-        // Pick the immediate child.  When multiple exist, prefer the
-        // largest PID (most recently created).
-        let (mut chosen_pid, chosen_name) = direct.iter()
-            .max_by_key(|(pid, _)| *pid)
-            .map(|(pid, name)| (*pid, name.clone()))
-            .unwrap();
+        };
+        let mut chosen_pid = direct.0;
+        let chosen_name = &direct.2;
 
         autorename_log(&format!("root={} immediate_child={} name={}", root_pid, chosen_pid, chosen_name));
 
         // If the immediate child is a known wrapper (cmd, bash, npx, ...),
         // look one level deeper for the real program.
-        if is_wrapper_exe(&chosen_name) {
-            let grandchildren: Vec<(u32, String)> = entries.iter()
-                .filter(|(_, ppid, name)| *ppid == chosen_pid && !is_system_exe(name))
-                .map(|(pid, _, name)| (*pid, name.clone()))
-                .collect();
-
-            if let Some((gc_pid, gc_name)) = grandchildren.iter()
-                .max_by_key(|(pid, _)| *pid)
-            {
+        if is_wrapper_exe(chosen_name) {
+            if let Some(gc) = super::proc_tree::highest_genuine_child(
+                entries, chosen_pid, &mut *creation_of, &not_system,
+            ) {
                 autorename_log(&format!(
                     "root={} wrapper={} skip_to_grandchild={} name={}",
-                    root_pid, chosen_name, gc_pid, gc_name
+                    root_pid, chosen_name, gc.0, gc.2
                 ));
-                chosen_pid = *gc_pid;
+                chosen_pid = gc.0;
             }
         }
 
@@ -4198,7 +4338,67 @@ pub mod process_info {
     }
 
     /// One `(pid, ppid, lowercased_exe_name)` row per process on the machine.
-    type ProcTable = std::sync::Arc<Vec<(u32, u32, String)>>;
+    type ProcRowT = (u32, u32, String);
+
+    /// A process table plus the creation times its walks have looked up.
+    ///
+    /// Every walk validates the edges it follows by creation time
+    /// (`proc_tree`), and the render path walks the same cached table up to
+    /// several times per frame.  A pid's creation time cannot change while
+    /// one table is the truth, so the lookups are memoised HERE, on the table:
+    /// the memo is created empty with each walk and dropped with the table
+    /// when a refresh replaces it, so it can never outlive the snapshot it
+    /// describes.  A render path walk over a warm table therefore costs hash
+    /// lookups, not `OpenProcess` calls, and the first walk after a refresh
+    /// pays one lookup per edge actually followed (a handful per pane).
+    pub(crate) struct ProcSnapshot {
+        rows: Vec<ProcRowT>,
+        creation: std::sync::Mutex<std::collections::HashMap<u32, Option<u64>>>,
+    }
+
+    impl ProcSnapshot {
+        /// Creation time of `pid`, memoised for the life of this table.
+        pub(crate) fn creation_of(&self, pid: u32) -> Option<u64> {
+            if let Some(hit) = self
+                .creation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&pid)
+            {
+                return *hit;
+            }
+            // Query outside the lock; a racing duplicate query is harmless
+            // (same pid, same answer).
+            let created = super::process_kill::process_creation_time(pid);
+            self.creation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid, created);
+            created
+        }
+
+        /// How many creation times this table has memoised (tests and the
+        /// micro benchmark read it).
+        #[cfg(test)]
+        pub(crate) fn memo_len(&self) -> usize {
+            self.creation.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+    }
+
+    impl From<Vec<ProcRowT>> for ProcSnapshot {
+        fn from(rows: Vec<ProcRowT>) -> Self {
+            ProcSnapshot { rows, creation: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        }
+    }
+
+    impl std::ops::Deref for ProcSnapshot {
+        type Target = Vec<ProcRowT>;
+        fn deref(&self) -> &Self::Target {
+            &self.rows
+        }
+    }
+
+    type ProcTable = std::sync::Arc<ProcSnapshot>;
 
     static PROC_TABLE_CACHE: std::sync::LazyLock<
         std::sync::Mutex<Option<(std::time::Instant, ProcTable)>>,
@@ -4388,7 +4588,7 @@ pub mod process_info {
             entries
         };
 
-        let table: ProcTable = std::sync::Arc::new(entries);
+        let table: ProcTable = std::sync::Arc::new(ProcSnapshot::from(entries));
         // Publish even for a ZERO-max_age caller: it paid for the walk, so a
         // later render-path caller may as well reuse it. Recover a poisoned lock
         // here too (see the read site above) so a panic elsewhere cannot leave
@@ -4480,7 +4680,7 @@ pub mod process_info {
     /// case the caller falls back to the pane's root child pid.
     pub fn foreground_leaf_pid(root_pid: u32) -> Option<u32> {
         let entries = process_table(std::time::Duration::ZERO)?;
-        deepest_descendant(&entries, root_pid).map(|(pid, _)| pid)
+        deepest_descendant(&entries, root_pid, &mut |p| entries.creation_of(p)).map(|(pid, _)| pid)
     }
 
     /// Is `pid` the pane root itself or one of its descendants (issue #613)?
@@ -4496,24 +4696,15 @@ pub mod process_info {
         let Some(entries) = process_table(std::time::Duration::from_millis(250)) else {
             return false;
         };
-        let mut cur = pid;
-        // Same iteration guard as `deepest_descendant`: a snapshot taken across
-        // PID reuse can contain a parent cycle, and this must terminate.
-        for _ in 0..64 {
-            match entries.iter().find(|(p, _, _)| *p == cur) {
-                Some((_, ppid, _)) => {
-                    if *ppid == root_pid {
-                        return true;
-                    }
-                    if *ppid == 0 || *ppid == cur {
-                        return false;
-                    }
-                    cur = *ppid;
-                }
-                None => return false,
-            }
-        }
-        false
+        // Every step up validates its edge (`proc_tree::is_genuine_descendant`).
+        // Without that, the reuse this function exists to catch came straight
+        // back one level up: an unrelated process holding the owner's recycled
+        // pid, whose own dead parent's pid had been recycled into this pane,
+        // kept the latch alive.  Unknown creation time: not in the tree (the
+        // owner exited, which is exactly when the latch must expire).
+        super::proc_tree::is_genuine_descendant(&entries, root_pid, pid, &mut |p| {
+            entries.creation_of(p)
+        })
     }
 
     /// True when the pane's deepest foreground process is a VT bridge
@@ -4539,7 +4730,8 @@ pub mod process_info {
 
         // Descend to the deepest foreground leaf, skipping system processes
         // (see `deepest_descendant`).
-        let leaf_name = deepest_descendant(&entries, root_pid).map(|(_, name)| name);
+        let leaf_name = deepest_descendant(&entries, root_pid, &mut |p| entries.creation_of(p))
+            .map(|(_, name)| name);
 
         // The process whose Ctrl+C behavior matters is the deepest
         // foreground leaf.  If the root has no children, classify the root
@@ -4564,9 +4756,27 @@ pub mod process_info {
             Some(t) => t,
             None => return false,
         };
-        !entries.iter().any(|(pid, ppid, name)| {
-            *ppid == root_pid && *pid != root_pid && !is_system_exe(name)
-        })
+        fell_back_to_root_in(&entries, root_pid, &mut |p| entries.creation_of(p))
+    }
+
+    /// Pure core of [`foreground_fell_back_to_root`].  It must count children
+    /// exactly the way `deepest_descendant` does, genuine edges only: a
+    /// survivor whose dead parent's pid was recycled into the pane shell would
+    /// otherwise make a childless shell look busy, and the #579 boot window
+    /// guard (which only runs on the childless fallback) would stand down
+    /// while a booting wsl.exe is exposed to the CTRL_C_EVENT broadcast.
+    fn fell_back_to_root_in(
+        entries: &[ProcRowT],
+        root_pid: u32,
+        creation_of: super::proc_tree::CreationOf<'_>,
+    ) -> bool {
+        super::proc_tree::highest_genuine_child(
+            entries,
+            root_pid,
+            creation_of,
+            &|r: &ProcRowT| !is_system_exe(&r.2),
+        )
+        .is_none()
     }
 
     /// True when a VT bridge CLIENT executable (wsl.exe, ssh.exe,
@@ -4888,25 +5098,7 @@ pub mod process_info {
             Some(t) => t,
             None => return false,
         };
-
-        // BFS from root_pid to check all descendants
-        let mut queue: Vec<u32> = vec![root_pid];
-        let mut head = 0;
-        while head < queue.len() {
-            let parent = queue[head];
-            head += 1;
-            for (pid, ppid, name) in entries.iter() {
-                if *ppid == parent && *pid != root_pid
-                    && !queue.contains(pid)
-                {
-                    if is_vt_bridge_exe(name) {
-                        return true;
-                    }
-                    queue.push(*pid);
-                }
-            }
-        }
-        false
+        tree_has_vt_bridge(&entries, root_pid, &mut |p| entries.creation_of(p))
     }
 
     // Path is relative to src/platform/process_info/ — an inline module inside a
@@ -4919,6 +5111,10 @@ pub mod process_info {
     #[cfg(test)]
     #[path = "../../../tests-rs/test_issue579_any_vt_bridge.rs"]
     mod tests_issue579_any_vt_bridge;
+
+    #[cfg(test)]
+    #[path = "../../../tests-rs/test_proc_tree_pid_reuse.rs"]
+    mod tests_proc_tree_pid_reuse;
 
     #[cfg(test)]
     #[path = "../../../tests-rs/test_ctrlc_bridge_recency.rs"]

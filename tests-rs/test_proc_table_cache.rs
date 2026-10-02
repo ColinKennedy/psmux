@@ -161,7 +161,7 @@ fn a_very_old_entry_is_still_served_without_a_caller_walk() {
     {
         let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let ancient = std::time::Instant::now() - Duration::from_secs(600);
-        let table = std::sync::Arc::new(vec![(1u32, 0u32, "ancient.exe".to_string())]);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(1u32, 0u32, "ancient.exe".to_string())]));
         *g = Some((ancient, table));
     }
     let before = walks();
@@ -372,7 +372,7 @@ fn an_explicit_query_walks_inline_when_the_entry_expired() {
     {
         let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let ancient = std::time::Instant::now() - Duration::from_secs(600);
-        let table = std::sync::Arc::new(vec![(1u32, 0u32, "ancient.exe".to_string())]);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(1u32, 0u32, "ancient.exe".to_string())]));
         *g = Some((ancient, table));
     }
     let before = walks();
@@ -420,7 +420,7 @@ fn the_render_path_still_never_walks_on_the_caller() {
     {
         let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let ancient = std::time::Instant::now() - Duration::from_secs(600);
-        let table = std::sync::Arc::new(vec![(1u32, 0u32, "ancient.exe".to_string())]);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(1u32, 0u32, "ancient.exe".to_string())]));
         *g = Some((ancient, table));
     }
     let before = walks();
@@ -474,7 +474,7 @@ fn pane_current_command_query_route_sees_a_process_the_cache_does_not() {
     {
         let mut g = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let ancient = std::time::Instant::now() - Duration::from_secs(600);
-        let table = std::sync::Arc::new(vec![(root_pid, 0u32, "cmd.exe".to_string())]);
+        let table = std::sync::Arc::new(ProcSnapshot::from(vec![(root_pid, 0u32, "cmd.exe".to_string())]));
         *g = Some((ancient, table));
     }
     let stale = get_deepest_foreground_process_name(root_pid);

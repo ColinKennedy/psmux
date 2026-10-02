@@ -100,6 +100,41 @@ foreach ($pair in @(@($inj, "mouse_injector.cs"),
     }
 }
 
+# When a pane reports the wrong foreground, say WHY, so the next failure names
+# its mechanism instead of just the stranger's name.  The 2026-10-02 sweep
+# reported 'vctip' here: an MSVC telemetry helper that outlives the linker
+# that started it, so its ParentProcessId names a dead pid, and when Windows
+# recycles that pid into a pane process an unguarded tree walk adopts it.
+# This prints, for every live process with the reported name, its pid, its
+# parent pid and creation time, and who holds that parent pid NOW with that
+# process's creation time.  A child older than the holder of its parent pid
+# can only be a recycled pid.
+function Describe-Foreground($ns, $target, $fgName) {
+    try {
+        $panePid = (& $PSMUX -L $ns display-message -t $target -p '#{pane_pid}' 2>&1 | Out-String).Trim()
+        Write-Info "pane_pid=$panePid pane_current_command='$fgName'"
+        $fmt = { param($p) if ($p) { "pid=$($p.ProcessId) name=$($p.Name) ppid=$($p.ParentProcessId) created=$($p.CreationDate.ToString('HH:mm:ss.fff'))" } else { "(gone)" } }
+        if ($panePid -match '^\d+$') {
+            $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$panePid" -EA SilentlyContinue
+            Write-Info ("  pane process: " + (& $fmt $pp))
+        }
+        if ($fgName) {
+            $leafs = @(Get-CimInstance Win32_Process -Filter "Name='$fgName.exe'" -EA SilentlyContinue)
+            if ($leafs.Count -eq 0) { Write-Info "  no live process named $fgName.exe (it exited)" }
+            foreach ($l in $leafs) {
+                $holder = Get-CimInstance Win32_Process -Filter "ProcessId=$($l.ParentProcessId)" -EA SilentlyContinue
+                Write-Info ("  foreground candidate: " + (& $fmt $l))
+                Write-Info ("    holder of its parent pid now: " + (& $fmt $holder))
+                if ($holder -and $l.CreationDate -lt $holder.CreationDate) {
+                    Write-Info "    -> the 'child' is OLDER than the process holding its parent pid: a RECYCLED parent pid, not a real child"
+                }
+            }
+        }
+    } catch {
+        Write-Info "  (could not describe the foreground: $($_.Exception.Message))"
+    }
+}
+
 function Cleanup-All {
     foreach ($n in @($NS, $NS_IN, $NS_OUT)) { & $PSMUX -L $n kill-server 2>&1 | Out-Null }
     Start-Sleep -Milliseconds 800
@@ -149,6 +184,7 @@ if (-not $clientUp) {
         Write-Pass "the pane's foreground is the non shell app ($fg)"
     } else {
         Write-Fail "the pane's foreground is '$fg', not the model app; this layer would prove nothing"
+        Describe-Foreground $NS $SESSION $fg
     }
     if ($blank -eq 0 -and $rows.Count -ge 20) {
         Write-Pass "the app filled the pane: $($rows.Count) painted rows, 0 blank"
@@ -285,6 +321,7 @@ if (-not $outerUp) {
             Write-Pass "the inner pane's foreground is the non shell app ($vfg)"
         } else {
             Write-Fail "the inner pane's foreground is '$vfg'; this layer would prove nothing"
+            Describe-Foreground $NS_IN $S_IN $vfg
         }
 
         $vBefore = (& $PSMUX -L $NS_IN display-message -t $S_IN -p '#{pane_in_mode}' 2>&1).Trim()
@@ -360,6 +397,7 @@ if (-not (Test-Path $alacritty)) {
             Write-Pass "the Alacritty pane's foreground is the non shell app ($afg)"
         } else {
             Write-Fail "the Alacritty pane's foreground is '$afg'; this layer would prove nothing"
+            Describe-Foreground $NS $SESSION $afg
         }
         $w = & $guiWheel $ala.Id up 3 400 300 2>&1
         Write-Info ("$w" -replace "`r?`n", " ")
