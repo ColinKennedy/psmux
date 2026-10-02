@@ -147,6 +147,13 @@ function Get-PerfBinaryVersion {
 function Get-PerfMachineLoad {
     param([int]$SampleMs = 1000)
     $pct = $null
+    # Per process CPU over the same second the counter samples, so a loaded
+    # sample can say WHO loaded it.  Sweep 2026-10-02 failed five perf gates on
+    # a box where 48 orphaned pstop.exe each burned half a core, and the gates
+    # only said "load 100%".
+    $cpuBefore = @{}
+    $swTop = [System.Diagnostics.Stopwatch]::StartNew()
+    try { foreach ($p in Get-Process -ErrorAction SilentlyContinue) { try { $cpuBefore[$p.Id] = $p.TotalProcessorTime.TotalMilliseconds } catch { } } } catch { }
     try {
         $s = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
         $pct = [math]::Round([double]($s.CounterSamples | Select-Object -First 1 -ExpandProperty CookedValue), 1)
@@ -161,12 +168,50 @@ function Get-PerfMachineLoad {
         if ($pct -gt 100) { $pct = 100.0 }
     }
     $procs = 0
-    try { $procs = @(Get-Process -ErrorAction SilentlyContinue).Count } catch { }
+    $top = ""
+    try {
+        $after = @(Get-Process -ErrorAction SilentlyContinue)
+        $procs = $after.Count
+        if ($null -ne $pct -and $pct -ge 5) {
+            $wallMs = [math]::Max(1.0, $swTop.Elapsed.TotalMilliseconds)
+            $cores = [Environment]::ProcessorCount
+            $rows = foreach ($p in $after) {
+                if (-not $cpuBefore.ContainsKey($p.Id)) { continue }
+                $d = 0.0
+                try { $d = $p.TotalProcessorTime.TotalMilliseconds - $cpuBefore[$p.Id] } catch { continue }
+                if ($d -le 0) { continue }
+                [pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; Pct = $d * 100.0 / ($wallMs * $cores) }
+            }
+            $best = @($rows | Sort-Object Pct -Descending | Select-Object -First 5)
+            if ($best.Count) {
+                $parents = @{}
+                try {
+                    $ids = ($best | ForEach-Object { "ProcessId=$($_.Id)" }) -join ' OR '
+                    foreach ($c in Get-CimInstance Win32_Process -Filter $ids -ErrorAction Stop) { $parents[[int]$c.ProcessId] = [int]$c.ParentProcessId }
+                } catch { }
+                $top = ($best | ForEach-Object {
+                    $pp = if ($parents.ContainsKey($_.Id)) { " ppid " + $parents[$_.Id] } else { "" }
+                    "{0}:{1}{2} {3:N1}% ({4:N2} cores)" -f $_.Name, $_.Id, $pp, $_.Pct, ($_.Pct * $cores / 100.0)
+                }) -join ", "
+            }
+        }
+    } catch { }
     return [ordered]@{
         at          = (Get-Date).ToString("o")
         cpu_pct     = $pct
         process_cnt = $procs
+        # Empty when the box was under 5 percent; otherwise the five busiest
+        # processes over the sampled second, in percent of TOTAL cpu.
+        top_cpu     = $top
     }
+}
+
+# One line naming the busiest processes of the most loaded sample, for a
+# gate's "machine load" line.  Empty when no sample reached 5 percent.
+function Get-PerfLoadTopText {
+    $worst = $script:PerfLoadSamples | Where-Object { $null -ne $_.cpu_pct } | Sort-Object { $_.cpu_pct } -Descending | Select-Object -First 1
+    if (-not $worst -or -not $worst.top_cpu) { return "" }
+    return ("  top cpu at the {0}% sample: {1}" -f $worst.cpu_pct, $worst.top_cpu)
 }
 
 # Samples accumulate for the life of the suite process. A gate calls

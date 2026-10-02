@@ -83,12 +83,53 @@ $mouseLog = "$psmuxDir\mouse_debug.log"
 Remove-Item $mouseLog -Force -EA SilentlyContinue
 
 $proc = $null
+# The pane's process tree (shell and descendants), by PID and start time.  The
+# app is quit with its own key before the session goes, and the test checks
+# that nothing of the tree outlives the server: sweep 2026-10-02 ended with 48
+# orphaned pstop processes each burning half a core.
+function Get-PaneTreeRecs([int]$root) {
+    $all = @(Get-CimInstance Win32_Process -EA SilentlyContinue); $by = @{}
+    foreach ($p in $all) { $by[[int]$p.ProcessId] = $p }
+    if (-not $by[$root]) { return @() }
+    $out = @(); $q = [System.Collections.Queue]::new(); $q.Enqueue($root)
+    while ($q.Count) {
+        $id = $q.Dequeue(); $p = $by[$id]
+        $out += [pscustomobject]@{ Pid = $id; Name = $p.Name; Start = $p.CreationDate }
+        foreach ($c in $all) { if ([int]$c.ParentProcessId -eq $id -and [int]$c.ProcessId -ne $id -and $c.CreationDate -ge $p.CreationDate) { $q.Enqueue([int]$c.ProcessId) } }
+    }
+    $out
+}
+function Test-RecAlive($r) { $g = Get-Process -Id $r.Pid -EA SilentlyContinue; $g -and ([Math]::Abs(($g.StartTime - $r.Start).TotalSeconds) -lt 2) }
+$script:paneTree = @()
 function Cleanup {
+    $pp = Px display-message -p -t $SESSION '#{pane_pid}' 2>$null
+    if ($pp -match '^\d+$') { $script:paneTree = @(Get-PaneTreeRecs ([int]$pp)) }
+    $apps = @($script:paneTree | Where-Object { $_.Name -match '^(pstop|htop)\.exe$' })
+    if ($apps.Count) {
+        foreach ($key in 'q', 'F10') {
+            if (-not @($apps | Where-Object { Test-RecAlive $_ }).Count) { break }
+            Px send-keys -t $SESSION $key 2>&1 | Out-Null
+            for ($i = 0; $i -lt 15 -and @($apps | Where-Object { Test-RecAlive $_ }).Count; $i++) { Start-Sleep -Milliseconds 200 }
+        }
+        $still = @($apps | Where-Object { Test-RecAlive $_ })
+        if ($still.Count) {
+            Write-Fail "pstop did not quit on q or F10: $(($still | ForEach-Object { "$($_.Name):$($_.Pid)" }) -join ' ')"
+            foreach ($r in $still) { Stop-Process -Id $r.Pid -Force -EA SilentlyContinue }
+        } else { Write-Pass "pstop quit on its own key before the session was killed" }
+    }
     Px kill-session -t $SESSION 2>&1 | Out-Null
     Start-Sleep -Milliseconds 400
     Px kill-server 2>&1 | Out-Null
     Start-Sleep -Milliseconds 300
     if ($script:proc) { try { Stop-Process -Id $script:proc.Id -Force -EA SilentlyContinue } catch {} }
+    if ($script:paneTree.Count) {
+        $left = @()
+        for ($i = 0; $i -lt 25; $i++) { $left = @($script:paneTree | Where-Object { Test-RecAlive $_ }); if (-not $left.Count) { break }; Start-Sleep -Milliseconds 200 }
+        if ($left.Count) {
+            Write-Fail "the pane's processes outlived the server: $(($left | ForEach-Object { "$($_.Name):$($_.Pid)" }) -join ' ')"
+            foreach ($r in $left) { Stop-Process -Id $r.Pid -Force -EA SilentlyContinue }
+        } else { Write-Pass "nothing of the pane's process tree outlived the server" }
+    }
 }
 
 try {

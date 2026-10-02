@@ -438,6 +438,7 @@ Write-Info ("pooled n={0}  min={1:N2}  median={2:N2}  p90={3:N2}  p99={4:N2}  ma
 Add-PerfLoadSample "after echo cell" | Out-Null
 $loadSummary = Get-PerfLoadSummary
 $wasQuiet = Test-PerfMachineQuiet $QuietLoadPct
+$topTxt = Get-PerfLoadTopText; if ($topTxt) { Write-Host "[INFO] $topTxt" -ForegroundColor Cyan }
 Write-Info ("machine load: n={0} min={1}% p50={2}% max={3}%  -> {4}" -f `
     $loadSummary.n, $loadSummary.min_pct, $loadSummary.p50_pct, $loadSummary.max_pct, `
     $(if ($wasQuiet) { "quiet, the median assertion is a hard failure" } else { "loaded, the median assertion is a warning" }))

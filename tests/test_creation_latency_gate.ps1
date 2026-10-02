@@ -770,6 +770,7 @@ if (-not $SkipResources) { Test-Resources }
 
 $loadSummary = Get-PerfLoadSummary
 $wasQuiet = Test-PerfMachineQuiet $QuietLoadPct
+$topTxt = Get-PerfLoadTopText; if ($topTxt) { Write-Host "[INFO] $topTxt" -ForegroundColor Cyan }
 Write-Info ("machine load over the run: n={0} min={1}% p50={2}% max={3}%  -> {4}" -f `
     $loadSummary.n, $loadSummary.min_pct, $loadSummary.p50_pct, $loadSummary.max_pct, `
     $(if ($wasQuiet) { "quiet, tail assertions were hard failures" } else { "loaded, tail assertions were warnings" }))

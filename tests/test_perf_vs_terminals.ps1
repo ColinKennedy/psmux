@@ -432,6 +432,7 @@ function Check {
     } elseif ($soft) {
         $lp = 0; try { $lp = (Get-PerfLoadSummary).p50_pct } catch { }
         $m = ("{0}: {1:F1}{3} > {2:F1}{3}, but the machine was at {4}% of total cpu, over the {5}% quiet mark, and a difference of two timings stretches with the machine" -f $Name, $Value, $Limit, $Unit, $lp, $QuietLoadPct)
+        try { $tt = Get-PerfLoadTopText; if ($tt) { $m += ";" + $tt } } catch { }
         Write-Host "[WARN] $m" -ForegroundColor Yellow
         [void]$script:Notes.Add($m)
     } else {
