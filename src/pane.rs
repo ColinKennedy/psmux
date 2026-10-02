@@ -4441,6 +4441,10 @@ mod tests_pane_writer_queue;
 mod tests_psrl_history_redirect;
 
 #[cfg(all(test, windows))]
+#[path = "../tests-rs/test_pane_job.rs"]
+mod tests_pane_job;
+
+#[cfg(all(test, windows))]
 #[path = "../tests-rs/test_pty_pipes_not_inheritable.rs"]
 mod tests_pty_pipes_not_inheritable;
 
