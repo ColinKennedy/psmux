@@ -794,7 +794,17 @@ if (-not $PSMUX) { $PSMUX = (Resolve-Path "$PSScriptRoot\..\target\debug\psmux.e
 if (-not $PSMUX) { $PSMUX = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
 if (-not $PSMUX) { Write-Error "psmux binary not found"; exit 1 }
 
+# Every suite that calls bare `psmux` resolves it through PATH, which on the
+# owner's box finds the INSTALLED copy in ~\.cargo\bin first.  Put the binary
+# this run announces in front, so each suite tests that build: a run from a
+# worktree otherwise mixed its own build with whatever was installed (the
+# -Only runs of 2026-10-02 drove test_tui_exit_cleanup with the installed
+# psmux, whose pane shells then ignored PSMUX_PSREADLINE_HISTORY below).
+$env:PATH = (Split-Path $PSMUX) + ';' + $env:PATH
+$resolved = (Get-Command psmux -ErrorAction SilentlyContinue).Source
+
 Write-Log "Binary: $PSMUX"
+Write-Log "PATH resolves psmux to: $resolved"
 Write-Log "Params: SkipPerf=$SkipPerf IncludeWSL=$IncludeWSL IncludeInteractive=$IncludeInteractive DefaultTimeoutSec=$DefaultTimeoutSec LongTimeoutSec=$LongTimeoutSec Only='$Only' Resume=$Resume"
 
 Write-Host "Binary: $PSMUX" -ForegroundColor Cyan
