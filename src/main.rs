@@ -2262,6 +2262,7 @@ fn run_main() -> io::Result<()> {
                 let mut env_args: Vec<String> = Vec::new();
                 let mut nw_positional: Vec<String> = Vec::new();
                 let mut nw_saw_ddash = false;
+                let mut placement_flags = String::new();
                 {
                     let mut i = 1;
                     while i < cmd_args.len() {
@@ -2275,11 +2276,30 @@ fn run_main() -> io::Result<()> {
                             "-T" => { i += 1; if i < cmd_args.len() { title_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
                             // -e KEY=VALUE environment for the new pane (#489)
                             "-e" => { i += 1; if i < cmd_args.len() { env_args.push(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-t" | "-S" => { i += 1; /* skip value */ }
+                            // -t travels as the TARGET line (PSMUX_TARGET_FULL).
+                            "-t" => { i += 1; }
                             "-d" => { detached = true; }
                             "-P" => { print_info = true; }
                             "-E" => { empty_flag = true; }
-                            "-a" | "-D" | "-k" => { /* ignored for compatibility */ }
+                            // Placement flags (tmux cmd-new-window.c): -S is a
+                            // plain flag, not one taking a value.
+                            "-a" => { placement_flags.push_str(" -a"); }
+                            "-b" => { placement_flags.push_str(" -b"); }
+                            "-k" => { placement_flags.push_str(" -k"); }
+                            "-S" => { placement_flags.push_str(" -S"); }
+                            "-D" => { /* ignored for compatibility */ }
+                            // A cluster of plain flags such as -dk or -dP.
+                            _ if a.len() > 2 && a.starts_with('-') && a[1..].chars().all(|c| "dPEabkSD".contains(c)) => {
+                                for c in a[1..].chars() {
+                                    match c {
+                                        'd' => detached = true,
+                                        'P' => print_info = true,
+                                        'E' => empty_flag = true,
+                                        'a' | 'b' | 'k' | 'S' => placement_flags.push_str(&format!(" -{}", c)),
+                                        _ => {}
+                                    }
+                                }
+                            }
                             _ if a.starts_with('-') => { /* unknown flag, skip */ }
                             _ => { nw_positional.extend(cmd_args[i..].iter().map(|s| s.to_string())); break; }
                         }
@@ -2307,6 +2327,7 @@ fn run_main() -> io::Result<()> {
                 if detached { cmd_line.push_str(" -d"); }
                 if print_info { cmd_line.push_str(" -P"); }
                 if empty_flag { cmd_line.push_str(" -E"); }
+                cmd_line.push_str(&placement_flags);
                 if let Some(ref fmt) = format_str {
                     cmd_line.push_str(&format!(" -F {}", crate::util::quote_arg(&fmt)));
                 }
@@ -2335,11 +2356,16 @@ fn run_main() -> io::Result<()> {
                     cmd_line.push_str(&format!(" {}", crate::util::quote_arg(&cmd_arg)));
                 }
                 cmd_line.push('\n');
+                // Always read the reply: an index in use or a window the -t
+                // cannot find is tmux's error on stderr at exit 1, where the
+                // old fire and forget send exited 0 having done nothing.
+                let resp = send_control_with_response(cmd_line)?;
+                if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                    eprintln!("psmux: {}", msg.trim_end());
+                    std::process::exit(1);
+                }
                 if print_info {
-                    let resp = send_control_with_response(cmd_line)?;
                     print!("{}", resp);
-                } else {
-                    send_control(cmd_line)?;
                 }
                 return Ok(());
             }

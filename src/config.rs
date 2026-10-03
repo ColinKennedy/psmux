@@ -909,6 +909,15 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
             let _ = crate::commands::execute_command_string(app, l);
             return;
         }
+        // The same for `new-window`: a sourced file's `new-window -t :N` makes
+        // a window, as cfg.c's queue does in tmux. It was silently dropped, so
+        // no index, name or -a/-b/-k form of it ever ran from a file. The
+        // startup load stays out for the reason above: every server, the warm
+        // standby included, loads the config before it has a session window.
+        if matches!(cmd, "new-window" | "neww") && !app.windows.is_empty() && !in_startup_load() {
+            let _ = crate::commands::execute_command_string(app, l);
+            return;
+        }
         if !cmd.is_empty() && !is_known_command(app, cmd) {
             warn_config(app, format!("unknown command: {}", cmd));
         }

@@ -1067,6 +1067,9 @@ pub fn window_target_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "move-window" | "movew" | "swap-window" | "swapw" | "select-window" | "selectw"
+            // new-window's -t is CMD_FIND_WINDOW with CMD_FIND_WINDOW_INDEX
+            // (cmd-new-window.c), so `new-window -t 3` is index 3 here.
+            | "new-window" | "neww"
     )
 }
 
