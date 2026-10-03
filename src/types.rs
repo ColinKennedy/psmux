@@ -2950,11 +2950,21 @@ pub enum CtrlReq {
     /// Fields: workdir (-c), kill (-k), command, empty (-E), reply, and the
     /// `-e KEY=VALUE` pairs for the new process (#708).
     RespawnPane(Option<String>, bool, Option<String>, bool, mpsc::Sender<Result<(), String>>, Vec<(String, String)>),
-    /// set-option -p (issue #580): pane-scoped option. Fields: raw -t pane
-    /// target ("" = active pane), option name, value ("" = unset via -u/-U),
-    /// reply ("" on success, "ERROR: ..." otherwise). Unwired pane options
-    /// are rejected loudly instead of stored as silent no-ops.
-    SetPaneOption(String, String, String, mpsc::Sender<String>),
+    /// set-option -p (issue #580, #728): pane-scoped option. `target` is the
+    /// raw -t pane ("" = active pane); `resp` gets "" on success and
+    /// "ERROR: ..." otherwise. Any `@name` user option is stored on the pane
+    /// (#728); a catalog name psmux does not keep per pane is refused loudly
+    /// instead of stored as a silent no-op.
+    SetPaneOption {
+        target: String,
+        option: String,
+        value: String,
+        unset: bool,
+        append: bool,
+        only_if_unset: bool,
+        quiet: bool,
+        resp: mpsc::Sender<String>,
+    },
     /// show-options -p (issue #580): list a pane's scoped options.
     ShowPaneOptions(String, mpsc::Sender<String>),
     BindKey(String, String, String, bool),  // table, key, command, repeat

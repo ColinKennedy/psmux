@@ -3254,23 +3254,30 @@ match cmd {
                     .map(|s| s.trim_matches('"').to_string())
                     .unwrap_or_default(),
             );
-            let reply = if has_u {
-                let option = non_flag_args[0];
-                let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::SetPaneOption(
-                    raw_target,
-                    option.to_string(),
-                    String::new(),
-                    rtx,
-                ));
-                rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default()
-            } else {
-                let option = non_flag_args[0].to_string();
-                let value = non_flag_args[1..].join(" ").trim_matches('"').to_string();
-                let value = expand_set_option_value(&tx, has_f, value);
-                let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::SetPaneOption(raw_target, option, value, rtx));
-                rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default()
+            // #728: -a / -o / -q reach the pane writer too; they used to be
+            // dropped on this route, so `set -pa` replaced instead of appending.
+            let reply = match non_flag_args.first() {
+                None => "ERROR: set-option -p: option and value required".to_string(),
+                Some(option) => {
+                    let value = if has_u {
+                        String::new()
+                    } else {
+                        let joined = non_flag_args[1..].join(" ").trim_matches('"').to_string();
+                        expand_set_option_value(&tx, has_f, joined)
+                    };
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::SetPaneOption {
+                        target: raw_target,
+                        option: option.to_string(),
+                        value,
+                        unset: has_u,
+                        append: has_a,
+                        only_if_unset: has_o,
+                        quiet: has_q,
+                        resp: rtx,
+                    });
+                    rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default()
+                }
             };
             if !reply.is_empty() {
                 let _ = write!(write_stream, "{}\n", reply);
@@ -3415,19 +3422,25 @@ match cmd {
                 // one, not the global one alone. tmux walks the same chain
                 // (`show -pA` in a window with `remain-on-exit on` prints
                 // `remain-on-exit* on`, verified against tmux 3.4).
+                // A user option has no window catalog entry; its parent is
+                // the one `@name` store (#728).
                 let inherited = |n: &str| -> Option<String> {
                     let (frtx, frrx) = mpsc::channel::<String>();
-                    let _ = tx.send(CtrlReq::ShowWindowOptionValue(
-                        frtx,
-                        n.to_string(),
-                        raw_t.clone(),
-                    ));
+                    if n.starts_with('@') {
+                        let _ = tx.send(CtrlReq::ShowOptionValue(frtx, n.to_string()));
+                    } else {
+                        let _ = tx.send(CtrlReq::ShowWindowOptionValue(
+                            frtx,
+                            n.to_string(),
+                            raw_t.clone(),
+                        ));
+                    }
                     frrx.recv_timeout(Duration::from_millis(2000)).ok()
                         .filter(|v| !v.is_empty())
                 };
                 let out = if let Some(name) = name {
-                    crate::server::options::select_pane_option_line(
-                        &reply, name, has_v, has_a, inherited,
+                    crate::server::options::pane_option_query_reply(
+                        &reply, name, has_v, has_a, has_q, inherited,
                     )
                 } else {
                     crate::server::options::render_pane_options(&reply, has_a, inherited)
@@ -5199,16 +5212,25 @@ fn dispatch_control_command(
                         .unwrap_or_default(),
                 );
                 let (rtx, rrx) = mpsc::channel::<String>();
-                if unset && !positional.is_empty() {
-                    let _ = tx.send(CtrlReq::SetPaneOption(raw, positional[0].to_string(), String::new(), rtx));
+                let value = if unset && !positional.is_empty() {
+                    String::new()
                 } else if positional.len() >= 2 {
                     let value = positional[1..].join(" ").trim_matches('"').to_string();
-                    let value = expand_set_option_value(tx, format_expand, value);
-                    let _ = tx.send(CtrlReq::SetPaneOption(raw, positional[0].to_string(), value, rtx));
+                    expand_set_option_value(tx, format_expand, value)
                 } else {
                     let _ = resp_tx.send("ERROR: set-option -p: option and value required".to_string());
                     return true;
-                }
+                };
+                let _ = tx.send(CtrlReq::SetPaneOption {
+                    target: raw,
+                    option: positional[0].to_string(),
+                    value,
+                    unset,
+                    append,
+                    only_if_unset,
+                    quiet,
+                    resp: rtx,
+                });
                 let reply = rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
                 let _ = resp_tx.send(reply);
                 return true;
@@ -5315,19 +5337,30 @@ fn dispatch_control_command(
                     .filter(|a| !a.starts_with('-'))
                     .copied()
                     .last();
+                // Same split as the one-shot route: `@name` inherits from the
+                // user option store (#728).
                 let inherited = |n: &str| -> Option<String> {
                     let (frtx, frrx) = mpsc::channel::<String>();
-                    let _ = tx.send(CtrlReq::ShowWindowOptionValue(
-                        frtx,
-                        n.to_string(),
-                        raw_t.clone(),
-                    ));
+                    if n.starts_with('@') {
+                        let _ = tx.send(CtrlReq::ShowOptionValue(frtx, n.to_string()));
+                    } else {
+                        let _ = tx.send(CtrlReq::ShowWindowOptionValue(
+                            frtx,
+                            n.to_string(),
+                            raw_t.clone(),
+                        ));
+                    }
                     frrx.recv_timeout(Duration::from_millis(2000)).ok()
                         .filter(|v| !v.is_empty())
                 };
                 let out = match name {
-                    Some(name) => crate::server::options::select_pane_option_line(
-                        &reply, name, combined_has2('v'), combined_has2('A'), inherited,
+                    Some(name) => crate::server::options::pane_option_query_reply(
+                        &reply,
+                        name,
+                        combined_has2('v'),
+                        combined_has2('A'),
+                        combined_has2('q'),
+                        inherited,
                     ),
                     // #655: `-A` adds the inherited entries here too, so the
                     // command prompt and the CLI print the same listing.

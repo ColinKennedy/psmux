@@ -1113,14 +1113,149 @@ pub(crate) fn apply_set_option(
 /// Catalog options psmux stores per pane, in the order `show-options -p`
 /// prints them.
 ///
-/// `set-option -p` accepts exactly two names (server/mod.rs
-/// `CtrlReq::SetPaneOption`): `remain-on-exit`, which is a catalog option a
-/// pane can inherit from its window and then the global store, and
-/// `@mouse-force`, which is a USER option. tmux prints a user option from the
+/// `set-option -p` accepts one catalog name ([`apply_set_pane_option`]):
+/// `remain-on-exit`, which a pane can inherit from its window and then the
+/// global store. Everything else it stores is a USER option (`@mouse-force`,
+/// and since #728 any `@name`). tmux prints a user option from the
 /// table's own entries (cmd-show-options.c:249-254, the `options_table_entry(o)
 /// == NULL` walk) and never invents an inherited one for it, so only the
 /// catalog name belongs here.
 pub(crate) const PANE_OPTION_NAMES: &[&str] = &["remain-on-exit"];
+
+/// Resolve a `set-option -p` / `show-options -p` target to the pane it names.
+///
+/// `raw` is "" for the active pane, or a `%N` / `N` pane id. The TCP routes
+/// resolve and focus a richer spelling before they get here (connection.rs
+/// `pane_scope_target`), but the command prompt and config route hand over
+/// what was typed, so a `sess:win.pane` spec is resolved like any other pane
+/// target rather than silently meaning the active pane.
+pub(crate) fn resolve_option_target_pane<'a>(
+    app: &'a mut AppState,
+    raw: &str,
+) -> Option<&'a mut crate::types::Pane> {
+    let raw = raw.trim().trim_matches('"');
+    if raw.is_empty() {
+        let window = app.windows.get_mut(app.active_idx)?;
+        return crate::tree::active_pane_mut(&mut window.root, &window.active_path);
+    }
+    let id = match raw.trim_start_matches('%').parse::<usize>() {
+        Ok(id) => id,
+        Err(_) => {
+            let (window_pos, path) = crate::window_ops::resolve_pane_spec(app, raw).ok()?;
+            let window = app.windows.get(window_pos)?;
+            crate::tree::get_active_pane_id_at_path(&window.root, &path)?
+        }
+    };
+    crate::tree::find_pane_mut_by_id_global(app, id)
+}
+
+/// The whole of `set-option -p [-u|-a|-o] [-q] [-t pane] <name> [value]`,
+/// shared by the TCP/CLI routes, the in-TUI command prompt and the config
+/// file so every route lands the same write (#728).
+///
+/// tmux keeps an options table on every pane and puts ANY `@name` user option
+/// there (cmd-set-option.c with `-p` picks `wp->options`; a user option has no
+/// table entry so it takes the scope of the flags). `#{@name}` for that pane
+/// then resolves pane, window, session, global in that order (options.c
+/// `options_get` walks `oo->parent`). psmux used to accept only
+/// `remain-on-exit` and `@mouse-force` here and refused every other user
+/// option, which broke `omx team` and the Claude Code teammate backend.
+///
+/// Semantics, each verified against tmux 3.4:
+/// * `-u` removes the pane's own entry (an absent one is not an error), so the
+///   pane inherits again.
+/// * `-a` appends to the pane's OWN value only (options_set_string looks the
+///   name up with options_get_only), never to an inherited one.
+/// * `-o` on a name the pane already owns is `already set: <name>`, silent
+///   under `-q`.
+/// * A non `@` name other than the per pane catalog options psmux implements
+///   stays a loud refusal, never a silently stored no-op (#580).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_set_pane_option(
+    app: &mut AppState,
+    target: &str,
+    option: &str,
+    value: &str,
+    unset: bool,
+    append: bool,
+    only_if_unset: bool,
+    quiet: bool,
+) -> String {
+    let Some(pane) = resolve_option_target_pane(app, target) else {
+        return format!("ERROR: can't find pane: {}", target);
+    };
+    let store = &mut pane.pane_options;
+    match option {
+        "remain-on-exit" | "@mouse-force" => {
+            // These two predate the general store and keep their validation.
+            // An empty value without -u still means "unset", as it always did.
+            if unset || value.is_empty() {
+                store.remove(option);
+                return String::new();
+            }
+            let valid = if option == "remain-on-exit" {
+                matches!(value, "on" | "off" | "failed")
+            } else {
+                matches!(value, "on" | "off" | "1" | "0" | "true" | "false" | "yes" | "no")
+            };
+            if !valid {
+                return if option == "remain-on-exit" {
+                    format!("ERROR: set-option -p remain-on-exit: bad value '{}' (want on, off or failed)", value)
+                } else {
+                    format!("ERROR: set-option -p @mouse-force: bad value '{}' (want on or off)", value)
+                };
+            }
+            if only_if_unset && store.contains_key(option) {
+                return if quiet { String::new() } else { format!("ERROR: already set: {}", option) };
+            }
+            store.insert(option.to_string(), value.to_string());
+            String::new()
+        }
+        name if name.starts_with('@') && name.len() > 1 => {
+            if unset {
+                store.remove(name);
+                return String::new();
+            }
+            if only_if_unset && store.contains_key(name) {
+                return if quiet { String::new() } else { format!("ERROR: already set: {}", name) };
+            }
+            let stored = if append {
+                format!("{}{}", store.get(name).map(String::as_str).unwrap_or(""), value)
+            } else {
+                value.to_string()
+            };
+            store.insert(name.to_string(), stored);
+            String::new()
+        }
+        // Loud refusal, never a silent stored no-op: the Claude Code teammate
+        // backend checked nothing but exit codes and a swallowed pane option
+        // looked exactly like success (#580).
+        other => format!(
+            "ERROR: pane-scoped option '{}' is not supported (supported: remain-on-exit, @mouse-force, any @user option)",
+            other
+        ),
+    }
+}
+
+/// A pane's own value for a user option, then the value it inherits.
+///
+/// tmux resolves `#{@name}` for a pane through pane, window, session and
+/// global tables (format.c format_find falls through to `options_get` on the
+/// pane's options, whose parent chain is the window's, then the session's,
+/// then the global ones). psmux keeps every non pane `@name` in one store
+/// (`user_options`; a psmux server holds one session and `-w @name` lands
+/// there too, see [`is_window_scoped_write`]), so the chain here is the pane
+/// first, then that store.
+pub(crate) fn pane_user_option(
+    app: &AppState,
+    pane: Option<&crate::types::Pane>,
+    name: &str,
+) -> Option<String> {
+    if let Some(value) = pane.and_then(|p| p.pane_options.get(name)) {
+        return Some(value.clone());
+    }
+    app.user_options.get(name).cloned()
+}
 
 /// Body of `show-options -p [-A]` for one pane.
 ///
@@ -1222,9 +1357,38 @@ where
     String::new()
 }
 
+/// [`select_pane_option_line`] plus tmux's verdict on a user option the pane
+/// does not have (#728).
+///
+/// tmux 3.4 cmd-show-options.c: when the named option is not found and the
+/// name starts with `@`, `-q` prints nothing at exit 0 and anything else is
+/// `invalid option: @name` at exit 1. A catalog name the pane does not own
+/// still prints nothing, which is what the #647 contract already does.
+pub(crate) fn pane_option_query_reply<F>(
+    listing: &str,
+    name: &str,
+    values_only: bool,
+    include_inherited: bool,
+    quiet: bool,
+    inherited: F,
+) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let out = select_pane_option_line(listing, name, values_only, include_inherited, inherited);
+    if out.is_empty() && name.starts_with('@') && !quiet {
+        return format!("ERROR: invalid option: {}\n", name);
+    }
+    out
+}
+
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue647_show_options_value.rs"]
 mod tests_issue647_show_options_value;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue728_pane_user_options.rs"]
+mod tests_issue728_pane_user_options;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue648_window_scoped_options.rs"]
