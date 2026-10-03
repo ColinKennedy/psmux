@@ -2,6 +2,7 @@
 # Tests ACTUAL command execution, not just list-keys output
 
 $ErrorActionPreference = "Continue"
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $script:Pass = 0; $script:Fail = 0
 function OK { param($m) Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
 function FAIL { param($m) Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }
@@ -44,9 +45,8 @@ function DumpField {
         $w.WriteLine("AUTH $key"); $w.Flush()
         $null = $r.ReadLine()
         $w.WriteLine("dump-state"); $w.Flush()
-        Start-Sleep -Milliseconds 500
-        $buf = ""
-        while ($s.DataAvailable) { $buf += [char]$s.ReadByte() }
+        # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+        $buf = Read-TcpReplyToEof -Stream $s -TimeoutMs 2000
         $tcp.Close()
         if ($buf -match "`"$Field`":(true|false|`"[^`"]*`"|\d+|\[[^\]]*\])") {
             return $Matches[1]

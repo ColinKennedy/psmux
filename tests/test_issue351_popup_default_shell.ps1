@@ -3,6 +3,7 @@
 # an interactive shell-backed popup, not a static close-only message.
 
 $ErrorActionPreference = "Continue"
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $results = @()
 
 function Add-Result($name, $pass, $detail = "") {
@@ -60,15 +61,11 @@ function Get-DumpState {
     $writer.AutoFlush = $true
     $writer.WriteLine("AUTH $(Get-Key)")
     $writer.WriteLine("dump-state")
-    Start-Sleep -Milliseconds $DelayMs
-
-    $buf = New-Object byte[] 1048576
-    $total = 0
-    while ($stream.DataAvailable -and $total -lt $buf.Length) {
-        $total += $stream.Read($buf, $total, $buf.Length - $total)
-    }
+    # The reply ends when the server closes the connection (tcp_reply_common.ps1);
+    # DelayMs is now only the upper bound on the wait.
+    $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs ([Math]::Max($DelayMs, 5000))
     $tcp.Close()
-    return [System.Text.Encoding]::UTF8.GetString($buf, 0, $total)
+    return $resp
 }
 
 try {
