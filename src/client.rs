@@ -844,8 +844,23 @@ fn active_copy_sel_end(layout: &LayoutJson) -> Option<(u16, u16)> {
 /// `None` for a gesture whose endpoint never made it to the screen (a flick the
 /// frames did not catch up with): the newest drag cell stands, as it does in
 /// tmux, and the flick is copied.
-fn copy_release_repin(pane_id: usize, painted: Option<(u16, u16)>) -> Option<String> {
-    painted.map(|(row, col)| format!("pane-mouse {} 32 {} {} M\n", pane_id, col, row))
+///
+/// The painted cell is a CONTENT column, the way the server reports it, and
+/// a mouse report carries a view column, so the line number gutter has to be
+/// put back on before this goes out: the server takes it off again
+/// (`window_ops::handle_pane_mouse`). `gutter` is 0 whenever no gutter is
+/// drawn, which leaves the column alone.
+fn copy_release_repin(
+    pane_id: usize,
+    painted: Option<(u16, u16)>,
+    gutter: u16,
+    pane_width: u16,
+) -> Option<String> {
+    painted.map(|(row, col)| {
+        let col = crate::copy_line_numbers::cursor_offset(
+            gutter as usize, col as usize, pane_width as usize);
+        format!("pane-mouse {} 32 {} {} M\n", pane_id, col, row)
+    })
 }
 
 /// The commands a copy-mode drag release sends, in order: the re-pin of the
@@ -860,10 +875,12 @@ fn copy_release_commands(
     dragged: bool,
     painted: Option<(u16, u16)>,
     release: (i16, i16),
+    gutter: u16,
+    pane_width: u16,
 ) -> Vec<String> {
     let mut cmds = Vec::new();
     if dragged {
-        if let Some(repin) = copy_release_repin(pane_id, painted) {
+        if let Some(repin) = copy_release_repin(pane_id, painted, gutter, pane_width) {
             cmds.push(repin);
         }
     }
@@ -878,15 +895,28 @@ mod copy_release_repin_tests {
     #[test]
     fn the_repin_reports_the_painted_cell_as_a_drag() {
         assert_eq!(
-            copy_release_repin(7, Some((3, 14))).expect("a painted cell must be re-reported"),
+            copy_release_repin(7, Some((3, 14)), 0, 80).expect("a painted cell must be re-reported"),
             "pane-mouse 7 32 14 3 M\n",
             "col 14, row 3: the same order the drag itself uses"
         );
     }
 
+    /// With a gutter on screen the painted cell is reported where it is
+    /// PAINTED: the server reads a mouse column as a view column and takes
+    /// the gutter back off, so a re-pin that sent the content column moved
+    /// the endpoint left by the width of the gutter.
+    #[test]
+    fn the_repin_reports_the_column_the_gutter_painted_it_at() {
+        assert_eq!(
+            copy_release_repin(7, Some((3, 14)), 4, 80).expect("a painted cell must be re-reported"),
+            "pane-mouse 7 32 18 3 M\n",
+            "content column 14 is drawn at view column 18 behind a 4-wide gutter"
+        );
+    }
+
     #[test]
     fn a_gesture_with_nothing_painted_sends_no_repin() {
-        assert!(copy_release_repin(7, None).is_none());
+        assert!(copy_release_repin(7, None, 0, 80).is_none());
     }
 
     /// The reported bug, at the client end: the drag reached cell 15 and only
@@ -895,7 +925,7 @@ mod copy_release_repin_tests {
     #[test]
     fn a_drag_release_repins_the_painted_cell_before_reporting_up() {
         assert_eq!(
-            copy_release_commands(7, true, Some((3, 14)), (15, 3)),
+            copy_release_commands(7, true, Some((3, 14)), (15, 3), 0, 80),
             vec![
                 "pane-mouse 7 32 14 3 M\n".to_string(),
                 "pane-mouse 7 0 15 3 m\n".to_string(),
@@ -906,7 +936,7 @@ mod copy_release_repin_tests {
     #[test]
     fn a_release_with_nothing_painted_sends_only_the_release() {
         assert_eq!(
-            copy_release_commands(7, true, None, (15, 3)),
+            copy_release_commands(7, true, None, (15, 3), 0, 80),
             vec!["pane-mouse 7 0 15 3 m\n".to_string()]
         );
     }
@@ -956,7 +986,7 @@ mod copy_release_repin_tests {
     #[test]
     fn a_click_never_repins() {
         assert_eq!(
-            copy_release_commands(7, false, Some((3, 14)), (14, 3)),
+            copy_release_commands(7, false, Some((3, 14)), (14, 3), 0, 80),
             vec!["pane-mouse 7 0 14 3 m\n".to_string()]
         );
     }
@@ -2111,10 +2141,15 @@ pub fn render_layout_json(
             if *copy_mode && *active {
                 if let (Some(cr), Some(cc)) = (copy_cursor_row, copy_cursor_col) {
                     let cr = (*cr).min(inner.height.saturating_sub(1));
-                    // The gutter shifts content right, so the cursor shifts too.
+                    // The gutter shifts content right, so the cursor shifts
+                    // too. A mouse column is brought back through the same
+                    // shift on the way in, so the two directions are one pair
+                    // of functions (tmux `window_copy_cursor_offset` and
+                    // `window_copy_cursor_unoffset`).
                     let cc = (*cc).min(inner.width.saturating_sub(1).saturating_sub(gutter_w));
                     let cy = inner.y + cr;
-                    let cx = inner.x + gutter_w + cc;
+                    let cx = inner.x + crate::copy_line_numbers::cursor_offset(
+                        gutter_w as usize, cc as usize, inner.width as usize) as u16;
                     // While a selection is on screen the copy cursor sits on one
                     // of its endpoints.  Reversing that cell (and parking the
                     // host terminal's cursor on it) turns a selected cell into
@@ -3353,6 +3388,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut rsel_block: bool = false;
     let mut selection_changed = false; // forces redraw for selection overlay
     let mut border_drag = false; // true when dragging a pane separator (resize)
+    // The copy-mode line number mode and scrollback size the frames are being
+    // painted with, which is what the gutter width is computed from. Kept out
+    // here because a copy-mode release re-reports a cell the server gave as a
+    // content column, and a mouse report carries a view column
+    // (`copy_release_repin`).
+    let mut client_copy_ln: (crate::copy_line_numbers::CopyLnMode, usize) =
+        (crate::copy_line_numbers::CopyLnMode::Off, 0);
     // Track rendered tab positions for accurate mouse click detection.
     // (row, window_display_idx, x_start, x_end) — one entry per clickable tab
     // span, on WHICHEVER status row it renders (#593: multi-row bars carry
@@ -6309,8 +6351,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             }).map(|&(id, r)| (id, r))
                                         });
                                         if let Some((pane_id, pane_rect)) = target {
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
                                             let rel_col = me.column as i16 - pane_rect.x as i16;
-                                            let rel_row = me.row as i16 - pane_content_inner(pane_rect, &client_border_status, &client_border_format).y as i16;
+                                            let rel_row = me.row as i16 - inner.y as i16;
+                                            // The gutter this pane is painted
+                                            // with, from the same three inputs
+                                            // the renderer uses.
+                                            let gutter = crate::copy_line_numbers::gutter_width(
+                                                client_copy_ln.0, client_copy_ln.1, inner.height as usize) as u16;
                                             // The final motion may have been applied by the
                                             // server (and written into a frame) without ever
                                             // being drawn: re-report the endpoint that is
@@ -6325,6 +6373,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             }
                                             for cmd in copy_release_commands(
                                                 pane_id, copy_drag_last.is_some(), client_drawn_sel, (rel_col, rel_row),
+                                                gutter, pane_rect.width,
                                             ) {
                                                 cmd_batch.push(cmd);
                                             }
@@ -6349,11 +6398,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // the selection yanks, and stop the auto-scroll repeat.
                                 if copy_drag_pane.is_some() {
                                     if client_copy_mode {
-                                        if let (Some((pane_id, _)), Some((rc, rr))) = (copy_drag_pane, copy_drag_last) {
+                                        if let (Some((pane_id, pane_rect)), Some((rc, rr))) = (copy_drag_pane, copy_drag_last) {
                                             // Same re-pin as the normal release: the
                                             // synthetic release must not finalize a cell
                                             // that was never painted either.
-                                            for cmd in copy_release_commands(pane_id, true, client_drawn_sel, (rc, rr)) {
+                                            let inner = pane_content_inner(pane_rect, &client_border_status, &client_border_format);
+                                            let gutter = crate::copy_line_numbers::gutter_width(
+                                                client_copy_ln.0, client_copy_ln.1, inner.height as usize) as u16;
+                                            for cmd in copy_release_commands(
+                                                pane_id, true, client_drawn_sel, (rc, rr), gutter, pane_rect.width,
+                                            ) {
                                                 cmd_batch.push(cmd);
                                             }
                                         }
@@ -6946,6 +7000,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         defaults_suppressed = state.defaults_suppressed;
         scroll_enter_copy_mode = state.scroll_enter_copy_mode;
         mouse_drag_enter_copy_mode = state.mouse_drag_enter_copy_mode;
+        client_copy_ln = (
+            crate::copy_line_numbers::CopyLnMode::parse(
+                state.copy_mode_line_numbers.as_deref()
+                    .unwrap_or(crate::copy_line_numbers::DEFAULT)),
+            state.copy_hsize,
+        );
         // Sync repeat-time from server
         repeat_time_ms = state.repeat_time;
         // Sync bold-is-bright (issue #425) into the console writer's atomic.

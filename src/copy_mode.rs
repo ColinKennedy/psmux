@@ -900,6 +900,34 @@ pub fn run_goto_line(app: &mut AppState, arg: &str) {
     }
 }
 
+/// How many columns the copy-mode line number gutter pushes the active pane's
+/// content to the right, 0 when no gutter is drawn.
+///
+/// The client paints the gutter from the same three inputs, the option, the
+/// active pane's scrollback size and its height (the `copy_ln` render config
+/// in client.rs), so this is the width that is on screen, and it is what a
+/// pointer column has to be brought back through
+/// (`copy_line_numbers::cursor_unoffset`).
+pub fn active_gutter_width(app: &AppState) -> usize {
+    let mode = crate::copy_line_numbers::CopyLnMode::parse(
+        app.user_options
+            .get("copy-mode-line-numbers")
+            .map(|s| s.as_str())
+            .unwrap_or(crate::copy_line_numbers::DEFAULT),
+    );
+    if !mode.is_active() {
+        return 0;
+    }
+    let Some(win) = app.windows.get(app.active_idx) else { return 0 };
+    let Some(p) = active_pane(&win.root, &win.active_path) else { return 0 };
+    let Ok(parser) = p.term.lock() else { return 0 };
+    crate::copy_line_numbers::gutter_width(
+        mode,
+        parser.screen().scrollback_filled(),
+        p.last_rows as usize,
+    )
+}
+
 /// The scroll offset `goto-line <lineno>` asks for, given the size of the
 /// history and whether line numbers are being counted absolutely.
 ///

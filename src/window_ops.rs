@@ -1159,6 +1159,10 @@ pub fn toggle_zoom(app: &mut AppState) {
 
 pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // The width of the line number gutter the pointer column was measured
+    // over, read before the focus below can change which pane is the active
+    // one (see `copy_cell_for_area`).
+    let gutter = if app.mode.in_copy() { crate::copy_mode::active_gutter_width(app) } else { 0 };
     // Status bar tab clicks are handled client-side via select-window.
     // Only handle pane focus and border resize here.
     let status_row = app.last_window_area.y + app.last_window_area.height;
@@ -1214,7 +1218,7 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
         app.copy_anchor = None;
         app.copy_pos_published = None;
         if let Some(area) = active_area {
-            let (row, col) = copy_cell_for_area(label.content(area), x, y);
+            let (row, col) = copy_cell_for_area(label.content(area), x, y, gutter);
             app.copy_pos = Some((row, col));
             // A press is not a drag: this cell is in the view on screen now, so
             // leave the endpoint unpinned.  Pinning here survived the press as
@@ -1261,6 +1265,10 @@ pub fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
 
 pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // The width of the line number gutter the pointer column was measured
+    // over, read before the focus below can change which pane is the active
+    // one (see `copy_cell_for_area`).
+    let gutter = if app.mode.in_copy() { crate::copy_mode::active_gutter_width(app) } else { 0 };
 
     // A floating-pane drag moves or resizes the grabbed float, following the
     // cursor. Runs before any tiled handling and short-circuits it.
@@ -1314,7 +1322,7 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
             .map(|(p, a)| (p.clone(), label.content(*a)));
         if let Some((path, area)) = target {
             win.active_path = path;
-            let (row, col) = copy_cell_for_area(area, x, y);
+            let (row, col) = copy_cell_for_area(area, x, y, gutter);
             if app.copy_anchor.is_none() {
                 // Only start selection when mouse moves to a different cell
                 // than the click position. Prevents micro-drag jitter (#199).
@@ -1363,6 +1371,10 @@ pub fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) {
 
 pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
     let (x, y) = map_client_coords(app, x, y);
+    // The width of the line number gutter the pointer column was measured
+    // over, read before the focus below can change which pane is the active
+    // one (see `copy_cell_for_area`).
+    let gutter = if app.mode.in_copy() { crate::copy_mode::active_gutter_width(app) } else { 0 };
     // End any floating-pane drag.
     if app.float_drag.is_some() {
         app.float_drag = None;
@@ -1383,7 +1395,7 @@ pub fn remote_mouse_up(app: &mut AppState, x: u16, y: u16) {
         let mut release_cell = None;
         if let Some((path, area)) = rects.iter().find(|(_, area)| area.contains(ratatui::layout::Position { x, y })) {
             win.active_path = path.clone();
-            release_cell = Some(copy_cell_for_area(label.content(*area), x, y));
+            release_cell = Some(copy_cell_for_area(label.content(*area), x, y, gutter));
             // Only a release with no drag endpoint of its own may position the
             // cursor — a press that belonged to another pane, or that arrived
             // before copy mode opened (#669).  Once a drag has anchored a
@@ -1550,10 +1562,16 @@ fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
     (col, row)
 }
 
-fn copy_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {
+fn copy_cell_for_area(area: Rect, x: u16, y: u16, gutter: usize) -> (u16, u16) {
     // Convert global terminal coordinates to 0-based pane-local coordinates (no border offset).
     let col = x.saturating_sub(area.x).min(area.width.saturating_sub(1));
     let row = y.saturating_sub(area.y).min(area.height.saturating_sub(1));
+    // A copy-mode column counts the pane's content, and the pointer counts
+    // what is on screen: the line number gutter sits between the two
+    // (tmux `window_copy_cursor_unoffset`, window-copy.c). `gutter` is 0
+    // whenever no gutter is drawn, which leaves the column untouched.
+    let col = crate::copy_line_numbers::cursor_unoffset(
+        gutter, col as usize, area.width as usize) as u16;
     (row, col)
 }
 
@@ -1663,6 +1681,10 @@ pub fn remote_scroll_down(app: &mut AppState, x: u16, y: u16) { remote_scroll_wh
 /// The client has already determined the target pane and computed pane-relative
 /// coordinates, so no coordinate translation is needed.
 pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i16, row: i16, press: bool) {
+    // The width of the line number gutter the pointer column was measured
+    // over, read before the focus below can change which pane is the active
+    // one (see `copy_cell_for_area`).
+    let gutter = if app.mode.in_copy() { crate::copy_mode::active_gutter_width(app) } else { 0 };
     // Find the pane by ID and focus it
     let win = &mut app.windows[app.active_idx];
     let mut found_path: Option<Vec<usize>> = None;
@@ -1703,7 +1725,12 @@ pub fn handle_pane_mouse(app: &mut AppState, pane_id: usize, button: u8, col: i1
         let max_r = (rows_v.saturating_sub(1)) as i16;
         let max_c = (cols_v.saturating_sub(1)) as i16;
         let r = row.clamp(0, max_r.max(0)) as u16;
-        let c = col.clamp(0, max_c.max(0)) as u16;
+        // Clamped to the pane first, because the client sends the column
+        // unclamped, and then brought back through the gutter: the client
+        // reports where the pointer is on screen, and a copy-mode column
+        // counts content (tmux `window_copy_cursor_unoffset`).
+        let c = crate::copy_line_numbers::cursor_unoffset(
+            gutter, col.clamp(0, max_c.max(0)) as usize, cols_v as usize) as u16;
         if button == 0 && press {
             // Left press: position cursor, clear selection
             app.copy_anchor = None;
@@ -3890,3 +3917,7 @@ mod tests_issue689_break_swap_pane;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue708_respawn_history_env.rs"]
 mod test_issue708_respawn_history_env;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue732_copy_mouse_gutter.rs"]
+mod test_issue732_copy_mouse_gutter;
