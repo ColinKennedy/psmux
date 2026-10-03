@@ -93,16 +93,15 @@ function Send-Tcp([string]$Command, [switch]$Persistent) {
         $wr.WriteLine("AUTH $key")
         if ($rd.ReadLine() -ne "OK") { $tcp.Close(); return "AUTH_FAIL" }
         $wr.WriteLine($Command)
+        # A one-shot reply is one send followed by the server's FIN, so read to
+        # EOF. A DataAvailable check would stop after the first line, since the
+        # whole reply is already in the StreamReader buffer. ReadTimeout bounds it.
         $lines = @()
         try {
             while ($true) {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if (-not $st.DataAvailable) {
-                    Start-Sleep -Milliseconds 150
-                    if (-not $st.DataAvailable) { break }
-                }
             }
         } catch {}
         $tcp.Close()
