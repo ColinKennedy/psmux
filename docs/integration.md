@@ -418,7 +418,7 @@ row per object. The full catalogue, including the human facing status bar variab
 | `#{version}` | `3.3.7` | psmux version, for capability gating |
 | `#{pid}` / `#{server_pid}` | `19004` | PID of the server process that answered. **Session-scoped**, see below |
 | `#{server_instance}` | `b644f0a347fa5e14` | Stable identity of the `-L` namespace. Poll this to detect a real restart |
-| `#{socket_path}` | `C:\Users\me/.psmux/default` | Server discovery path |
+| `#{socket_path}` | `C:\Users\me/.psmux/default` | The server that answered: `<psmux dir>/default`, `<psmux dir>/<label>` under `-L`, or the exact path given to `-S`. Passing it back to `-S` reaches the same server |
 | `#{host}` / `#{host_short}` / `#{user}` | `BOX` / `me` | Host and user identity |
 
 > **Supervising a namespace.** Unlike tmux, psmux runs one server process per
@@ -629,7 +629,7 @@ psmux sets these environment variables in child processes, matching tmux:
 
 | Variable | Example | Description |
 |----------|---------|-------------|
-| `TMUX` | `/tmp/psmux-58828/default,51961,0` | Indicates a tmux/psmux session is active. The shape is `/tmp/psmux-<server pid>/<socket name>,<port>,0`, so the middle field is the server's TCP port rather than a Unix pid |
+| `TMUX` | `/tmp/psmux-58828/default,51961,0` | Indicates a tmux/psmux session is active. The shape is `/tmp/psmux-<server pid>/<socket name>,<port>,0` (for a server started with `-S`, the first field is that exact path), so the middle field is the server's TCP port rather than a Unix pid. The first field passed to `-S` reaches the same server |
 | `TMUX_PANE` | `%1` | The pane ID of the current pane |
 | `PSMUX_SESSION` | `work` | The session the pane belongs to (psmux extension) |
 | `TERM` | `xterm-256color` | Terminal type |

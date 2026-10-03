@@ -47,6 +47,7 @@ mod pty_trace;
 mod startup_trace;
 mod wsl_path;
 mod terminal_overrides;
+mod socket_path;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -710,7 +711,14 @@ fn main() {
     if let Err(e) = run_main() {
         // Print a user-friendly error message instead of Rust's Debug format
         // which shows "Error: Custom { kind: Other, error: \"...\" }"  (fixes #47)
-        let msg = e.to_string();
+        let mut msg = e.to_string();
+        // Under `-S` the routing base is an internal `sock-<hash>__<session>`
+        // name; say which socket had no server, as tmux does (#730).
+        if let Some(path) = crate::socket_path::cli_socket_path() {
+            if msg.starts_with("no server running on session '") {
+                msg = format!("no server running on {}", path);
+            }
+        }
         eprintln!("psmux: {}", msg);
         std::process::exit(1);
     }
@@ -906,6 +914,7 @@ fn run_main() -> io::Result<()> {
     // IMPORTANT: Only recognize -L as a global flag when it appears BEFORE the subcommand.
     // This avoids conflict with subcommand flags (e.g. select-pane -L, resize-pane -L).
     let mut l_socket_name: Option<String> = None;
+    let mut s_socket_path: Option<String> = None;
     let mut f_config_file: Option<String> = None;
     let mut precommand_target: Option<String> = None;
     let mut control_mode: u8 = 0; // 0=off, 1=-C (echo), 2=-CC (no echo)
@@ -929,7 +938,8 @@ fn run_main() -> io::Result<()> {
                 precommand_target = Some(args[i + 1].clone());
                 i += 2;
             } else if arg == "-S" && i + 1 < args.len() {
-                i += 2; // skip other global flag-value pairs
+                s_socket_path = Some(args[i + 1].clone());
+                i += 2;
             } else if arg.starts_with('-') {
                 i += 1; // skip single global flags (e.g. -v, -V)
             } else {
@@ -937,6 +947,29 @@ fn run_main() -> io::Result<()> {
             }
         }
     }
+
+    // Issue #730: `-S <path>` names a server just as `-L` does, and wins over
+    // `-L` like tmux (tmux.c main: a path, when given, is used as is and the
+    // label is never expanded). It used to be skipped here, so every `-S`
+    // command reached the DEFAULT server, `kill-server` included. The path is
+    // exported for the server this client may spawn, which reports it as
+    // `#{socket_path}`. The variable is not cleared when `-S` is absent: the
+    // `server` invocation a client spawns carries only `-L <ns>` and reads it
+    // from here, and a server trusts it only when it hashes to its own
+    // namespace, so a copy inherited from anywhere else is inert.
+    if let Some(path) = s_socket_path.as_deref() {
+        match crate::socket_path::namespace_for_socket_path(path, &crate::paths::psmux_dir()) {
+            Ok(ns) => l_socket_name = ns,
+            Err(e) => {
+                eprintln!("psmux: {}", e);
+                std::process::exit(1);
+            }
+        }
+        env::set_var(crate::socket_path::SOCKET_PATH_ENV, path);
+        crate::socket_path::set_cli_socket_path(path);
+    }
+    // What `no server running on ...` names: the `-S` path when one was given.
+    let shown_socket: Option<String> = s_socket_path.clone();
 
     // Set PSMUX_CONFIG_FILE if -f was provided, so load_config() picks it up.
     if let Some(ref cf) = f_config_file {
@@ -1254,9 +1287,10 @@ fn run_main() -> io::Result<()> {
                 // <socket>` at exit 1; scripts (`tmux kill-server 2>/dev/null ||
                 // true`) lean on that code, and an exit 0 here used to claim a
                 // kill that never happened.
-                match l_socket_name.as_deref() {
-                    Some(l) => eprintln!("psmux: no server running on {} (-L {})", psmux_dir, l),
-                    None => eprintln!("psmux: no server running on {}", psmux_dir),
+                match (shown_socket.as_deref(), l_socket_name.as_deref()) {
+                    (Some(s), _) => eprintln!("psmux: no server running on {}", s),
+                    (None, Some(l)) => eprintln!("psmux: no server running on {} (-L {})", psmux_dir, l),
+                    (None, None) => eprintln!("psmux: no server running on {}", psmux_dir),
                 }
                 std::process::exit(1);
             }
@@ -1441,9 +1475,10 @@ fn run_main() -> io::Result<()> {
                     // `no server running on <socket>` and exits 1 here, and
                     // scripts lean on that code (`tmux ls || start`), so an
                     // empty listing at exit 0 was a portability trap.
-                    match l_socket_name.as_deref() {
-                        Some(l) => eprintln!("psmux: no server running on {} (-L {})", dir, l),
-                        None => eprintln!("psmux: no server running on {}", dir),
+                    match (shown_socket.as_deref(), l_socket_name.as_deref()) {
+                        (Some(s), _) => eprintln!("psmux: no server running on {}", s),
+                        (None, Some(l)) => eprintln!("psmux: no server running on {} (-L {})", dir, l),
+                        (None, None) => eprintln!("psmux: no server running on {}", dir),
                     }
                     std::process::exit(1);
                 }

@@ -1807,6 +1807,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         app.format_job_rx = Some(fjrx);
     }
     app.socket_name = socket_name;
+    // Pin the `-S` path (#730) now, from the environment this server was
+    // started with, before a warm claim or set-environment can touch it.
+    let _ = crate::socket_path::server_recorded_path(app.socket_name.as_deref());
     app.session_group = group_target;
     // The session id belongs to a server, so it is allocated here rather than in
     // `AppState::new`: the counter lives in the data directory, and building a

@@ -590,7 +590,7 @@ These are parsed before psmux looks at the command name.
 | `-C` | Control mode with command echo. |
 | `-CC` | Control mode without command echo. |
 | `-t <target>` | Target `session`, `session:window` or `session:window.pane` for the command that follows. |
-| `-S <path>` | Socket path, accepted and its value consumed. |
+| `-S <path>` | Selects the server for that path, and wins over `-L` as in tmux. A path inside the psmux data dir (`<dir>/<label>`, what `#{socket_path}` prints) or the `$TMUX` first field selects that label; any other path selects a private namespace keyed by a hash of the normalized absolute path, so every spelling of one path reaches one server. `#{socket_path}` and the first field of `$TMUX` in its panes report the path as given. |
 | `-h`, `--help` | Usage. |
 | `-V`, `-v`, `--version` | Version. |
 
