@@ -2931,6 +2931,8 @@ match cmd {
             // (cmd-join-pane.c:515). It was parsed nowhere, so join-pane
             // always switched, the same defect break-pane had (#689).
             detach: args.iter().any(|a| *a == "-d"),
+            // -b: the moved pane goes left of / above the target (#725).
+            before: args.contains(&"-b"),
         });
     }
     "respawn-pane" | "respawnp" => {

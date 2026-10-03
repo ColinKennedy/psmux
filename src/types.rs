@@ -2937,6 +2937,8 @@ pub enum CtrlReq {
         target_pane: Option<usize>,
         horizontal: bool,
         detach: bool,
+        /// `-b`: the moved pane goes left of / above the target (#725).
+        before: bool,
     },
     /// respawn-pane. Fields: optional workdir (-c), kill flag (-k), command
     /// (`--`/positional shell-command), empty (-E), and the per-request reply.
@@ -3112,6 +3114,8 @@ pub enum CtrlReq {
         target_pane: Option<usize>,
         horizontal: bool,
         detach: bool,
+        /// `-b`: the moved pane goes left of / above the target (#725).
+        before: bool,
     },
     /// Extract a pane and start I/O forwarding for cross-session transfer.
     /// Fields: window index, pane index, response channel.

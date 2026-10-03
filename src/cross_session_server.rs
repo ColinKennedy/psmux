@@ -293,12 +293,12 @@ pub fn handle_pane_forward_inject(
             app.windows[tgt_idx].active_path.clone()
         };
         let split_kind = if horizontal { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-        tree::replace_leaf_with_split(
-            &mut app.windows[tgt_idx].root,
-            &tgt_path,
-            split_kind,
-            Node::Leaf(proxy_pane),
-        );
+        // Cross session join-pane has no -d: the joined pane becomes active,
+        // and active_path is re-anchored on it instead of on the split the
+        // graft created (#725).
+        if let Some(g) = tree::graft_pane(&mut app.windows[tgt_idx], &tgt_path, split_kind, Node::Leaf(proxy_pane), false, true) {
+            if let Some(prev) = g.prev_active_path { app.last_pane_path = prev; }
+        }
         app.active_idx = tgt_idx;
     }
 }
