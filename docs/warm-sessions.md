@@ -112,6 +112,55 @@ spawning, which covers the slowest spawn at that concurrency. Over the ten call
 burst the two together took the p50 from 57 ms to about 25 ms and removed the
 450 to 550 ms outliers entirely.
 
+### The third quick creation at depth two
+
+Five `new-window` calls in a row, each waiting for its prompt (TEST 2 of
+`tests/test_pane_startup_perf.ps1`), come out like `[51, 34, 1118, 39, 34]` at
+the default depth of two: the first two take settled spares, the third pays
+0.9 to 1.2 s against a bare `pwsh -NoProfile` of about 335 ms. The trace says
+why. The second call takes the last ready spare, which opens a surge, and the
+pool schedules seven spawns at once (two waves of four `CreateProcessW`). The
+third call is handed the one spare that was already starting, and that shell
+boots alongside both waves.
+
+Other shells starting nearby slow a shell's startup, and it is not the CPU.
+Measured with no psmux (a C# probe starting the Store pwsh with `-NoProfile`
+and timing it by its own exit time, 32 logical CPUs mostly idle, seven runs
+each): alone 306 ms; four more started 0 to 50 ms after it 473 to 494; 100 to
+200 ms after it about 410; 300 ms after it 306. Four started 300 ms before it
+cost 384, 400 ms or more before it nothing. Eight cost about the same as four
+(484). Starting the others at idle priority changed nothing. So the cost is
+contention in the first 300 to 400 ms of each process's life, and the only lever
+is when the other shells start.
+
+That lever was tried and rejected, because it only moves the cost. Capping how
+many spares may start while the shell a caller waits on is still starting
+(three, five in a burst) took the third window to 450 to 726 ms over ten
+interleaved runs, but the pool then had fewer started spares when the next
+creations came: the four splits that follow the window run (TEST 3) went from a
+worst of 33 to 80 ms on master to 160 to 653 ms, and once the depth five
+contract failed (p90 202 ms). Protecting the waiting shell for a fixed time
+instead (400, 700 or 1000 ms after it started) either lost the gain (1167, 892,
+900 ms) or kept the split cost (779, 806, 414 ms). One wave of eight
+`CreateProcessW` instead of two waves of four did not help either (1075,
+1748 ms). The total amount of shell starting is fixed by how many creations
+follow, and at depth two one of them pays for it; `warm-pool-size 5` is the
+setting for a user who opens windows in runs, and its contract (every creation
+fast, p90 150 ms) holds. The experiment is kept on the branch
+`perf-refill-budget-experiment` with all of its numbers.
+
+One side effect visible in the same traces was also tried on its own and
+dropped. A claim that waits for in flight spares takes the first one to land,
+while package activation returns a batch of concurrent spawns within a couple
+of milliseconds of each other in no id order; the claim's id raises the pool's
+floor, so the lower ids landing a millisecond later are killed on arrival
+("refused spare pane=5 below floor 6") and spawned again. Landing the whole
+batch before choosing (5 ms) is correct and unit testable, but over three
+interleaved runs of `tests/test_issue686_pool_surge_and_reap.ps1` it changed
+nothing measurable: burst mean 247, 246, 154 ms against 97, 136, 187 on
+master, refusals 16, 48, 8 against 13, 11, 32. An earlier set of three had
+shown the opposite, which is the size of the noise on this machine.
+
 ### Teardown
 
 A spare that is still being spawned belongs to nobody: the shell exists, its
