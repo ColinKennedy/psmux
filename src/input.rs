@@ -2425,6 +2425,165 @@ pub(crate) fn write_ctrl_key_as_record(p: &mut crate::types::Pane, c: char, shif
     true
 }
 
+/// `ENHANCED_KEY` in a console `KEY_EVENT_RECORD`'s control key state: the
+/// arrows and the navigation block, which Windows Terminal flags as such.
+#[cfg(windows)]
+pub(crate) const ENHANCED_KEY: u32 = 0x0100;
+/// `LEFT_ALT_PRESSED` in a console `KEY_EVENT_RECORD`'s control key state.
+#[cfg(windows)]
+pub(crate) const LEFT_ALT_PRESSED: u32 = 0x0002;
+
+/// The key a complete VT named key sequence stands for, as the virtual key,
+/// the character and the control key state of the console record Windows
+/// Terminal would have sent for it.  `None` for anything that is not exactly
+/// one such sequence (text, a paste, a mouse report, a lone `ESC`).
+///
+/// The sequences are the ones psmux itself writes for a named key, which are
+/// tmux's `input_key_defaults` (input-keys.c): `CSI A..D H F`, their DECCKM
+/// `SS3` forms, `CSI n ~` for the editing block and F5..F12, `SS3 P..S` for
+/// F1..F4, `CSI Z`, and the xterm modified forms `CSI 1;m x` and `CSI n;m ~`
+/// with `m` = 1 + Shift + 2 Alt + 4 Ctrl.
+#[cfg(windows)]
+pub(crate) fn named_key_record(seq: &[u8]) -> Option<(u16, u16, u32)> {
+    fn cursor_vk(c: u8) -> Option<u16> {
+        Some(match c {
+            b'A' => 0x26, // VK_UP
+            b'B' => 0x28, // VK_DOWN
+            b'C' => 0x27, // VK_RIGHT
+            b'D' => 0x25, // VK_LEFT
+            b'H' => 0x24, // VK_HOME
+            b'F' => 0x23, // VK_END
+            _ => return None,
+        })
+    }
+    fn pf_vk(c: u8) -> Option<u16> {
+        Some(match c {
+            b'P' => 0x70, b'Q' => 0x71, b'R' => 0x72, b'S' => 0x73, // VK_F1..VK_F4
+            _ => return None,
+        })
+    }
+    fn tilde_vk(n: u32) -> Option<(u16, bool)> {
+        Some(match n {
+            2 => (0x2D, true),  // VK_INSERT
+            3 => (0x2E, true),  // VK_DELETE
+            5 => (0x21, true),  // VK_PRIOR
+            6 => (0x22, true),  // VK_NEXT
+            15 => (0x74, false), 17 => (0x75, false), 18 => (0x76, false),
+            19 => (0x77, false), 20 => (0x78, false), 21 => (0x79, false),
+            23 => (0x7A, false), 24 => (0x7B, false), // VK_F5..VK_F12
+            _ => return None,
+        })
+    }
+    fn mods(m: u32) -> Option<u32> {
+        if !(2..=8).contains(&m) {
+            return None;
+        }
+        let b = m - 1;
+        Some(
+            if b & 1 != 0 { SHIFT_PRESSED } else { 0 }
+                | if b & 2 != 0 { LEFT_ALT_PRESSED } else { 0 }
+                | if b & 4 != 0 { LEFT_CTRL_PRESSED } else { 0 },
+        )
+    }
+    fn num(s: &[u8]) -> Option<u32> {
+        if s.is_empty() || s.len() > 3 || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(s).ok()?.parse().ok()
+    }
+
+    if seq.len() < 3 || seq[0] != 0x1b {
+        return None;
+    }
+    let last = *seq.last()?;
+    match seq[1] {
+        b'O' if seq.len() == 3 => {
+            if let Some(vk) = cursor_vk(last) {
+                return Some((vk, 0, ENHANCED_KEY));
+            }
+            pf_vk(last).map(|vk| (vk, 0, 0))
+        }
+        b'[' => {
+            let params = &seq[2..seq.len() - 1];
+            if params.is_empty() {
+                if last == b'Z' {
+                    return Some((0x09, 0x09, SHIFT_PRESSED)); // VK_TAB, Shift+Tab
+                }
+                return cursor_vk(last).map(|vk| (vk, 0, ENHANCED_KEY));
+            }
+            let mut it = params.splitn(2, |&b| b == b';');
+            let first = num(it.next()?)?;
+            let modifier = match it.next() {
+                Some(m) => Some(mods(num(m)?)?),
+                None => None,
+            };
+            if last == b'~' {
+                let (vk, enhanced) = tilde_vk(first)?;
+                let cs = modifier.unwrap_or(0) | if enhanced { ENHANCED_KEY } else { 0 };
+                return Some((vk, 0, cs));
+            }
+            // `CSI 1;m x` only: an unmodified key never carries the `1;`.
+            if first != 1 {
+                return None;
+            }
+            let m = modifier?;
+            if let Some(vk) = cursor_vk(last) {
+                return Some((vk, 0, m | ENHANCED_KEY));
+            }
+            pf_vk(last).map(|vk| (vk, 0, m))
+        }
+        _ => None,
+    }
+}
+
+/// Deliver a named key (an arrow, Home, End, the editing block, a function
+/// key, Shift+Tab, any of them modified) to a pane that reads VT input as the
+/// win32 input mode record Windows Terminal sends for it, instead of as its VT
+/// bytes.  Returns true when the key was written here.
+///
+/// Issue #729.  A pane's conhost does not parse the VT bytes psmux writes when
+/// the child reads VT input (`ENABLE_VIRTUAL_TERMINAL_INPUT`): it hands them
+/// over one character record each.  A plain VT reader cannot tell, because
+/// the characters come back out as the same bytes.  A child that ALSO asked
+/// its console for win32 input mode (`CSI ?9001h`, which Ink based TUIs such
+/// as dsh-TUI and Claude Code do on Windows) reads every record in that form,
+/// so the Up arrow arrived as three keys, `ESC[0;0;27;1;0;1_`,
+/// `ESC[0;0;91;1;0;1_`, `ESC[0;0;65;1;0;1_`: a lone Escape, then `[` and `A`
+/// typed as text.  Windows Terminal never shows this, because conhost asks
+/// its terminal for win32 input mode at startup (it writes `CSI ?9001h` to
+/// psmux too) and the terminal answers every key with a real record, which
+/// that child reads as one `ESC[38;72;0;1;256;1_`.
+///
+/// Measured under a bare pseudoconsole, a VT reader WITHOUT win32 input mode
+/// gets exactly the bytes psmux used to write for each of these keys from the
+/// record form, modifiers included, and conhost applies DECCKM itself
+/// (`ESC O A` when the child set `CSI ?1h`).  So the substitution changes
+/// nothing for such a child and repairs the one that asked for records.
+///
+/// Record readers are left on the VT bytes: conhost parses those into the same
+/// records already, and Far, PSReadLine and crossterm apps are measured on that
+/// path.  A win32 sequence latches the ConPTY (issue #588), so the latch is
+/// recorded for the lone `ESC` repair in [`write_pane_input`].
+#[cfg(windows)]
+fn write_named_key_as_record(p: &mut crate::types::Pane, bytes: &[u8]) -> bool {
+    use std::io::Write as _;
+    let Some((vk, uchar, ctrl_state)) = named_key_record(bytes) else { return false };
+    if !crate::window_ops::pane_reads_vt_bytes(p) {
+        return false;
+    }
+    let scan = crate::platform::mouse_inject::vk_to_scan(vk);
+    let seq = win32_input_key_seq(vk, scan, uchar, ctrl_state);
+    let _ = p.writer.write_all(seq.as_bytes());
+    let _ = p.writer.flush();
+    p.win32_input_latched = true;
+    crate::debug_log::input_log(
+        "named-key-record",
+        &format!("#729 {:?} as win32 record vk=0x{:02X} cs=0x{:X} pid={:?}",
+            String::from_utf8_lossy(bytes), vk, ctrl_state, p.child_pid),
+    );
+    true
+}
+
 /// Write key bytes into ONE pane's ConPTY input pipe.
 ///
 /// Every key psmux delivers to a pane goes through here so the one byte that
@@ -2450,6 +2609,9 @@ pub(crate) fn write_pane_input(p: &mut crate::types::Pane, bytes: &[u8]) {
     use std::io::Write as _;
     #[cfg(windows)]
     {
+        if write_named_key_as_record(p, bytes) {
+            return;
+        }
         if bytes == b"\x1b" && p.win32_input_latched {
             const VK_ESCAPE: u16 = 0x1B;
             let scan = crate::platform::mouse_inject::vk_to_scan(VK_ESCAPE);
@@ -2804,7 +2966,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         let win = &mut app.windows[app.active_idx];
         fn write_all_panes(node: &mut Node, data: &[u8]) {
             match node {
-                Node::Leaf(p) if !p.dead => { let _ = p.writer.write_all(data); let _ = p.writer.flush(); }
+                Node::Leaf(p) if !p.dead => write_pane_input(p, data),
                 Node::Leaf(_) => {}
                 Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
             }
@@ -2815,9 +2977,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         let win = &mut app.windows[app.active_idx];
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if !active.dead {
-                let _ = active.writer.write_all(&encoded);
-                let _ = active.writer.flush();
-
+                write_pane_input(active, &encoded);
             }
         }
     }
@@ -3954,7 +4114,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
                 if let Ok(n) = s[1..].parse::<u8>() {
                     let seq = function_key_seq(n);
-                    if !seq.is_empty() { let _ = write!(p.writer, "{}", seq); }
+                    if !seq.is_empty() { write_key_seq(p, seq.as_bytes()); }
                 }
             }
             // Ctrl+Shift+<letter>: inject a native KEY_EVENT carrying BOTH the
@@ -4166,7 +4326,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             // Modifier + special key combos: C-Left, S-Right, C-S-Up, C-M-Home, etc.
             s if parse_modified_special_key(s).is_some() => {
                 let seq = parse_modified_special_key(s).unwrap();
-                let _ = p.writer.write_all(seq.as_bytes());
+                write_key_seq(p, seq.as_bytes());
             }
             _ => {}
         }
