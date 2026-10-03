@@ -25,6 +25,7 @@
 #>
 
 $ErrorActionPreference = 'Continue'
+. "$PSScriptRoot\tcp_reply_common.ps1"
 
 $script:TestsPassed = 0
 $script:TestsFailed = 0
@@ -108,9 +109,14 @@ function Close-Conn($conn) {
     try { if ($conn.Tcp)    { $conn.Tcp.Close() } } catch {}
 }
 
-# Read whatever the server emits in response to one command, draining briefly so
-# multi-line replies are captured. Bounded by ReadTimeout; never throws upward.
-function Read-Reply($conn, [int]$DrainMs = 250) {
+# Read the server's reply to one command. A one-shot connection's reply ends
+# when the server closes it (ReadLine returns null), bounded by ReadTimeout;
+# never throws upward. -UntilQuiet keeps the old quiet-socket drain, for a
+# PERSISTENT connection that never closes and only needs its backlog skimmed.
+function Read-Reply($conn, [int]$DrainMs = 250, [switch]$UntilQuiet) {
+    if (-not $UntilQuiet) {
+        return ((Read-TcpReplyLines -Reader $conn.Reader) -join "`n")
+    }
     $lines = @()
     try {
         while ($true) {
@@ -325,7 +331,7 @@ try {
         try { $flood.Writer.WriteLine('PERSISTENT') } catch {}
         Start-Sleep -Milliseconds 100
         # Drain any banner/ack from PERSISTENT without blocking the flood.
-        try { if ($flood.Stream.DataAvailable) { [void](Read-Reply $flood 50) } } catch {}
+        try { if ($flood.Stream.DataAvailable) { [void](Read-Reply $flood 50 -UntilQuiet) } } catch {}
 
         $floodCount = 200
         $sentOk = 0

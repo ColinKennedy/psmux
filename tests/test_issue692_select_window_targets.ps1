@@ -96,10 +96,9 @@ function Send-OverSocket([string]$Command) {
                 $line = $r.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if (-not $s.DataAvailable) {
-                    Start-Sleep -Milliseconds 120
-                    if (-not $s.DataAvailable) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $c.Close()

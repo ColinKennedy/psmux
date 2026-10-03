@@ -24,6 +24,61 @@ fn clear_inherit(s: &TcpStream) {
 #[cfg(not(windows))]
 fn clear_inherit(_s: &TcpStream) {}
 
+/// The write side of a client connection: one logical reply, one send.
+///
+/// The default `Write::write_fmt` hands every piece of a format string to
+/// `write_all` on its own, so on a TCP_NODELAY socket `write!(s, "{}\n", text)`
+/// went out as two segments (the text, then the newline) and
+/// `writeln!(s, "ERROR: {}", e)` as three, so what a reader got from one recv
+/// depended on segment timing. A reply's end is the close of the connection
+/// (one-shot) or its newline (persistent frames); one send per reply keeps the
+/// bytes a reader sees independent of timing. This wrapper formats the whole argument
+/// list into one buffer and sends it with a single `write_all`, so every
+/// `write!` / `writeln!` on a connection is one send; `write`, `write_all` and
+/// `flush` pass straight through. It derefs to the socket for the read only
+/// calls (`set_nodelay`, `shutdown`, `register_persistent_stream`), and
+/// `try_clone` hands back another `ReplyStream` so clones keep the property.
+pub(crate) struct ReplyStream(TcpStream);
+
+impl ReplyStream {
+    fn try_clone(&self) -> io::Result<ReplyStream> {
+        self.0.try_clone().map(ReplyStream)
+    }
+
+    /// The underlying socket, for a clone that is only ever shut down.
+    fn socket(&self) -> &TcpStream {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ReplyStream {
+    type Target = TcpStream;
+    fn deref(&self) -> &TcpStream {
+        &self.0
+    }
+}
+
+impl Write for ReplyStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.write_all(buf)
+    }
+
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        match args.as_str() {
+            Some(s) => self.0.write_all(s.as_bytes()),
+            None => self.0.write_all(std::fmt::format(args).as_bytes()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// Expand a `set-option -F` value as a format before it is stored.
 ///
 /// tmux's set-option takes `-F` and runs the value through format_expand before
@@ -754,7 +809,7 @@ let client_id = crate::types::next_client_id();
 let _ = stream.set_nodelay(true);
 // Clone stream for writing, original goes into BufReader for reading
 let mut write_stream = match stream.try_clone() {
-    Ok(s) => s,
+    Ok(s) => ReplyStream(s),
     Err(_) => return,
 };
 // Every socket handle on this connection must be non-inheritable: the server
@@ -865,7 +920,7 @@ if line.trim() == "PERSISTENT" {
     // pressure the clone chain stays shallow.  If the clone fails here we
     // return early — the client immediately sees a closed connection and
     // reconnects, which is far better than hanging with no shutdown signal.
-    let ws_shutdown = match write_stream.try_clone() {
+    let ws_shutdown = match write_stream.socket().try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -1029,10 +1084,9 @@ if control_echo || control_noecho {
         let mut ws = write_lock.lock().unwrap();
         if control_noecho {
             let init_ts = chrono::Utc::now().timestamp();
-            // DCS opener (no newline) immediately followed by %begin
-            let _ = ws.write_all(b"\x1bP1000p");
-            let _ = writeln!(ws, "%begin {} 1 0", init_ts);
-            let _ = writeln!(ws, "%end {} 1 0", init_ts);
+            // DCS opener (no newline) immediately followed by %begin, sent
+            // as one write: the bytes are the same, only the send count drops.
+            let _ = write!(ws, "\x1bP1000p%begin {0} 1 0\n%end {0} 1 0\n", init_ts);
         } else {
             // -C (echo) mode: no DCS, just a blank ready line
             let _ = writeln!(ws);
@@ -1110,12 +1164,17 @@ if control_echo || control_noecho {
         let raw_cmd = parsed.first().map(|s| s.as_str()).unwrap_or("");
 
         if raw_cmd.is_empty() {
-            let mut ws = write_lock.lock().unwrap();
+            let mut out = String::new();
             if control_echo {
-                let _ = writeln!(ws, "{}", trimmed);
+                out.push_str(trimmed);
+                out.push('\n');
             }
-            let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
-            let _ = writeln!(ws, "{}", control::format_end(ts, cmd_counter));
+            out.push_str(&control::format_begin(ts, cmd_counter));
+            out.push('\n');
+            out.push_str(&control::format_end(ts, cmd_counter));
+            out.push('\n');
+            let mut ws = write_lock.lock().unwrap();
+            let _ = ws.write_all(out.as_bytes());
             let _ = ws.flush();
             continue;
         }
@@ -1349,29 +1408,35 @@ if control_echo || control_noecho {
         // with command responses.  This matches real tmux's single-
         // threaded behaviour where command output and notifications are
         // serialized on one bufferevent.
-        let mut ws = write_lock.lock().unwrap();
+        //
+        // The whole block (echo, %begin, body, %end or %error) is built
+        // first and sent with one write under the lock, so a reply leaves
+        // in one send instead of one per line; the bytes are unchanged.
+        let mut out = String::new();
 
         // Echo the command if -C mode
         if control_echo {
-            let _ = writeln!(ws, "{}", trimmed);
+            out.push_str(trimmed);
+            out.push('\n');
         }
 
         // Send %begin
-        let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
+        out.push_str(&control::format_begin(ts, cmd_counter));
+        out.push('\n');
 
         match response_result {
             Some(Ok(response)) => {
                 // Sentinel-encoded error: dispatcher signals %error
                 // instead of %end by prefixing with \u{0001}ERR\u{0001}.
                 let (is_error, body) = if let Some(stripped) = response.strip_prefix("\u{0001}ERR\u{0001}") {
-                    (true, stripped.to_string())
+                    (true, stripped)
                 } else {
-                    (false, response)
+                    (false, response.as_str())
                 };
                 if !body.is_empty() {
-                    let _ = write!(ws, "{}", body);
+                    out.push_str(body);
                     if !body.ends_with('\n') {
-                        let _ = writeln!(ws);
+                        out.push('\n');
                     }
                 }
                 let footer = if is_error {
@@ -1379,17 +1444,22 @@ if control_echo || control_noecho {
                 } else {
                     control::format_end(ts, cmd_counter)
                 };
-                let _ = writeln!(ws, "{}", footer);
+                out.push_str(&footer);
+                out.push('\n');
             }
             Some(Err(_)) => {
-                let _ = writeln!(ws, "command timed out");
-                let _ = writeln!(ws, "{}", control::format_error(ts, cmd_counter));
+                out.push_str("command timed out\n");
+                out.push_str(&control::format_error(ts, cmd_counter));
+                out.push('\n');
             }
             None => {
                 // Command dispatched without response channel (fire and forget)
-                let _ = writeln!(ws, "{}", control::format_end(ts, cmd_counter));
+                out.push_str(&control::format_end(ts, cmd_counter));
+                out.push('\n');
             }
         }
+        let mut ws = write_lock.lock().unwrap();
+        let _ = ws.write_all(out.as_bytes());
         let _ = ws.flush();
         drop(ws);
     }
@@ -4809,6 +4879,29 @@ match cmd {
         }
     }
 } // end command loop
+    // A one-shot connection ends with the reply and then EOF: that is the
+    // whole contract a client reads to (tmux's client reads its server until
+    // the peer closes, never on a timer: proc.c:82-91 hands the closed read to
+    // client_dispatch, client.c:579). Close it gracefully: everything written
+    // above is already in the send buffer, shutdown(Write) queues the FIN
+    // behind it, and the input the client may still have in flight is read
+    // off before the socket is dropped, because closesocket() on a socket
+    // with unread input sends RST instead of FIN and a reset can discard the
+    // reply the client has not read yet. The drain is bounded by the 10 ms
+    // batching read timeout set above and by a byte cap, and costs the client
+    // nothing: its FIN has already gone out.
+    if !persistent {
+        let _ = write_stream.flush();
+        let _ = write_stream.shutdown(std::net::Shutdown::Write);
+        let mut sink = [0u8; 4096];
+        let mut drained = 0usize;
+        while drained < 64 * 1024 {
+            match io::Read::read(&mut r, &mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    }
 }
 
 /// Dispatch a command from a control mode client.

@@ -3,6 +3,7 @@
 # both server-side (list-keys) and client-side (actual key dispatch)
 
 $ErrorActionPreference = "Continue"
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $script:TestsPassed = 0
 $script:TestsFailed = 0
 
@@ -81,9 +82,8 @@ function Get-DumpStateField {
     $writer.WriteLine("AUTH $key"); $writer.Flush()
     $auth = $reader.ReadLine()
     $writer.WriteLine("dump-state"); $writer.Flush()
-    Start-Sleep -Milliseconds 500
-    $buf = ""
-    while ($stream.DataAvailable) { $buf += [char]$stream.ReadByte() }
+    # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+    $buf = Read-TcpReplyToEof -Stream $stream -TimeoutMs 2000
     $tcp.Close()
     if ($buf -match "`"$FieldName`":(true|false|`"[^`"]*`"|\d+|\[[^\]]*\])") {
         return $Matches[1]

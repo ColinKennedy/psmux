@@ -10,6 +10,7 @@
 #>
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $pass = 0; $fail = 0; $skip = 0; $total = 0
 
 function Write-Test($msg) { Write-Host "  TEST: $msg" -ForegroundColor Cyan; $script:total++ }
@@ -58,13 +59,8 @@ function Send-Tcp($cmd) {
     $auth = $reader.ReadLine()
     if ($auth -ne "OK") { $client.Close(); return @{ok=$false; resp="AUTH failed: $auth"} }
     $writer.WriteLine($cmd)
-    Start-Sleep -Milliseconds 200
-    $buf = New-Object byte[] 16384
-    $resp = ""
-    while ($stream.DataAvailable) {
-        $n = $stream.Read($buf, 0, $buf.Length)
-        $resp += [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
-    }
+    # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+    $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs 3000
     $client.Close()
     @{ok=$true; resp=$resp.Trim()}
 }

@@ -108,10 +108,9 @@ function Send-TcpCommand {
                 $line = $rd.ReadLine()
                 if ($null -eq $line) { break }
                 $lines += $line
-                if (-not $ns.DataAvailable) {
-                    Start-Sleep -Milliseconds 120
-                    if (-not $ns.DataAvailable) { break }
-                }
+                # Read to EOF: a one-shot reply ends when the server closes the
+                # connection (ReadLine returns null), bounded by ReadTimeout. A quiet
+                # socket is not the end of a reply.
             }
         } catch {}
         $tcp.Close()

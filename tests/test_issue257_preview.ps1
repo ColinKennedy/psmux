@@ -11,6 +11,7 @@
 # CLI plus by confirming the underlying capture mechanism returns content.
 
 $ErrorActionPreference = "Continue"
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $PSMUX = (Get-Command psmux -EA Stop).Source
 $SESSION = "issue257_preview"
 $psmuxDir = "$env:USERPROFILE\.psmux"
@@ -197,11 +198,8 @@ if ($paneCount -ne 3) {
             # Consume auth ack ("OK")
             $null = $reader.ReadLine()
             $writer.WriteLine("window-layout $wid")
-            Start-Sleep -Milliseconds 400
-            $resp = ""
-            while ($stream.DataAvailable) {
-                $resp += [char]$stream.ReadByte()
-            }
+            # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+            $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs 1500
             $client.Close()
             Write-Host "  Layout JSON: $resp" -ForegroundColor DarkGray
             $leafCount = ([regex]::Matches($resp, '"type":"leaf"')).Count
@@ -325,9 +323,8 @@ if ($paneIds.Count -ne 3) {
         $writer.WriteLine("AUTH $key")
         $null = $reader.ReadLine()
         $writer.WriteLine("window-dump $wid")
-        Start-Sleep -Milliseconds 800
-        $resp = ""
-        while ($stream.DataAvailable) { $resp += [char]$stream.ReadByte() }
+        # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+        $resp = Read-TcpReplyToEof -Stream $stream -TimeoutMs 3000
         $client.Close()
 
         # Assertions: response should contain ALL THREE markers, and each

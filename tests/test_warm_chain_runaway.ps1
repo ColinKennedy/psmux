@@ -48,6 +48,7 @@
 # Run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests\test_warm_chain_runaway.ps1
 
 $ErrorActionPreference = 'Continue'
+. "$PSScriptRoot\tcp_reply_common.ps1"
 $PSMUX = (Get-Command psmux -ErrorAction Stop).Source
 $psmuxDir = "$env:USERPROFILE\.psmux"
 $NS = 'wchainrb'
@@ -80,12 +81,9 @@ function Query-LiveSessionName($port, $key) {
         $writer.NewLine = "`n"; $writer.AutoFlush = $true
         $writer.WriteLine("AUTH $key")
         $writer.Write("display-message -p '#{session_name}'`n")
-        Start-Sleep -Milliseconds 200
-        $buf = New-Object byte[] 4096
-        $sb = New-Object System.Text.StringBuilder
-        try { while ($stream.DataAvailable) { $n = $stream.Read($buf,0,$buf.Length); if ($n -le 0) {break}; $sb.Append([System.Text.Encoding]::UTF8.GetString($buf,0,$n)) | Out-Null } } catch {}
+        # The reply ends when the server closes the connection (tcp_reply_common.ps1).
+        $raw = (Read-TcpReplyToEof -Stream $stream -TimeoutMs 500).Trim()
         $client.Close()
-        $raw = $sb.ToString().Trim()
         $lines = @($raw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
         if ($lines.Count -eq 0) { return $null }
         if ($lines[0] -eq "OK" -and $lines.Count -gt 1) { return $lines[1] }
