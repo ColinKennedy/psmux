@@ -1274,9 +1274,21 @@ pub fn land_spare(app: &mut AppState, slot: Option<crate::types::WarmPane>) {
 ///
 /// Waiting instead costs at most this budget and usually ends in an in flight
 /// spare, which keeps the ids monotonic and the treadmill from ever starting.
-/// 250ms covers the slowest spawn measured at the current concurrency; past it
-/// the caller still cold spawns exactly as before.
-pub const WARM_INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Past the budget the caller still cold spawns exactly as before.
+///
+/// The budget was 250ms, "the slowest spawn measured at the current
+/// concurrency" in September 2026. By 2026-10-04 a `CreateProcessW` of the
+/// Store pwsh inside a surge measured 290 to 350ms at its median (Windows
+/// batches the package activations of processes that start together, see
+/// docs/warm-sessions.md), so the wait expired on an ordinary burst: the surge
+/// suite traced 1 to 2 of ten claims cold spawning, each of them a fourth
+/// shell starting beside the surge, the late batch refused below the floor and
+/// killed, and the creation that paid for it took 1.4 to 1.5s instead of 0.7
+/// to 0.9. The wait ends the moment the in flight spare lands, and a cold
+/// spawn would have to run its own `CreateProcessW` from zero beside the same
+/// surge, so it cannot land sooner than the spare it gave up on: the only
+/// spawn worth abandoning is one that is stuck. A second bounds that.
+pub const WARM_INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// A claim found nothing, but refills are already in flight. Wait briefly for
 /// the next one to land and use that, instead of spawning a further shell.

@@ -160,9 +160,22 @@ param(
     # max only catches a blow-up. The floor for one creation in a run of ten is
     # a whole shell startup, because no pool can produce a booted shell faster
     # than a shell boots, and a pwsh cold start measures 600 to 900ms on this
-    # machine. A budget at 800ms flaked on exactly that; 1500ms is above the
+    # machine. A budget at 800ms flaked on exactly that; 1500ms was above the
     # floor with headroom and still far below anything pathological.
-    [int]$MaxLimitMs = 1500,
+    #
+    # 2026-10-04: the floor moved. The cold creation in a run is the one that
+    # drains the pool and then boots through the surge it opened, and the Store
+    # pwsh it waits on costs 1.6x its solo time while the surge's other spawns
+    # go through package activation beside it (the no psmux probe in
+    # docs/warm-sessions.md, "The third quick creation at depth two"). Measured
+    # on master 8c9ef128 to b8c9777f with the bare pwsh start at 324 to 371 ms:
+    # 943 to 1070 ms in six interleaved runs and 1434, 1534 and 1547 ms in three
+    # of about twelve runs under the sweep runner. 1500 sat inside that
+    # envelope, so it failed on the floor it was meant to sit above. 2000 is
+    # above the measured envelope and still half of anything pathological; the
+    # real per creation accounting is tests/test_pane_startup_perf.ps1, which
+    # writes cold_creation_ratio against the bare shell for the trend.
+    [int]$MaxLimitMs = 2000,
     [int]$PollMs = 10,
     # The resource cell: how many windows and splits are stacked up before the
     # second memory sample is taken, and how long the quiet windows are.
