@@ -1058,12 +1058,7 @@ fn run_main() -> io::Result<()> {
             // already been resolved to the on disk name, which carries the
             // prefix, so do not add it a second time: `-L ns cmd -t $N` used
             // to route to `ns__ns__name`, a server that does not exist.
-            let port_file_base = match l_socket_name {
-                Some(ref l) if !session.starts_with(&format!("{}__", l)) => {
-                    format!("{}__{}", l, session)
-                }
-                _ => session.clone(),
-            };
+            let port_file_base = crate::session::namespaced_session_base(l_socket_name.as_deref(), &session);
             // If the -t target includes an explicit session name, use it
             // directly. Otherwise (e.g. -t %2, -t :1.0) fall through to
             // the TMUX env var resolution below so we connect to the right
@@ -3043,12 +3038,7 @@ fn run_main() -> io::Result<()> {
                                 // already carries the prefix, so do not add it
                                 // twice: `-L ns kill-session -t $N` used to look
                                 // for `ns__ns__name`, find nothing, and exit 0.
-                                let namespaced = match l_socket_name {
-                                    Some(ref l) if !resolved.starts_with(&format!("{}__", l)) => {
-                                        format!("{}__{}", l, resolved)
-                                    }
-                                    _ => resolved,
-                                };
+                                let namespaced = crate::session::namespaced_session_base(l_socket_name.as_deref(), &resolved);
                                 target = Some(namespaced);
                                 i += 1;
                             }
@@ -3787,18 +3777,28 @@ fn run_main() -> io::Result<()> {
                 // Get -t from the saved env var (global handler stripped it from cmd_args)
                 let target_spec = std::env::var("PSMUX_TARGET_FULL").unwrap_or_default();
                 // Check if source and target reference different sessions
-                let src_session = if source_spec.contains(':') {
-                    source_spec.split(':').next().unwrap_or("").to_string()
-                } else {
-                    String::new()
+                // Session halves are compared as registry identities: the routed
+                // session (PSMUX_TARGET_SESSION) is the on disk `<ns>__name`
+                // under -L while a typed `sess:1` carries the short name, so a
+                // raw string compare sent every same session move down the
+                // cross session path, which then looked for a server named by
+                // the bare name and failed. Normalising both sides also gives
+                // the genuine cross session path names it can resolve.
+                let session_half = |spec: &str| -> String {
+                    let Some((s, _)) = spec.split_once(':') else { return String::new() };
+                    let s = crate::cli::strip_exact_match_prefix(s);
+                    if s.is_empty() { return String::new(); }
+                    let s = match s.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+                        Some(id) => crate::session::resolve_session_by_id(id).unwrap_or_else(|| s.to_string()),
+                        None => s.to_string(),
+                    };
+                    crate::session::namespaced_session_base(l_socket_name.as_deref(), &s)
                 };
-                let tgt_session = if target_spec.contains(':') {
-                    target_spec.split(':').next().unwrap_or("").to_string()
-                } else {
-                    String::new()
-                };
+                let src_session = session_half(&source_spec);
+                let tgt_session = session_half(&target_spec);
                 let current_session = std::env::var("PSMUX_TARGET_SESSION")
                     .or_else(|_| std::env::var("PSMUX_SESSION"))
+                    .map(|s| crate::session::namespaced_session_base(l_socket_name.as_deref(), &s))
                     .unwrap_or_default();
                 let effective_src = if src_session.is_empty() { current_session.clone() } else { src_session.clone() };
                 let effective_tgt = if tgt_session.is_empty() { current_session.clone() } else { tgt_session.clone() };
@@ -3816,7 +3816,8 @@ fn run_main() -> io::Result<()> {
                 let tgt_after_colon_check = if target_spec.contains(':') {
                     target_spec.split(':').nth(1).unwrap_or("")
                 } else { target_spec.as_str() };
-                let same_session = effective_src == effective_tgt && !effective_src.is_empty();
+                let same_session = !effective_src.is_empty()
+                    && crate::session::same_session_identity(l_socket_name.as_deref(), &effective_src, &effective_tgt);
                 if same_session && !src_after_colon_check.is_empty() && !tgt_after_colon_check.is_empty() {
                     // Prefix with ':' so parse_target reads "0.2" as window=0,pane=2
                     // (a bare "0.2" is otherwise read as session="0", pane=2).
@@ -3829,7 +3830,9 @@ fn run_main() -> io::Result<()> {
                         }
                     }
                 }
-                if !effective_src.is_empty() && !effective_tgt.is_empty() && effective_src != effective_tgt {
+                if !effective_src.is_empty() && !effective_tgt.is_empty()
+                    && !crate::session::same_session_identity(l_socket_name.as_deref(), &effective_src, &effective_tgt)
+                {
                     // Cross-session join-pane: orchestrate via TCP
                     let src_after_colon = if source_spec.contains(':') {
                         source_spec.split(':').nth(1).unwrap_or("0.0")

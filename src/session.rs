@@ -45,6 +45,31 @@ pub fn session_namespace(full: &str) -> Option<&str> {
     }
 }
 
+/// The registry base (port file stem) a session name addresses under `ns`.
+///
+/// A user types the short name (`sess`) inside `-L ns`, while routing state
+/// such as `PSMUX_TARGET_SESSION` and a resolved `$N` id already carry the
+/// on disk name (`ns__sess`). Adding the prefix only when it is missing maps
+/// both spellings onto the same identity, so the prefix is never doubled.
+pub fn namespaced_session_base(ns: Option<&str>, name: &str) -> String {
+    match ns {
+        Some(n) if !n.is_empty() && !name.starts_with(&format!("{}__", n)) => {
+            format!("{}__{}", n, name)
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Whether two session names denote the same session under namespace `ns`.
+///
+/// Either side may be the short name or the namespaced registry base. This is
+/// what a CLI must use to decide whether a `sess:win` target leaves the
+/// routed session: comparing the raw strings read `ns__sess` and `sess` as two
+/// different sessions.
+pub fn same_session_identity(ns: Option<&str>, a: &str, b: &str) -> bool {
+    namespaced_session_base(ns, a) == namespaced_session_base(ns, b)
+}
+
 /// Whether the registry base `base` belongs to namespace `ns`.
 ///
 /// This is the file-name convention in one place: a `-L` namespace writes
@@ -3011,3 +3036,7 @@ mod tests_issue650_cross_session_process_name;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue698_counter_lock_missing_dir.rs"]
 mod tests_issue698_counter_lock_missing_dir;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_namespaced_session_identity.rs"]
+mod tests_namespaced_session_identity;
