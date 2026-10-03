@@ -242,6 +242,27 @@ host on that build mangles them. Under it psmux also takes the cheaper pipe rout
 bracketed paste rather than the `WriteConsoleInputW` injection it uses on the inbox host below
 build 22523; `PSMUX_PASTE_INJECT=1` still forces injection if you need it.
 
+The inbox host also drops a cursor move made while the cursor is hidden, on Windows 11 26200 as
+well as on 19045 (#726). A program that draws its own caret hides the hardware cursor with
+`ESC[?25l` and still moves it onto the caret with CUP, because the outer terminal anchors IME
+composition (Korean, Japanese, Chinese) to that cursor whether it is shown or not. Claude Code and
+other Ink based CLIs work this way. The inbox host never paints a hidden cursor, so that final CUP
+never reaches the pseudoconsole output and psmux sees the cursor wherever the last drawn cell left
+it. psmux moves the outer terminal's hidden cursor to the pane's cursor on every frame, like tmux,
+but on the inbox host that is the wrong cell. Measured with a probe that writes
+`ESC[?25l ... ESC[5;6H` into a 100 by 29 pane:
+
+```
+                              inbox conhost      OpenConsole (from WezTerm)
+#{cursor_x},#{cursor_y}       0,28               5,4
+same probe without ESC[?25l   5,4                5,4
+```
+
+Under `PSMUX_CONPTY_DIR` the composition lands on the caret. One limit remains with either host:
+a pane resize makes the console host repaint its buffer, and a hidden cursor is not put back
+afterwards, so the position is only right again once the program redraws, which Ink based CLIs do
+on every resize.
+
 Measured on Windows 11 26200 with that package at 1.24.2607.10001, against the inbox host, three
 runs each:
 
