@@ -202,7 +202,7 @@ Write-Host "`n[Test 3b] Detached session (never attached) shows no client rows" 
 $S = "iss434_neverattach"
 Cleanup $S
 & $PSMUX new-session -d -s $S; Start-Sleep -Seconds 3
-$rows = @(& $PSMUX list-clients -t $S 2>&1 | Where-Object { $_ -match ': ' + [regex]::Escape($S) + ':' })
+$rows = @(& $PSMUX list-clients -t $S 2>&1 | Where-Object { $_ -match '^/dev/pts/\d+: ' + [regex]::Escape($S) + ' \[' })
 $att  = Attached $S
 if ($rows.Count -eq 0 -and $att -eq "0") {
   Write-Pass "never-attached session: 0 client rows AND session_attached=0"
@@ -221,7 +221,7 @@ Cleanup $S
 & $PSMUX new-session -d -s $S; Start-Sleep -Seconds 3
 $p = Start-Process -FilePath $PSMUX -ArgumentList "attach-session","-t",$S -PassThru -WindowStyle Minimized
 Start-Sleep -Seconds 4
-$dRows = @(& $PSMUX list-clients -t $S 2>&1 | Where-Object { $_ -match ': ' + [regex]::Escape($S) + ':' })
+$dRows = @(& $PSMUX list-clients -t $S 2>&1 | Where-Object { $_ -match '^/dev/pts/\d+: ' + [regex]::Escape($S) + ' \[' })
 if ((Attached $S) -eq "1" -and $dRows.Count -eq 1) { Write-Pass "attached: exactly 1 row, attached=1" }
 else { Write-Fail "attach state wrong: rows=$($dRows.Count) attached=$(Attached $S)" }
 # `-s` is the SESSION selector; `-t` names a CLIENT (a tty or %id), per tmux and
@@ -232,7 +232,7 @@ else { Write-Fail "attach state wrong: rows=$($dRows.Count) attached=$(Attached 
 # client", so `-s` is the right selector.
 & $PSMUX detach-client -s $S 2>&1 | Out-Null
 Start-Sleep -Seconds 3
-$aRows = @(& $PSMUX list-clients -t $S 2>&1 | Where-Object { $_ -match ': ' + [regex]::Escape($S) + ':' })
+$aRows = @(& $PSMUX list-clients -t $S 2>&1 | Where-Object { $_ -match '^/dev/pts/\d+: ' + [regex]::Escape($S) + ' \[' })
 $aAtt  = Attached $S
 $pDead = -not (Get-Process -Id $p.Id -EA SilentlyContinue)
 if ($aRows.Count -eq 0 -and $aAtt -eq "0" -and $pDead) {

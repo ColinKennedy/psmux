@@ -795,6 +795,59 @@ fn parse_new_pane_args(args: &[&str]) -> ParsedNewPane {
     ParsedNewPane { command, x, y, w, h, border, title, start_dir, detached, print, empty }
 }
 
+/// The request for `list-clients [-F format] [-f filter]` (issue #724).
+fn list_clients_request(args: &[&str], resp: mpsc::Sender<String>) -> CtrlReq {
+    let fmt = extract_flag_value(args, "-F");
+    let filter = extract_flag_value(args, "-f");
+    match (fmt, filter) {
+        (None, None) => CtrlReq::ListClients(resp),
+        (fmt, filter) => CtrlReq::ListClientsFormat(
+            resp,
+            fmt.unwrap_or_else(|| crate::format::default_list_clients_format().to_string()),
+            filter,
+        ),
+    }
+}
+
+/// The process on the other end of this loopback connection (issue #724).
+fn connection_peer_pid(stream: &TcpStream) -> Option<u32> {
+    let peer = stream.peer_addr().ok()?.port();
+    let ours = stream.local_addr().ok()?.port();
+    crate::platform::process_kill::loopback_peer_pid(peer, ours)
+}
+
+/// What a read only client (`attach -r`, tmux CLIENT_READONLY) may still send.
+///
+/// tmux drops a read only client's keys, pastes and mouse events
+/// (server-client.c:1425, :1639, :1646) and refuses any bound or typed command
+/// that is not flagged CMD_READONLY (key-bindings.c, server-client.c:2751):
+/// attach-session, copy-mode, detach-client, list-clients, send-keys -X and
+/// switch-client. The rest of this list is psmux's own client protocol (frames,
+/// size, focus and identity reports) and queries that change nothing, without
+/// which the client could not draw at all.
+pub(crate) fn readonly_client_may_run(cmd: &str) -> bool {
+    matches!(cmd,
+        // psmux client protocol
+        "dump-state" | "dump" | "dump-layout" | "session-info" | "client-size"
+        | "host-colors" | "client-attach" | "client-detach" | "client-last-session"
+        | "client-flags" | "focus-in" | "focus-out" | "prefix-begin" | "prefix-end"
+        | "overlay-close" | "window-layout" | "window-dump" | "list-tree"
+        // tmux CMD_READONLY commands
+        | "attach-session" | "attach" | "detach-client" | "detach"
+        | "switch-client" | "switchc" | "list-clients" | "lsc"
+        | "copy-mode" | "copy-enter" | "copy-move" | "copy-anchor"
+        | "rectangle-toggle" | "copy-mode-page-up" | "copy-yank"
+        // overlays that only show something
+        | "display-panes" | "displayp" | "menu-navigate"
+        // queries
+        | "list-windows" | "lsw" | "list-panes" | "lsp" | "list-sessions" | "ls"
+        | "list-buffers" | "lsb" | "list-keys" | "lsk" | "list-commands" | "lscm"
+        | "has-session" | "show-buffer" | "showb" | "show-environment" | "showenv"
+        | "show-hooks" | "show-messages" | "showmsgs" | "show-options" | "show"
+        | "show-window-options" | "showw" | "server-info" | "info"
+    )
+}
+
 /// Handle a single TCP connection from a client.
 /// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
 /// to the main server event loop via the `tx` channel.
@@ -1103,6 +1156,8 @@ if control_echo || control_noecho {
         client_id: ctrl_client_id,
         echo: control_echo,
         notif_tx: notif_tx,
+        // `#{client_pid}` of a -CC client is the process at the other end (#724).
+        pid: connection_peer_pid(r.get_ref()),
     });
 
     // Control mode command loop: read lines, dispatch, wrap in %begin/%end/%error
@@ -1499,6 +1554,8 @@ let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(10)));
 
 // Process commands in a loop to handle batching
 let mut attached_sent = false;
+// `attach -r` (issue #724): set by the client's `client-flags read-only`.
+let mut client_readonly = false;
 let mut pending_chain: Vec<String> = Vec::new();
 loop {
     // Check pending chained commands before reading from socket
@@ -1591,6 +1648,15 @@ if let Err(flag_error) = crate::cli::validate_flag_arguments(cmd, &args) {
     let _ = writeln!(write_stream, "ERROR: {}", flag_error);
     let _ = write_stream.flush();
     if !persistent { break; }
+    line.clear();
+    continue;
+}
+
+// A read only client looks but does not touch (issue #724). Dropped here,
+// before any target is resolved or focused, so a refused command has no side
+// effect at all. Nothing is written back: this is the attached client's frame
+// stream, and tmux too drops a read only client's keys without a word.
+if persistent && client_readonly && !readonly_client_may_run(cmd) {
     line.clear();
     continue;
 }
@@ -2788,6 +2854,7 @@ match cmd {
         let mut parts: Vec<&str> = Vec::new();
         let mut end_of_opts = false;
         let mut duration_ms: Option<u64> = None;
+        let mut client_sel: Option<crate::types::ClientSel> = None;
         let mut i = 0;
         while i < args.len() {
             let a = args[i];
@@ -2803,6 +2870,14 @@ match cmd {
                 "-d" => {
                     if i + 1 < args.len() {
                         duration_ms = args[i + 1].parse::<u64>().ok();
+                    }
+                    i += 1;
+                }
+                // -c target-client (issue #724): the client the client_*
+                // variables describe. It used to fall into the message text.
+                "-c" => {
+                    if let Some(c) = args.get(i + 1) {
+                        client_sel = Some(crate::types::ClientSel::Name(c.to_string()));
                     }
                     i += 1;
                 }
@@ -2824,12 +2899,12 @@ match cmd {
         let (rtx, rrx) = mpsc::channel::<String>();
         if pane_is_id {
             if let Some(pid) = target_pane {
-                let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_stdout, duration_ms));
+                let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_stdout, duration_ms, client_sel));
             } else {
-                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, None, !print_stdout, duration_ms));
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, None, !print_stdout, duration_ms, client_sel));
             }
         } else {
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane, !print_stdout, duration_ms));
+            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane, !print_stdout, duration_ms, client_sel));
         }
         if let Ok(text) = rrx.recv() {
             if print_stdout {
@@ -3097,8 +3172,24 @@ match cmd {
     }
     "client-attach" => {
         if !attached_sent {
-            let _ = tx.send(CtrlReq::ClientAttach(client_id));
+            let _ = tx.send(CtrlReq::ClientAttach(client_id, connection_peer_pid(r.get_ref())));
             attached_sent = true;
+        }
+        if !persistent { let _ = write!(write_stream, "ok\n"); }
+    }
+    // tmux client flags the attaching client asks for (issue #724). Only
+    // `read-only` (`attach -r`) is meaningful today; `!read-only` clears it,
+    // the way tmux's server_client_set_flags reads a leading `!`.
+    "client-flags" => {
+        for flag in args.iter().flat_map(|a| a.split(',')) {
+            let (off, name) = match flag.strip_prefix('!') {
+                Some(n) => (true, n),
+                None => (false, flag),
+            };
+            if name == "read-only" {
+                client_readonly = !off;
+                let _ = tx.send(CtrlReq::SetClientReadonly(client_id, client_readonly));
+            }
         }
         if !persistent { let _ = write!(write_stream, "ok\n"); }
     }
@@ -3849,18 +3940,15 @@ match cmd {
         let _ = tx.send(CtrlReq::NextLayout);
     }
     "list-clients" | "lsc" => {
-        let fmt = extract_flag_value(&args, "-F");
         let (rtx, rrx) = mpsc::channel::<String>();
-        if let Some(fmt_str) = fmt {
-            let _ = tx.send(CtrlReq::ListClientsFormat(rtx, fmt_str));
-        } else {
-            let _ = tx.send(CtrlReq::ListClients(rtx));
-        }
+        let _ = tx.send(list_clients_request(&args, rtx));
         if let Ok(text) = rrx.recv() {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("list-clients".to_string(), text));
             } else {
-                let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
+                // Each row already ends in a newline; a second one printed an
+                // empty line after the list, and a line for no clients at all.
+                let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
             }
         }
         if !persistent { break; }
@@ -4177,10 +4265,10 @@ match cmd {
                 let _ = tx.send(CtrlReq::ClientDetach(client_id));
                 attached_sent = false;
             } else {
-                if kill_parent {
-                    let _ = crate::types::send_directive_to_client(cid, "DETACH-KILL-PARENT");
-                }
-                let _ = tx.send(CtrlReq::ForceDetachClient(cid));
+                // `%N` and `N` name the client listed as /dev/pts/N. That number
+                // is the client's pid now (issue #724); the server falls back to
+                // the connection id N for a client listed under it.
+                let _ = tx.send(CtrlReq::ForceDetachClientByTty(format!("/dev/pts/{}", cid), kill_parent));
             }
         } else if let Some(tty) = target_str {
             // Non-numeric -t value: treat as a tty_name lookup.
@@ -4196,7 +4284,7 @@ match cmd {
     }
     "attach-session" | "attach" => {
         if !attached_sent {
-            let _ = tx.send(CtrlReq::ClientAttach(client_id));
+            let _ = tx.send(CtrlReq::ClientAttach(client_id, connection_peer_pid(r.get_ref())));
             attached_sent = true;
         }
     }
@@ -4475,7 +4563,9 @@ match cmd {
             let false_cmd = positional.get(2);
             let success = if format_mode {
                 let (rtx, rrx) = std::sync::mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::DisplayMessage(rtx, condition.to_string(), None, false, None));
+                // An attached client's own if-shell -F is about that client.
+                let client = persistent.then_some(crate::types::ClientSel::Id(client_id));
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, condition.to_string(), None, false, None, client));
                 let expanded = rrx.recv().unwrap_or_default();
                 !expanded.is_empty() && expanded != "0"
             } else if condition == "true" || condition == "1" {
@@ -4508,7 +4598,7 @@ match cmd {
         let fmt = extract_flag_value(&args, "-F");
         if let Some(fmt_str) = fmt {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt_str, None, false, None));
+            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt_str, None, false, None, None));
             if let Ok(text) = rrx.recv() {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-sessions".to_string(), text));
@@ -4788,8 +4878,14 @@ match cmd {
         // Lock is a no-op on Windows (no terminal locking concept)
         // Stub for compatibility
     }
-    "focus-in" => { let _ = tx.send(CtrlReq::FocusIn); }
-    "focus-out" => { let _ = tx.send(CtrlReq::FocusOut); }
+    "focus-in" => {
+        let _ = tx.send(CtrlReq::SetClientFocus(client_id, true));
+        let _ = tx.send(CtrlReq::FocusIn);
+    }
+    "focus-out" => {
+        let _ = tx.send(CtrlReq::SetClientFocus(client_id, false));
+        let _ = tx.send(CtrlReq::FocusOut);
+    }
     "choose-client" => {
         let (rtx, rrx) = mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::ListClients(rtx));
@@ -4977,15 +5073,21 @@ fn dispatch_control_command(
                 raw_fmt
             };
             let target_pane_idx = if pane_is_id { None } else { target_pane };
+            // A control client's current client is itself, and `-c` names
+            // another one (issue #724).
+            let client = Some(match extract_flag_value(args, "-c") {
+                Some(c) => crate::types::ClientSel::Name(c),
+                None => crate::types::ClientSel::Id(client_id),
+            });
             let (rtx, rrx) = mpsc::channel::<String>();
             if pane_is_id {
                 if let Some(pid) = target_pane {
-                    let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_mode, None));
+                    let _ = tx.send(CtrlReq::DisplayMessageById(rtx, fmt, pid, !print_mode, None, client));
                 } else {
-                    let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+                    let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None, client));
                 }
             } else {
-                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
+                let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None, client));
             }
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 // Same visual encoding as the one-shot route above (#647).
@@ -5618,13 +5720,8 @@ fn dispatch_control_command(
             true
         }
         "list-clients" | "lsc" => {
-            let fmt = extract_flag_value(&args, "-F");
             let (rtx, rrx) = mpsc::channel::<String>();
-            if let Some(fmt_str) = fmt {
-                let _ = tx.send(CtrlReq::ListClientsFormat(rtx, fmt_str));
-            } else {
-                let _ = tx.send(CtrlReq::ListClients(rtx));
-            }
+            let _ = tx.send(list_clients_request(args, rtx));
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
             }

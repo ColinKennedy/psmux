@@ -2405,6 +2405,13 @@ fn establish_connection_with_timeout(
             );
         }
     }
+    // `attach -r` (issue #724): ask to be a read only client. Like the last
+    // session above it must follow client-attach, and it is resent on every
+    // reconnect because the flag lives on the connection. Sent only when set,
+    // so a normal attach is byte-identical to before.
+    if std::env::var("PSMUX_CLIENT_READONLY").map(|v| v == "1").unwrap_or(false) {
+        let _ = writer.write_all(b"client-flags read-only\n");
+    }
     // Issue #473: report the host terminal's colors (queried once at client
     // startup) so the server can answer pane color queries (OSC 4/10/11,
     // CSI ?996n) with the real palette instead of the Campbell fallback.

@@ -32,12 +32,13 @@ function Get-AttachedSession {
     if ($ForceLastSession) { Set-Content $lastSessionFile -Value $ForceLastSession -NoNewline }
     $proc = Start-Process -FilePath $PSMUX -ArgumentList $ArgList -WindowStyle Minimized -PassThru
     Start-Sleep -Seconds 2
-    $clients = & $PSMUX list-clients 2>&1 | Out-String
+    # The session this attach client joined, found by its own pid (issue #724
+    # made both the pid and the format available).
+    $clients = & $PSMUX list-clients -F '#{client_pid} #{session_name}' 2>&1
     try { Stop-Process -Id $proc.Id -Force -EA SilentlyContinue } catch {}
     Start-Sleep -Milliseconds 400
-    # Parse the most recently active client line: "/dev/pts/N: <session>: cmd ..."
-    $line = ($clients -split "`n" | Where-Object { $_ -match ':\s*\S+:\s' } | Select-Object -Last 1)
-    if ($line -match '^\S+:\s*(\S+):') { return $Matches[1] }
+    $line = ($clients | Where-Object { "$_" -like "$($proc.Id) *" } | Select-Object -Last 1)
+    if ("$line" -match '^\d+ (\S+)$') { return $Matches[1] }
     return ""
 }
 

@@ -22,15 +22,14 @@ $script:Pass = 0; $script:Fail = 0
 function Pass($m){ Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
 function Fail($m){ Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:Fail++ }
 
-# A REAL client shows a numbered pts plus an [activity=] stamp; a session with
-# no client shows nothing or a bare placeholder. That is the discriminator.
+# A REAL client is one row of `list-clients -t <session>`; a session with no
+# client lists nothing. A bare list-clients lists the clients of EVERY session,
+# as tmux does (issue #724), so the session is named explicitly.
 function RealClients($sess) {
     $port = (Get-Content "$psmuxDir\$sess.port" -Raw -EA SilentlyContinue)
     if (-not $port) { return 0 }
-    $env:TMUX = "x,$($port.Trim()),0"
-    $out = & $PSMUX list-clients 2>&1 | Out-String
-    $env:TMUX = $null
-    return ([regex]::Matches($out, 'activity=')).Count
+    $out = & $PSMUX list-clients -t $sess -F '#{client_name}' 2>&1 | Out-String
+    return ([regex]::Matches($out, '/dev/pts/\d+')).Count
 }
 function Fmt($sess, $fmt) {
     $port = (Get-Content "$psmuxDir\$sess.port" -Raw -EA SilentlyContinue)

@@ -122,6 +122,35 @@ pub struct ClientInfo {
     /// (issue #566). `None` means this client has not switched yet, which is
     /// the honest answer rather than somebody else's history.
     pub last_session: Option<String>,
+    /// Process id of the attached client (`#{client_pid}`), 0 until known.
+    ///
+    /// The server reads it from the owner of the client's end of the loopback
+    /// connection, so it is the real attaching process for a TUI client, a
+    /// read only one and a control mode one alike (issue #724).
+    pub pid: u32,
+    /// `attach -r` (tmux CLIENT_READONLY): the client may look but not type.
+    pub readonly: bool,
+    /// The client's terminal has focus (tmux CLIENT_FOCUSED), from its own
+    /// focus-in / focus-out reports.
+    pub focused: bool,
+}
+
+/// The synthetic tty a client is listed under (`#{client_name}`): its process
+/// id when known, else its connection id (issue #724).
+pub fn client_tty_name(cid: u64, pid: Option<u32>) -> String {
+    match pid {
+        Some(p) if p != 0 => format!("/dev/pts/{}", p),
+        _ => format!("/dev/pts/{}", cid),
+    }
+}
+
+/// Which client a format is expanded for (`display-message -c`, issue #724).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientSel {
+    /// A server-side client id (a control mode client asking about itself).
+    Id(u64),
+    /// A client name or tty as the user typed it (`/dev/pts/3`, `pts/3`).
+    Name(String),
 }
 
 /// A pane's standing authorization to receive wheel reports (issue #613).
@@ -1783,11 +1812,25 @@ impl AppState {
     /// the registry entry is naturally unique while the counter is not.
     /// Returns `true` only when a new registry entry was inserted.
     pub fn register_client(&mut self, cid: u64, is_control: bool) -> bool {
+        self.register_client_with_pid(cid, is_control, None)
+    }
+
+    /// [`register_client`](Self::register_client) for a client whose process
+    /// id is known, which then also names it.
+    ///
+    /// tmux names a client after its tty, which is unique on the machine and
+    /// stays the same when the client switches session. psmux clients have no
+    /// tty, and the connection id this name used to be built from is only
+    /// unique inside ONE session's server: two sessions each had a
+    /// `/dev/pts/6`, so `display-message -c /dev/pts/6` could not say which
+    /// one it meant (issue #724). The client's pid has both of tmux's
+    /// properties, so it is the number in the name whenever it is known.
+    pub fn register_client_with_pid(&mut self, cid: u64, is_control: bool, pid: Option<u32>) -> bool {
         if self.client_registry.contains_key(&cid) {
             return false;
         }
 
-        let tty = format!("/dev/pts/{}", cid);
+        let tty = client_tty_name(cid, pid);
         self.client_registry.insert(cid, ClientInfo {
             id: cid,
             width: self.client_area.width,
@@ -1797,6 +1840,9 @@ impl AppState {
             tty_name: tty,
             is_control,
             last_session: None,
+            pid: pid.unwrap_or(0),
+            readonly: false,
+            focused: false,
         });
         self.attached_clients = self.attached_clients.saturating_add(1);
         // Preserve the existing distinction between an interactive TUI client
@@ -2705,7 +2751,9 @@ pub enum CtrlReq {
     /// target pane id (`-t %N`, None = active pane), preserve trailing
     /// spaces (`-N`).
     CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>, bool),
-    ClientAttach(u64),
+    /// (client id, process id of the attaching client when the server could
+    /// read it from the connection, issue #724).
+    ClientAttach(u64, Option<u32>),
     ClientDetach(u64),
     DumpLayout(mpsc::Sender<String>),
     DumpState(mpsc::Sender<String>, bool, u64),  // (resp, allow_nc, client_id)
@@ -2894,9 +2942,9 @@ pub enum CtrlReq {
     /// Delete a named buffer by name
     DeleteNamedBuffer(String),
     PasteBufferAt(usize),
-    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms
+    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool, Option<u64>, Option<ClientSel>),  // resp, format, target_pane_idx, set_status_bar, duration_override_ms, -c client
     /// Like DisplayMessage but resolves -t %N pane ID instead of position. (Issue #332.)
-    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>),  // resp, format, pane_id, set_status_bar, duration_override_ms
+    DisplayMessageById(mpsc::Sender<String>, String, usize, bool, Option<u64>, Option<ClientSel>),  // resp, format, pane_id, set_status_bar, duration_override_ms, -c client
     LastWindow,
     /// `last-pane` / `select-pane -l`.
     ///
@@ -3156,7 +3204,12 @@ pub enum CtrlReq {
     SelectLayout(String),
     NextLayout,
     ListClients(mpsc::Sender<String>),
-    ListClientsFormat(mpsc::Sender<String>, String),
+    /// `list-clients -F <format> [-f <filter>]` (issue #724).
+    ListClientsFormat(mpsc::Sender<String>, String, Option<String>),
+    /// `attach -r` / `client-flags read-only`: (client id, read only).
+    SetClientReadonly(u64, bool),
+    /// focus-in / focus-out from one attached client: (client id, focused).
+    SetClientFocus(u64, bool),
     ForceDetachClient(u64),
     /// detach-client -t <tty>: force-detach a client by tty_name (e.g. "/dev/pts/2").
     /// `kill_parent` is the tmux `-P` flag: also tell the client to kill its parent
@@ -3321,6 +3374,8 @@ pub enum CtrlReq {
         client_id: u64,
         echo: bool,
         notif_tx: mpsc::SyncSender<ControlNotification>,
+        /// The control client's process id, read from the connection (#724).
+        pid: Option<u32>,
     },
     /// Deregister a control mode client.
     ControlDeregister {

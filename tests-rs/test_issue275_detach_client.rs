@@ -27,6 +27,9 @@ fn add_client(app: &mut AppState, id: u64, tty: &str) {
         tty_name: tty.to_string(),
         is_control: false,
         last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     });
     app.attached_clients += 1;
 }

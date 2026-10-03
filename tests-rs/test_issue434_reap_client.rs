@@ -31,6 +31,9 @@ fn client_info(id: u64, control: bool) -> ClientInfo {
         tty_name: format!("/dev/pts/{}", id),
         is_control: control,
         last_session: None,
+        pid: 0,
+        readonly: false,
+        focused: false,
     }
 }
 
