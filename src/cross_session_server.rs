@@ -15,23 +15,22 @@ use crate::tree;
 /// connection info so the target session can connect.
 pub fn handle_pane_forward_extract(
     app: &mut AppState,
-    win_idx: usize,
-    pane_idx: usize,
+    target: &crate::types::TempTarget,
     resp: mpsc::Sender<String>,
 ) {
-    if win_idx >= app.windows.len() {
-        let _ = resp.send("ERR window out of range".to_string());
-        return;
-    }
-    // Resolve pane path by DFS index
-    let src_path = {
-        let mut leaves = Vec::new();
-        tree::collect_leaf_paths_pub(&app.windows[win_idx].root, &mut Vec::new(), &mut leaves);
-        if let Some((_, p)) = leaves.get(pane_idx) {
-            p.clone()
-        } else {
-            app.windows[win_idx].active_path.clone()
+    // The window is a window INDEX (it used to be read as a position in the
+    // window list) and a pane index past the end is an error (it used to
+    // fall back to the active pane and move that one instead).
+    let (win_idx, pane_pos) = match crate::commands::resolve_join_end(app, target) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = resp.send(format!("ERR {}", e));
+            return;
         }
+    };
+    let src_path = match pane_pos.and_then(|p| tree::pane_paths(&app.windows[win_idx].root).get(p).cloned()) {
+        Some(p) => p,
+        None => app.windows[win_idx].active_path.clone(),
     };
     // Unzoom if needed
     if let Some(saved) = app.windows[win_idx].zoom_saved.take() {
@@ -196,17 +195,21 @@ pub fn handle_pane_forward_inject(
     rows: u16,
     cols: u16,
     screen_b64: String,
-    target_win: Option<usize>,
-    target_pane: Option<usize>,
+    target: &crate::types::TempTarget,
     horizontal: bool,
-) {
+) -> Result<(), String> {
+    // Resolve the target BEFORE connecting: the pane goes next to the pane
+    // the join named (it used to go next to the active one, the target was
+    // dropped on the way here), and a target that does not resolve is an
+    // error, not a graft somewhere else.
+    let (tgt_idx, tgt_pos) = crate::commands::resolve_join_end(app, target)?;
     // Connect to the forwarding listener on the source session
     let fwd_addr = format!("127.0.0.1:{}", fwd_port);
     let stream = match TcpStream::connect(&fwd_addr) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("psmux: cross-session inject connect failed: {}", e);
-            return;
+            return Err(format!("connect to the source pane failed: {}", e));
         }
     };
     let _ = stream.set_nodelay(true);
@@ -214,7 +217,7 @@ pub fn handle_pane_forward_inject(
         Ok(s) => s,
         Err(e) => {
             eprintln!("psmux: cross-session inject clone failed: {}", e);
-            return;
+            return Err(format!("clone failed: {}", e));
         }
     };
     let writer_stream = stream;
@@ -255,7 +258,7 @@ pub fn handle_pane_forward_inject(
         Ok(p) => p,
         Err(e) => {
             eprintln!("psmux: create_proxy_pane failed: {}", e);
-            return;
+            return Err(format!("create_proxy_pane failed: {}", e));
         }
     };
     // Start the reader thread (same as normal panes)
@@ -263,7 +266,7 @@ pub fn handle_pane_forward_inject(
         Ok(r) => r,
         Err(e) => {
             eprintln!("psmux: proxy reader clone failed: {}", e);
-            return;
+            return Err(format!("proxy reader clone failed: {}", e));
         }
     };
     crate::pane::spawn_reader_thread(
@@ -278,19 +281,11 @@ pub fn handle_pane_forward_inject(
         pane_id,
         proxy_pane.child_pid,
     );
-    // Graft into the target window tree
-    let tgt_idx = target_win.unwrap_or(app.active_idx);
+    // Graft into the target window tree, next to the resolved target pane.
     if tgt_idx < app.windows.len() {
-        let tgt_path = if let Some(tp) = target_pane {
-            let mut leaves = Vec::new();
-            tree::collect_leaf_paths_pub(&app.windows[tgt_idx].root, &mut Vec::new(), &mut leaves);
-            if let Some((_, p)) = leaves.get(tp) {
-                p.clone()
-            } else {
-                app.windows[tgt_idx].active_path.clone()
-            }
-        } else {
-            app.windows[tgt_idx].active_path.clone()
+        let tgt_path = match tgt_pos.and_then(|p| tree::pane_paths(&app.windows[tgt_idx].root).get(p).cloned()) {
+            Some(p) => p,
+            None => app.windows[tgt_idx].active_path.clone(),
         };
         let split_kind = if horizontal { LayoutKind::Horizontal } else { LayoutKind::Vertical };
         // Cross session join-pane has no -d: the joined pane becomes active,
@@ -301,4 +296,5 @@ pub fn handle_pane_forward_inject(
         }
         app.active_idx = tgt_idx;
     }
+    Ok(())
 }

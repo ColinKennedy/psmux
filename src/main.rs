@@ -3833,30 +3833,15 @@ fn run_main() -> io::Result<()> {
                 if !effective_src.is_empty() && !effective_tgt.is_empty()
                     && !crate::session::same_session_identity(l_socket_name.as_deref(), &effective_src, &effective_tgt)
                 {
-                    // Cross-session join-pane: orchestrate via TCP
-                    let src_after_colon = if source_spec.contains(':') {
-                        source_spec.split(':').nth(1).unwrap_or("0.0")
-                    } else if !source_spec.is_empty() {
-                        &source_spec
-                    } else {
-                        "0.0"
-                    };
-                    let tgt_after_colon = if target_spec.contains(':') {
-                        target_spec.split(':').nth(1).unwrap_or("")
-                    } else if !target_spec.is_empty() {
-                        &target_spec
-                    } else {
-                        ""
-                    };
-                    let sp = crate::cli::parse_target(src_after_colon);
-                    let tp = crate::cli::parse_target(tgt_after_colon);
+                    // Cross-session join-pane: orchestrate via TCP. The window
+                    // and pane halves travel as specs (`:1.0`, `%3`): parsed
+                    // here without their colon, `1.0` read as session "1"
+                    // pane 0, and the target half was dropped entirely.
                     match crate::cross_session::orchestrate_cross_session_join(
                         &effective_src,
-                        sp.window.unwrap_or(0),
-                        sp.pane.unwrap_or(0),
+                        &crate::cross_session::window_pane_half(&source_spec),
                         &effective_tgt,
-                        tp.window,
-                        tp.pane,
+                        &crate::cross_session::window_pane_half(&target_spec),
                         horizontal,
                     ) {
                         Ok(()) => {}
@@ -3874,7 +3859,15 @@ fn run_main() -> io::Result<()> {
                     if !source_spec.is_empty() { cmd.push_str(&format!(" -s {}", source_spec)); }
                     if !target_spec.is_empty() { cmd.push_str(&format!(" -t {}", target_spec)); }
                     cmd.push('\n');
-                    send_control(cmd)?;
+                    // The server resolves `%id` ends and answers tmux's
+                    // refusals (`can't join a pane to its own window` for
+                    // `-s %3 -t sess:0` when %3 is in window 0): print them
+                    // at exit 1 instead of a silent exit 0.
+                    let resp = send_control_with_response(cmd)?;
+                    if let Some(msg) = resp.trim_start().strip_prefix("ERROR: ") {
+                        eprintln!("psmux: {}", msg.trim_end());
+                        std::process::exit(1);
+                    }
                 }
                 return Ok(());
             }

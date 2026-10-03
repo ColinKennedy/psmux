@@ -1327,6 +1327,13 @@ fn move_window_request(
     after: bool,
     before: bool,
 ) -> Result<(), String> {
+    // A window in another session lives in another server: refuse it rather
+    // than move this session's window of the same number.
+    for spec in [src, dst].into_iter().flatten() {
+        if let Some(s) = crate::commands::foreign_session_in_spec(app, spec) {
+            return Err(crate::commands::cross_session_refusal("move-window", &s));
+        }
+    }
     // -a/-b make room by shuffling, so they never collide and never need -k.
     if kill && !renumber && !after && !before {
         if let Some(occupant) = app.move_window_kill_target(src, dst) {
@@ -2751,7 +2758,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         CtrlReq::KillPaneById(_) => "KillPaneById",
                         CtrlReq::BreakPaneReq { .. } => "BreakPane",
                         CtrlReq::JoinPane { .. } => "JoinPane",
-                        CtrlReq::MovePane { .. } => "MovePane",
                         CtrlReq::PaneForwardExtract(..) => "PaneForwardExtract",
                         CtrlReq::PaneForwardInject { .. } => "PaneForwardInject",
                         CtrlReq::PaneForwardResize(..) => "PaneForwardResize",
@@ -5123,32 +5129,41 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::JoinPane { src_win, src_pane, target_win, target_pane, horizontal, detach, before }
-                | CtrlReq::MovePane { src_win, src_pane, target_win, target_pane, horizontal, detach, before } => {
+                CtrlReq::JoinPane { src_raw, src, dst, horizontal, detach, before, resp } => {
                     unzoom_if_zoomed(&mut app);
-                    // One implementation with the embedded fallback (#725).
-                    if crate::commands::join_pane_local(&mut app, src_win, src_pane, target_win, target_pane, horizontal, detach, before) {
-                        resize_all_panes(&mut app);
-                        hook_event = Some("after-join-pane");
+                    // One implementation with the embedded fallback (#725);
+                    // join_pane_request resolves %id ends and answers the
+                    // refusals the CLI prints at exit 1.
+                    let r = crate::commands::join_pane_request(&mut app, src_raw.as_deref(), &src, &dst, horizontal, detach, before);
+                    match r {
+                        Ok(()) => {
+                            resize_all_panes(&mut app);
+                            hook_event = Some("after-join-pane");
+                        }
+                        Err(ref e) => {
+                            app.status_message = Some((format!("join-pane: {}", e), std::time::Instant::now(), None));
+                        }
                     }
+                    let _ = resp.send(r);
                     meta_dirty = true;
                 }
                 // ── Cross-session pane forwarding ───────────────────────
-                CtrlReq::PaneForwardExtract(win_idx, pane_idx, resp) => {
-                    crate::cross_session_server::handle_pane_forward_extract(&mut app, win_idx, pane_idx, resp);
+                CtrlReq::PaneForwardExtract(target, resp) => {
+                    crate::cross_session_server::handle_pane_forward_extract(&mut app, &target, resp);
                     resize_all_panes(&mut app);
                     meta_dirty = true;
                 }
                 CtrlReq::PaneForwardInject {
                     source_session, source_addr, source_key,
                     forward_id, fwd_port, pid, title, rows, cols,
-                    screen_b64, target_win, target_pane, horizontal,
+                    screen_b64, target, horizontal, resp,
                 } => {
-                    crate::cross_session_server::handle_pane_forward_inject(
+                    let r = crate::cross_session_server::handle_pane_forward_inject(
                         &mut app, source_session, source_addr, source_key,
                         forward_id, fwd_port, pid, title, rows, cols,
-                        screen_b64, target_win, target_pane, horizontal,
+                        screen_b64, &target, horizontal,
                     );
+                    let _ = resp.send(r);
                     resize_all_panes(&mut app);
                     meta_dirty = true;
                     hook_event = Some("after-join-pane");
@@ -5733,6 +5748,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // to be `trim_start_matches(':').parse::<usize>()`, which
                     // read neither (#693 item 1).
                     let resolved = (|| -> Result<(usize, Option<usize>), String> {
+                        // One window shared by two sessions cannot be
+                        // expressed by two servers: refuse it rather than
+                        // link this session's window of the same number.
+                        for spec in [src.as_deref(), dst.as_deref()].into_iter().flatten() {
+                            if let Some(s) = crate::commands::foreign_session_in_spec(&app, spec) {
+                                return Err(crate::commands::cross_session_refusal("link-window", &s));
+                            }
+                        }
                         let spos = match src.as_deref() {
                             Some(s) => app.resolve_window_spec(s, false)?.pos()
                                 .ok_or_else(|| format!("can't find window: {}", s))?,

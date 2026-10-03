@@ -451,6 +451,104 @@ fn generate_show_options(app: &AppState) -> String {
     output
 }
 
+/// The session a raw `sess:win.pane` spec names, when that is a live session
+/// other than the one `app` serves.
+///
+/// psmux runs one server per session, so a server that is handed a source in
+/// another session can only act on its own windows. Every server side command
+/// that takes a `-s` used to drop the session half and act on its own window
+/// or pane of the same number, at exit 0. This is the check that turns that
+/// silent wrong action into an error. A session half that names no live
+/// server is left alone (the command keeps its old reading of the spec), so a
+/// name the CLI resolved by prefix can never be refused here.
+pub(crate) fn foreign_session_in_spec(app: &AppState, spec: &str) -> Option<String> {
+    let (s, _) = spec.split_once(':')?;
+    let s = crate::cli::strip_exact_match_prefix(s);
+    if s.is_empty() { return None; }
+    let own = app.port_file_base();
+    let ns = app.socket_name.as_deref();
+    let base = match s.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+        Some(id) => crate::session::resolve_session_by_id(id)?,
+        None => crate::session::namespaced_session_base(ns, s),
+    };
+    if crate::session::same_session_identity(ns, &base, &own) { return None; }
+    if std::path::Path::new(&crate::paths::port_file(&base)).exists() {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// The error a server answers for a command whose source lives in another
+/// session it cannot reach. `what` says why the command cannot be carried
+/// across two servers.
+pub(crate) fn cross_session_refusal(cmd: &str, session: &str) -> String {
+    let why = match cmd {
+        "swap-pane" => "each session runs in its own psmux server; use join-pane to move a pane between sessions",
+        "link-window" => "a window cannot be shared by two psmux servers",
+        "move-window" => "each session runs in its own psmux server; use join-pane to move its panes between sessions",
+        _ => "each session runs in its own psmux server",
+    };
+    format!("{}: source is in session {} (cross-session {} is not supported: {})", cmd, session, cmd, why)
+}
+
+/// Resolve one end of a join-pane (`-s` or `-t`) to a window position and the
+/// pane's position in that window's pane order (None: the window's active
+/// pane). A `%id` pane names its own window, whatever window the spec names,
+/// as it does in tmux. Err carries tmux's message.
+pub(crate) fn resolve_join_end(app: &AppState, t: &crate::types::TempTarget) -> Result<(usize, Option<usize>), String> {
+    if let (Some(id), true) = (t.pane, t.pane_is_id) {
+        return crate::tree::find_pane_by_id_global(app, id)
+            .map(|(w, p)| (w, Some(p)))
+            .ok_or_else(|| format!("can't find pane: %{}", id));
+    }
+    let pos = if let Some(w) = t.win {
+        if t.win_is_id { app.windows.iter().position(|x| x.id == w) } else { app.win_pos(w) }
+            .ok_or_else(|| format!("can't find window: {}{}", if t.win_is_id { "@" } else { "" }, w))?
+    } else if let Some(ref n) = t.win_name {
+        app.windows.iter().position(|x| x.name == *n)
+            .ok_or_else(|| format!("can't find window: {}", n))?
+    } else if app.active_idx < app.windows.len() {
+        app.active_idx
+    } else {
+        return Err("no current window".to_string());
+    };
+    if let Some(p) = t.pane {
+        if crate::tree::pane_paths(&app.windows[pos].root).get(p).is_none() {
+            return Err(format!("can't find pane: {}", p));
+        }
+    }
+    Ok((pos, t.pane))
+}
+
+/// The server's join-pane / move-pane: resolve both ends strictly (pane ids
+/// included, the `-s %id` form used to be read as a pane INDEX of the active
+/// window), refuse a join into the source's own window with tmux's message,
+/// then run `join_pane_local`. Err is what the CLI prints at exit 1.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn join_pane_request(app: &mut AppState, src_raw: Option<&str>, src: &crate::types::TempTarget,
+                   dst: &crate::types::TempTarget, horizontal: bool, detach: bool, before: bool) -> Result<(), String> {
+    if let Some(s) = src_raw.and_then(|r| foreign_session_in_spec(app, r)) {
+        // The CLI carries a cross session join itself; a server can only
+        // reach its own windows, so it must not act on the same numbers here.
+        return Err(format!("join-pane: source is in session {} (run join-pane from the command line to move a pane between sessions)", s));
+    }
+    let (spos, spane) = resolve_join_end(app, src)?;
+    let (dpos, dpane) = resolve_join_end(app, dst)?;
+    if spos == dpos {
+        return Err("can't join a pane to its own window".to_string());
+    }
+    let sw = app.win_display_index(spos);
+    let dw = app.win_display_index(dpos);
+    if join_pane_local(app, Some(sw), spane, Some(dw), dpane, horizontal, detach, before) {
+        Ok(())
+    } else {
+        Err(app.status_message.as_ref()
+            .map(|(m, _, _)| m.trim_start_matches("join-pane: ").to_string())
+            .unwrap_or_else(|| "join-pane failed".to_string()))
+    }
+}
+
 /// join-pane / move-pane: extract the source pane and graft it into the target
 /// window. The ONE implementation behind both the server request
 /// (`CtrlReq::JoinPane` / `CtrlReq::MovePane`) and the embedded fallback, so
@@ -3295,3 +3393,7 @@ mod tests_killwindow_bad_target;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue725_join_pane_focus.rs"]
 mod test_issue725_join_pane_focus;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_cross_session_source_targets.rs"]
+mod test_cross_session_source_targets;
