@@ -5264,67 +5264,32 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = fp.child.kill();
                     }
                 }
-                CtrlReq::SetPaneOption(raw, option, value, resp) => {
-                    // Resolve "" -> active pane, "%N"/"N" -> global pane id.
-                    let pane = if raw.is_empty() {
-                        let win = &mut app.windows[app.active_idx];
-                        crate::tree::active_pane_mut(&mut win.root, &win.active_path)
-                    } else {
-                        match raw.trim().trim_start_matches('%').parse::<usize>() {
-                            Ok(id) => crate::tree::find_pane_mut_by_id_global(&mut app, id),
-                            Err(_) => None,
-                        }
-                    };
-                    let reply = match pane {
-                        None => format!("ERROR: can't find pane: {}", raw),
-                        Some(p) => match option.as_str() {
-                            "remain-on-exit" => {
-                                if value.is_empty() {
-                                    p.pane_options.remove("remain-on-exit");
-                                    String::new()
-                                } else if matches!(value.as_str(), "on" | "off" | "failed") {
-                                    p.pane_options.insert("remain-on-exit".to_string(), value.clone());
-                                    String::new()
-                                } else {
-                                    format!("ERROR: set-option -p remain-on-exit: bad value '{}' (want on, off or failed)", value)
-                                }
-                            }
-                            // #613: authorize the wheel for THIS pane even when
-                            // its application asked through neither signal the
-                            // #598 gate accepts.  Pane scoped on purpose: the
-                            // damage the gate prevents (htop typing the report
-                            // into its search prompt) is decided per pane, so
-                            // the escape hatch is too.
-                            "@mouse-force" => {
-                                if value.is_empty() {
-                                    p.pane_options.remove("@mouse-force");
-                                    String::new()
-                                } else if matches!(value.as_str(), "on" | "off" | "1" | "0" | "true" | "false" | "yes" | "no") {
-                                    p.pane_options.insert("@mouse-force".to_string(), value.clone());
-                                    String::new()
-                                } else {
-                                    format!("ERROR: set-option -p @mouse-force: bad value '{}' (want on or off)", value)
-                                }
-                            }
-                            // Loud refusal, never a silent stored no-op: the
-                            // Claude Code teammate backend checked nothing but
-                            // exit codes and a swallowed pane option looked
-                            // exactly like success (#580).
-                            other => format!("ERROR: pane-scoped option '{}' is not supported (supported: remain-on-exit, @mouse-force)", other),
-                        },
-                    };
+                CtrlReq::SetPaneOption {
+                    target,
+                    option,
+                    value,
+                    unset,
+                    append,
+                    only_if_unset,
+                    quiet,
+                    resp,
+                } => {
+                    // #613 `@mouse-force`, #580 `remain-on-exit` and every
+                    // `@name` user option (#728) share one writer with the
+                    // command prompt and config routes.
+                    let reply = crate::server::options::apply_set_pane_option(
+                        &mut app, &target, &option, &value, unset, append, only_if_unset, quiet,
+                    );
+                    if reply.is_empty() {
+                        // A user option can feed the status line or a border
+                        // format, so a write must reach attached clients.
+                        meta_dirty = true;
+                        state_dirty = true;
+                    }
                     let _ = resp.send(reply);
                 }
                 CtrlReq::ShowPaneOptions(raw, resp) => {
-                    let pane = if raw.is_empty() {
-                        let win = &mut app.windows[app.active_idx];
-                        crate::tree::active_pane_mut(&mut win.root, &win.active_path)
-                    } else {
-                        match raw.trim().trim_start_matches('%').parse::<usize>() {
-                            Ok(id) => crate::tree::find_pane_mut_by_id_global(&mut app, id),
-                            Err(_) => None,
-                        }
-                    };
+                    let pane = crate::server::options::resolve_option_target_pane(&mut app, &raw);
                     let reply = match pane {
                         None => format!("ERROR: can't find pane: {}", raw),
                         Some(p) => {

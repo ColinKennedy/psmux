@@ -1038,6 +1038,7 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
     let mut unset_mode = false;     // -u: unset (reset to default)
     let mut quiet = false;          // -q: suppress the "already set" error
     let mut window_scope = window_command;
+    let mut pane_scope = false;     // -p: the target pane's own table (#728)
     let mut target = String::new();
 
     while i < toks.len() {
@@ -1054,6 +1055,7 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
             if p.contains('o') { only_if_unset = true; }
             if p.contains('a') { append_mode = true; }
             if p.contains('w') { window_scope = true; }
+            if p.contains('p') { pane_scope = true; }
             // -U is an unset alias of -u (tmux parity, #553); the contains
             // check is case-sensitive so both must be tested.
             if p.contains('u') || p.contains('U') { unset_mode = true; }
@@ -1092,6 +1094,31 @@ fn parse_set_option(app: &mut AppState, line: &str, window_command: bool) {
         )
     {
         warn_config(app, error);
+        return;
+    }
+
+    // #728: `-p` writes the target PANE's own table, through the same writer
+    // the CLI and TCP routes use, so the command prompt and `source-file` land
+    // `set -p @name v` on the pane instead of in the global store. A startup
+    // config has no pane yet; that line keeps falling through to the global
+    // store below, the way an untargeted `-w` line does.
+    let has_pane_to_target = !app.windows.is_empty();
+    if pane_scope && !is_global && has_pane_to_target {
+        let value = if format_expand && !raw_value.is_empty() {
+            crate::format::expand_format(&raw_value, app)
+        } else {
+            raw_value.clone()
+        };
+        if value.is_empty() && !unset_mode {
+            warn_config(app, format!("empty value for '{}'", key));
+            return;
+        }
+        let reply = crate::server::options::apply_set_pane_option(
+            app, &target, key, &value, unset_mode, append_mode, only_if_unset, quiet,
+        );
+        if let Some(error) = reply.strip_prefix("ERROR: ") {
+            warn_config(app, error.to_string());
+        }
         return;
     }
 

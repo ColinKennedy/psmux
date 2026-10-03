@@ -2187,6 +2187,13 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
         "current_file" => crate::config::current_config_file(),
 
+        // A user option resolves for THIS pane first (#728): tmux's
+        // format_find reads `@name` through the pane's options table, whose
+        // parent chain is the window, the session and the global tables.
+        _ if var.starts_with('@') => {
+            crate::server::options::pane_user_option(app, target_pane(), var)
+                .unwrap_or_else(|| UNKNOWN_VAR.to_string())
+        }
         // Anything else: try as option, then report "not a variable at all".
         _ => {
             if let Some(val) = lookup_option(var, app) { val }
