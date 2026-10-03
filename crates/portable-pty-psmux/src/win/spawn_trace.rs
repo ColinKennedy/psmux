@@ -34,8 +34,9 @@ pub(crate) fn now_us() -> u64 {
     origin().elapsed().as_micros() as u64
 }
 
-/// One step: started at `start_us`, ended now.
-pub(crate) fn step(start_us: u64, what: &str) {
+/// One step: started at `start_us`, ended now.  `what` is only built when
+/// the trace is on, so a spawn with the trace off formats nothing.
+pub(crate) fn step<S: AsRef<str>>(start_us: u64, what: impl FnOnce() -> S) {
     if !enabled() {
         return;
     }
@@ -54,7 +55,7 @@ pub(crate) fn step(start_us: u64, what: &str) {
                 tid,
                 start_us,
                 end.saturating_sub(start_us),
-                what
+                what().as_ref()
             )
             .as_bytes(),
         );

@@ -63,7 +63,7 @@ impl PtySystem for ConPtySystem {
         let t_pipes = super::spawn_trace::now_us();
         let (stdin_read, stdin_write) = create_pipe_with_buffer(PIPE_BUF)?;
         let (stdout_read, stdout_write) = create_pipe_with_buffer(PIPE_BUF)?;
-        super::spawn_trace::step(t_pipes, "openpty.pipes");
+        super::spawn_trace::step(t_pipes, || "openpty.pipes");
 
         let t_con = super::spawn_trace::now_us();
         let con = PsuedoCon::new(
@@ -74,7 +74,7 @@ impl PtySystem for ConPtySystem {
             stdin_read,
             stdout_write,
         )?;
-        super::spawn_trace::step(t_con, "openpty.CreatePseudoConsole");
+        super::spawn_trace::step(t_con, || "openpty.CreatePseudoConsole");
 
         let master = ConPtyMasterPty {
             inner: Arc::new(Mutex::new(Inner {
@@ -170,7 +170,7 @@ impl SlavePty for ConPtySlavePty {
         crate::reset_spawn_create_us();
         let t_lock = super::spawn_trace::now_us();
         let mut inner = self.inner.lock().unwrap();
-        super::spawn_trace::step(t_lock, "spawn.inner_mutex_wait");
+        super::spawn_trace::step(t_lock, || "spawn.inner_mutex_wait");
         match inner.con.spawn_command(cmd.clone()) {
             Ok(child) => Ok(Box::new(child)),
             Err(e) if inner.con.used_passthrough && is_invalid_parameter(&e) => {
