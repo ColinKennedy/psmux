@@ -2096,7 +2096,9 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "version" => VERSION.to_string(),
         "start_time" => app.created_at.timestamp().to_string(),
         "socket_path" => {
-            format!("{}/default", crate::paths::psmux_dir())
+            // The server that answered (#730): `<dir>/default`, `<dir>/<-L label>`,
+            // or the exact `-S` path its namespace was created for.
+            crate::socket_path::server_socket_path(app.socket_name.as_deref())
         }
 
         // ── Options as format variables ──

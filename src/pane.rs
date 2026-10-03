@@ -2091,17 +2091,19 @@ pub fn set_host_colors_env(builder: &mut CommandBuilder, host_colors: Option<&cr
 }
 
 /// Set TMUX, TMUX_PANE, and PSMUX_SESSION environment variables on a CommandBuilder.
-/// TMUX format: /tmp/psmux-{server_pid}/{socket_name},{port},0
+/// TMUX format: /tmp/psmux-{server_pid}/{socket_name},{port},0, or
+/// {-S path},{port},0 for a server started with `-S` (#730)
 /// TMUX_PANE format: %{pane_id}
 /// PSMUX_SESSION: actual session name (for Claude Code / tool detection)
 /// The socket_name component encodes the -L namespace for child process resolution.
 pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: Option<u16>, socket_name: Option<&str>, session_name: &str, fix_tty: bool, _force_interactive: bool) {
-    let server_pid = std::process::id();
     let port = control_port.unwrap_or(0);
-    let sn = socket_name.unwrap_or("default");
-    // Format compatible with tmux: <socket_path>,<pid>,<session_idx>
-    // We encode the socket name in the path component for -L namespace resolution
-    builder.env("TMUX", format!("/tmp/psmux-{}/{},{},0", server_pid, sn, port));
+    // Format compatible with tmux: <socket_path>,<pid>,<session_idx>. The first
+    // field names the namespace and, for a `-S` server, is the exact path, so
+    // `-S "${TMUX%%,*}"` from the pane reaches this server again.
+    builder.env("TMUX", format!("{},{},0", crate::socket_path::server_tmux_env_path(socket_name), port));
+    // The path that told this server who it is must not leak into the pane.
+    builder.env_remove(crate::socket_path::SOCKET_PATH_ENV);
     builder.env("TMUX_PANE", format!("%{}", pane_id));
     // Override the placeholder "1" from build_command/build_default_shell with the
     // real session name.  Tools like Claude Code can use PSMUX_SESSION for explicit

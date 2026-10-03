@@ -469,7 +469,7 @@ bind-key -n C-h if-shell -F "#{pane_at_left}" "send-keys C-h" "select-pane -L"
 | `#{server_instance}` | Stable identity of the `-L` namespace. Constant while the namespace is up, whichever of its servers answers; changes only after a genuine restart. Empty for a namespace that has no server |
 | `#{version}` | psmux version, for example `3.3.7` |
 | `#{start_time}` | Server start time |
-| `#{socket_path}` | Path of the server's discovery files |
+| `#{socket_path}` | The server that answered: `<psmux dir>/default`, `<psmux dir>/<label>` under `-L`, or the `-S` path |
 | `#{history_size}` | Lines currently held in the pane's scrollback |
 | `#{alternate_on}` | `1` if the pane is on the alternate screen |
 | `#{mouse_any_flag}` | `1` if the pane has any mouse tracking mode on (DECSET 1000, 1002 or 1003) |
