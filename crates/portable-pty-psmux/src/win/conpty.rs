@@ -167,6 +167,7 @@ impl MasterPty for ConPtyMasterPty {
 
 impl SlavePty for ConPtySlavePty {
     fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
+        crate::reset_spawn_create_us();
         let t_lock = super::spawn_trace::now_us();
         let mut inner = self.inner.lock().unwrap();
         super::spawn_trace::step(t_lock, "spawn.inner_mutex_wait");

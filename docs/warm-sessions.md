@@ -151,12 +151,22 @@ A spawn line carries its own breakdown, which is how a serialised surge is told
 apart from a slow machine:
 
 ```
-pool: spawned spare pane=6 pid=Some(28164) in 99.9ms (pty 6.2ms, proc 93.2ms, console wait 0.0ms)
+pool: spawned spare pane=6 pid=Some(28164) in 99.9ms (pty 6.2ms, proc 93.2ms, console wait 0.0ms, in CreateProcessW 92.4ms)
 ```
 
-`pty` is the ConPTY allocation, `proc` is the `CreateProcessW`, and `console
-wait` is how long that spawn waited to get into the console state. A non zero
-console wait means something is holding it exclusively.
+`pty` is the ConPTY allocation, `proc` is the whole process spawn, `console
+wait` is how long that spawn waited to get into the console state, and `in
+CreateProcessW` is the part of `proc` spent inside the operating system's
+`CreateProcessW`. A non zero console wait means something is holding it
+exclusively. Spares that started together and differ only in `in
+CreateProcessW` were held up by Windows, not by psmux: the Store packaged pwsh
+is created through package activation, which returns concurrent creations in
+batches.
+
+`PSMUX_SPAWN_TRACE=1` goes one level deeper and times every step of each
+spawn (job object, attribute list, console state, each `CreateProcessW`
+attempt, job assignment, resume) into `%TEMP%\psmux_spawn_trace.log`
+(override with `PSMUX_SPAWN_TRACE_FILE`).
 
 ## Disabling Warm Sessions
 

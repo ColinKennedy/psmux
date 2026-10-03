@@ -1528,6 +1528,7 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     let t_spawn = t_spawn0.elapsed();
     let console_wait = portable_pty::last_spawn_console_wait_us();
+    let os_create = portable_pty::last_spawn_create_us();
     // The pid exists now, so the server can reap this shell even if it never
     // becomes a pool member (#686). A `false` answer means the server has begun
     // to die: nothing will ever adopt this child, so kill it here.
@@ -1571,15 +1572,18 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
     let now = std::time::Instant::now();
     // The phase breakdown is what showed the surge was serialised: `pty` stayed
     // flat while `proc` and its `wait` component climbed by one whole
-    // CreateProcessW per concurrent spawn (#686).
+    // CreateProcessW per concurrent spawn (#686).  `in CreateProcessW` is the
+    // operating system's share of `proc`; see portable_pty::last_spawn_create_us
+    // for why a surge has to be judged on what is left.
     crate::warm_trace!(
-        "pool: spawned spare pane={} pid={:?} in {:.1}ms (pty {:.1}ms, proc {:.1}ms, console wait {:.1}ms)",
+        "pool: spawned spare pane={} pid={:?} in {:.1}ms (pty {:.1}ms, proc {:.1}ms, console wait {:.1}ms, in CreateProcessW {:.1}ms)",
         pane_id,
         child_pid,
         t0.elapsed().as_micros() as f64 / 1000.0,
         t_openpty.as_micros() as f64 / 1000.0,
         t_spawn.as_micros() as f64 / 1000.0,
-        console_wait as f64 / 1000.0
+        console_wait as f64 / 1000.0,
+        os_create as f64 / 1000.0
     );
     Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring, spawned_at: now, ready: false, last_dv: 0, last_change: now, trace_settled: false, host_colors: p.host_colors.clone() })
 }

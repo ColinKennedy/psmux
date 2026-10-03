@@ -29,9 +29,11 @@ pub type HPCON = HANDLE;
 static JOBLIST_REFUSED: Mutex<Vec<Vec<u16>>> = Mutex::new(Vec::new());
 
 fn joblist_refused(exe: &[u16]) -> bool {
-    // An app execution alias (a WindowsApps path, as the Store pwsh is
-    // launched) is known to refuse: skip the failing CreateProcessW that would
-    // otherwise cost the first spawn of every server.
+    // A Store packaged image (a WindowsApps path: the execution alias the
+    // Store pwsh is launched by, or the package's own copy) is known to refuse
+    // when the caller has no package identity, as the server never does: skip
+    // the failing CreateProcessW, which runs the whole package activation
+    // before it refuses, about 160 ms on the first spawn of every server.
     let lower: Vec<u16> = exe.iter().map(|&c| if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c }).collect();
     let needle: Vec<u16> = "\\windowsapps\\".encode_utf16().collect();
     if lower.windows(needle.len()).any(|w| w == needle.as_slice()) {
@@ -493,7 +495,11 @@ impl PsuedoCon {
         let t = st::now_us();
         let mut env_block = cmd.environment_block();
         st::step(t, "spawn.env_block");
+        // Every CreateProcessW is timed into `last_spawn_create_us`, so the
+        // time the OS spends creating the process can be told apart from the
+        // time psmux spends around it (see that function).
         let mut create = |si: &mut STARTUPINFOEXW, pi: &mut PROCESS_INFORMATION, extra: DWORD| unsafe {
+            let _timed = crate::SpawnCreateTimer::start();
             CreateProcessW(
                 exe.as_mut_slice().as_mut_ptr(),
                 cmdline.as_mut_slice().as_mut_ptr(),
@@ -511,14 +517,21 @@ impl PsuedoCon {
         };
         // Three ways in, best first:
         //  1. the job list attribute: the process is born in its pane job.
-        //  2. Windows refuses a job list for some images with
-        //     ERROR_ACCESS_DENIED, measured for the WindowsApps execution alias
-        //     of the Store pwsh (the default shell) when the caller is a
-        //     detached process like the server; the real image path and
-        //     cmd.exe are accepted.  Such an image is created suspended,
-        //     assigned to the job that already exists, then resumed, so the
-        //     window outside the job is the one assign call.  The refusal is
-        //     remembered per image, so it is paid once per process.
+        //  2. Windows refuses a job list with ERROR_ACCESS_DENIED when an
+        //     UNPACKAGED caller, as the server is, creates a Store packaged
+        //     image: the pwsh execution alias and its real path under
+        //     Program Files\WindowsApps alike, measured from an unpackaged C#
+        //     probe with or without a console or an OS compatibility manifest.
+        //     The same probe hosted in the Store pwsh (a caller WITH package
+        //     identity) is accepted for both, which is why a pane's shell or a
+        //     run-shell child never sees the refusal.  cmd.exe is accepted.
+        //     Such an image is created suspended, assigned to the job that
+        //     already exists, then resumed, so the window outside the job is
+        //     the one assign call.  The refusal is remembered per image, so it
+        //     is paid once per process.  Measured, the suspended path costs
+        //     nothing the user sees: AssignProcessToJobObject ~30 us,
+        //     ResumeThread ~5 us, and launch to prompt of the shell is the same
+        //     as an unsuspended create.
         //  3. Without a job, exactly as before.
         let mut res = 0;
         let mut create_err = IoError::from_raw_os_error(0);
