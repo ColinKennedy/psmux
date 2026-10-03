@@ -1743,6 +1743,76 @@ impl WindowTarget {
     }
 }
 
+/// Where a `new-window` goes: its raw `-t` and the flags that decide the
+/// index (tmux cmd-new-window.c, flag set `abc:de:EF:kn:PSt:T:`).
+///
+/// tmux resolves the `-t` with `CMD_FIND_WINDOW_INDEX`, so `sess:N` naming no
+/// window is the index the new window takes. psmux used to validate that `-t`
+/// as an EXISTING window and dropped the command at exit 0 when none held N,
+/// and the server always appended, so `-t sess:N`, `-a`, `-b`, `-k` and `-S`
+/// all did nothing tmux does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewWindowPlacement {
+    /// The raw `-t` value (`sess:N`, `:N`, `N`, `sess`, `sess:name`, ...).
+    pub target: Option<String>,
+    /// `-a`: insert after the target window, shuffling the ones above up.
+    pub after: bool,
+    /// `-b`: insert before the target window, shuffling it and those above up.
+    pub before: bool,
+    /// `-k`: an index already in use is replaced rather than refused.
+    pub kill: bool,
+    /// `-S`: with `-n` and no index, select the window of that name if any.
+    pub select_existing: bool,
+}
+
+impl NewWindowPlacement {
+    /// Read the placement flags out of a new-window argument list. `-t` is
+    /// taken from `outer_target` when the route already peeled it off.
+    pub fn from_args(args: &[&str], outer_target: Option<&str>) -> Self {
+        let mut p = NewWindowPlacement { target: outer_target.map(|t| t.to_string()), ..Default::default() };
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            if a == "--" { break; }
+            // Value taking flags: skip the value so it is never read as a flag.
+            if matches!(a, "-c" | "-e" | "-F" | "-n" | "-T") { i += 2; continue; }
+            if a == "-t" {
+                if let Some(v) = args.get(i + 1) { p.target = Some(v.trim_matches('"').to_string()); }
+                i += 2;
+                continue;
+            }
+            if a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| c.is_ascii_alphabetic()) {
+                for c in a[1..].chars() {
+                    match c {
+                        'a' => p.after = true,
+                        'b' => p.before = true,
+                        'k' => p.kill = true,
+                        'S' => p.select_existing = true,
+                        _ => {}
+                    }
+                    // A value flag inside a cluster ends it (its value follows).
+                    if matches!(c, 'c' | 'e' | 'F' | 'n' | 'T' | 't') { break; }
+                }
+            } else if !a.starts_with('-') {
+                // First positional: the shell command, nothing after it is a flag.
+                break;
+            }
+            i += 1;
+        }
+        p
+    }
+}
+
+/// What a `new-window` resolved to before anything is spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewWindowPlan {
+    /// `-S -n name` found that window: select it (None with `-d`).
+    SelectExisting(Option<usize>),
+    /// Spawn a window. `index` is its display index (None: the next free one),
+    /// `kill_pos` the Vec position of the window `-k` replaces.
+    Create { index: Option<usize>, kill_pos: Option<usize> },
+}
+
 impl AppState {
     /// Whether this is the hidden `__warm__` pre-spawn server: a server started
     /// ahead of time so the next `new-session` can claim it instead of paying a
@@ -1950,6 +2020,95 @@ impl AppState {
         for wi in self.window_indices.iter_mut() {
             if *wi >= idx { *wi += 1; }
         }
+    }
+
+    /// tmux's `winlink_shuffle_up` exactly: free the index after (or, with
+    /// `before`, at) the window at Vec position `pos` by moving the run of
+    /// windows that starts there up by one, stopping at the first gap. Windows
+    /// above that gap keep their numbers. Returns the freed display index.
+    pub fn shuffle_up_at(&mut self, pos: usize, before: bool) -> Option<usize> {
+        if pos >= self.windows.len() { return None; }
+        if !self.window_indices_valid() {
+            let base = self.window_base_index;
+            self.window_indices = (0..self.windows.len()).map(|i| i + base).collect();
+        }
+        let base_idx = self.window_indices[pos];
+        let idx = if before { base_idx } else { base_idx.checked_add(1)? };
+        let mut last = idx;
+        while self.win_pos(last).is_some() { last = last.checked_add(1)?; }
+        for wi in self.window_indices.iter_mut() {
+            if *wi >= idx && *wi < last { *wi += 1; }
+        }
+        Some(idx)
+    }
+
+    /// Resolve a `new-window` the way tmux's cmd_new_window_exec does, up to
+    /// (not including) the spawn: the `-t` window part, `-S`, the `-a`/`-b`
+    /// shuffle and the "index N in use" check. The shuffle is applied here,
+    /// as tmux applies it before spawn_window. The error is what tmux prints.
+    pub fn plan_new_window(
+        &mut self,
+        placement: &NewWindowPlacement,
+        name: Option<&str>,
+        detached: bool,
+    ) -> Result<NewWindowPlan, String> {
+        // (wl, idx): the target window's Vec position, if it names one, and
+        // the requested display index (tmux target->wl / target->idx).
+        let active = if self.windows.is_empty() { None } else { Some(self.active_idx.min(self.windows.len() - 1)) };
+        let (wl, idx): (Option<usize>, Option<usize>) = match placement.target.as_deref().map(str::trim) {
+            None | Some("") => (active, None),
+            Some(t) => {
+                let t = crate::cli::strip_exact_match_prefix(t);
+                match t.split_once(':') {
+                    Some((_, w)) if crate::cli::strip_exact_match_prefix(w.trim()).is_empty() => (active, None),
+                    Some(_) => {
+                        if let Some(s) = crate::commands::foreign_session_in_spec(self, t) {
+                            return Err(format!("new-window: target is in session {} (each session runs in its own psmux server)", s));
+                        }
+                        match self.resolve_window_spec(t, true)? {
+                            WindowTarget::Pos(p) => (Some(p), Some(self.win_display_index(p))),
+                            WindowTarget::FreeIndex(i) => (None, Some(i)),
+                        }
+                    }
+                    None => {
+                        // No colon: tmux's cmd_find_get_window tries a window of
+                        // the current session first, then a session.
+                        match self.resolve_window_spec(t, true) {
+                            Ok(WindowTarget::Pos(p)) => (Some(p), Some(self.win_display_index(p))),
+                            Ok(WindowTarget::FreeIndex(i)) => (None, Some(i)),
+                            Err(_) => (active, None),
+                        }
+                    }
+                }
+            }
+        };
+        if placement.select_existing && idx.is_none() {
+            if let Some(n) = name {
+                let mut hit = None;
+                for (i, w) in self.windows.iter().enumerate() {
+                    if w.name != n { continue; }
+                    if hit.is_some() { return Err(format!("multiple windows named {}", n)); }
+                    hit = Some(i);
+                }
+                if let Some(p) = hit {
+                    return Ok(NewWindowPlan::SelectExisting(if detached { None } else { Some(p) }));
+                }
+            }
+        }
+        let mut idx = idx;
+        if placement.after || placement.before {
+            if let Some(p) = wl {
+                if let Some(i) = self.shuffle_up_at(p, placement.before) { idx = Some(i); }
+            }
+        }
+        let mut kill_pos = None;
+        if let Some(i) = idx {
+            if let Some(p) = self.win_pos(i) {
+                if !placement.kill { return Err(format!("create window failed: index {} in use", i)); }
+                kill_pos = Some(p);
+            }
+        }
+        Ok(NewWindowPlan::Create { index: idx, kill_pos })
     }
 
     /// Renumber every window contiguously from `base-index`, tmux's
@@ -2663,8 +2822,8 @@ pub enum CtrlReq {
     /// window kept it narrow after the user went back to the desktop
     /// (only a real resize, `client-size`, ever updated it).
     ClientActivity(u64),
-    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489)
-    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E), env (-e, #489)
+    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>, NewWindowPlacement, Option<mpsc::Sender<Result<(), String>>>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489), placement (-t/-a/-b/-k/-S), outcome
+    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>, NewWindowPlacement),  // cmd, name, detached, start_dir, format, resp ("ERROR: ..." on failure), title (-T), empty (-E), env (-e, #489), placement
     SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T), env (-e, #489), zoom (-Z)
     SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T), env (-e, #489), zoom (-Z)
     /// new-pane: create a floating pane over the active window's layout.
@@ -4093,6 +4252,10 @@ mod tests_base_index_rebase;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue601_602_move_swap_window.rs"]
 mod tests_issue601_602_move_swap_window;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_new_window_index_target.rs"]
+mod tests_new_window_index_target;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_preview_window_state.rs"]

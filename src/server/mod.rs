@@ -1115,6 +1115,86 @@ pub(crate) fn focus_window_at(app: &mut AppState, internal_idx: usize) -> bool {
     true
 }
 
+/// One `new-window`, tmux cmd-new-window.c then spawn.c spawn_window, shared
+/// by the plain and the `-P` request so both place the window the same way.
+///
+/// Returns the Vec position of the window `-P` describes (None when `-S`
+/// selected an existing window, which tmux does not print), or tmux's error.
+/// Before this, the server ignored `-t`, `-a`, `-b`, `-k` and `-S` and always
+/// appended at the highest index plus one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_new_window(
+    app: &mut AppState,
+    pty_system: &dyn portable_pty::PtySystem,
+    cmd: Option<&str>,
+    name: Option<&str>,
+    detached: bool,
+    start_dir: Option<&str>,
+    title: Option<String>,
+    empty: bool,
+    env_sets: &[(String, String)],
+    placement: &crate::types::NewWindowPlacement,
+    notify_events: &mut Vec<&'static str>,
+) -> Result<Option<usize>, String> {
+    let name = name.map(crate::util::clean_name);
+    let plan = app.plan_new_window(placement, name.as_deref(), detached)?;
+    let (index, kill_pos) = match plan {
+        crate::types::NewWindowPlan::SelectExisting(sel) => {
+            if let Some(p) = sel { focus_window_at(app, p); }
+            return Ok(None);
+        }
+        crate::types::NewWindowPlan::Create { index, kill_pos } => (index, kill_pos),
+    };
+    let prev_active_id = app.windows.get(app.active_idx).map(|w| w.id);
+    let prev_last_id = app.windows.get(app.last_window_idx).map(|w| w.id);
+    // -k on an index in use: the occupant goes first (spawn.c), and when it
+    // was the current window the new one takes its place as current even
+    // with -d (spawn.c clears SPAWN_DETACHED when s->curw is removed).
+    let mut replaced_current = false;
+    if let Some(kp) = kill_pos {
+        replaced_current = kp == app.active_idx;
+        let mut win = app.windows.remove(kp);
+        crate::tree::kill_all_children(&mut win.root);
+        app.on_window_removed(kp);
+        notify_events.push("window-unlinked");
+    }
+    let resolve = |app: &AppState, id: Option<usize>| id.and_then(|id| app.windows.iter().position(|w| w.id == id));
+    if let Some(p) = resolve(app, prev_active_id) { app.active_idx = p; }
+    if let Some(p) = resolve(app, prev_last_id) { app.last_window_idx = p; }
+    if let Err(e) = create_window_with_env(pty_system, app, cmd, start_dir, empty, env_sets) {
+        return Err(format!("create window failed: {}", e));
+    }
+    let new_pos = app.windows.len() - 1;
+    let new_id = app.windows[new_pos].id;
+    if let Some(n) = name {
+        app.windows[new_pos].name = n;
+        app.windows[new_pos].manual_rename = true;
+    }
+    // -T: set the new pane's title at creation (tmux new-window -T).
+    if let Some(t) = title {
+        let win = &mut app.windows[new_pos];
+        if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
+            p.title_locked = !t.is_empty();
+            p.title = t;
+        }
+    }
+    // The window was appended at the highest index plus one; give it the
+    // index the target asked for (free by now: in use was refused or killed).
+    if let Some(i) = index {
+        app.move_window_to_index(new_pos, i)?;
+    }
+    let new_pos = app.windows.iter().position(|w| w.id == new_id).unwrap_or(new_pos);
+    if detached && !replaced_current {
+        if let Some(p) = resolve(app, prev_active_id) { app.active_idx = p; }
+    } else {
+        app.active_idx = new_pos;
+        if !replaced_current {
+            if let Some(p) = resolve(app, prev_active_id) { app.last_window_idx = p; }
+        }
+    }
+    Ok(Some(new_pos))
+}
+
 /// The pane path a `select-pane -l` / `last-pane` would switch to, or None
 /// when tmux would answer `no last pane`.
 ///
@@ -2768,9 +2848,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         _ => "",
                     };
                     match req {
-                CtrlReq::NewWindow(cmd, name, detached, start_dir, title, empty, env_sets) => {
+                CtrlReq::NewWindow(cmd, name, detached, start_dir, title, empty, env_sets, placement, outcome) => {
                     if let Some(cmds) = app.hooks.get("before-new-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    let prev_idx = app.active_idx;
                     // Expand format variables like #{pane_current_path} (#111)
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     // Issue #630: do NOT chdir the server process into the start
@@ -2787,60 +2866,62 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // pane.rs, usable_start_dir), and a warm transplant gets it through
                     // pane::silent_rehome(). A shell releases the directory as soon as
                     // it cd's elsewhere, which is the tmux behaviour.
-                    if let Err(e) = create_window_with_env(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref(), empty, &env_sets) {
-                        eprintln!("psmux: new-window error: {e}");
-                    }
+                    let result = run_new_window(
+                        &mut app, &*pty_system, cmd.as_deref(), name.as_deref(), detached,
+                        start_dir.as_deref(), title, empty, &env_sets, &placement, &mut notify_events);
                     crate::resize_window::refresh_dynamic_window_sizes(&mut app);
-                    if let Some(n) = name { let n = crate::util::clean_name(&n); app.windows.last_mut().map(|w| { w.name = n; w.manual_rename = true; }); }
-                    // -T: set the new pane's title at creation (tmux new-window -T).
-                    if let Some(t) = title {
-                        if let Some(win) = app.windows.last_mut() {
-                            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                                p.title_locked = !t.is_empty();
-                                p.title = t;
-                            }
+                    match result {
+                        Ok(created) => {
+                            // Replenish warm pane pool for next new-window
+                            // Warm-pane replenish is deferred OFF the command path — it
+                            // runs at the loop top during an idle gap (Tier 3), so a burst
+                            // of window-creates never chains blocking spawns that stall
+                            // other clients' commands.
+                            resize_all_panes(&mut app); meta_dirty = true; state_dirty = true;
+                            if created.is_some() { notify_events.push("window-linked"); hook_event = Some("after-new-window"); }
+                            if let Some(tx) = outcome { let _ = tx.send(Ok(())); }
+                        }
+                        Err(msg) => {
+                            // An attached client (command prompt, key binding) has
+                            // no reply stream: show it like move-window does.
+                            app.status_message = Some((msg.clone(), Instant::now(), None));
+                            resize_all_panes(&mut app); meta_dirty = true; state_dirty = true;
+                            if let Some(tx) = outcome { let _ = tx.send(Err(msg)); }
                         }
                     }
-                    if detached { app.active_idx = prev_idx; }
-                    // Replenish warm pane pool for next new-window
-                    // Warm-pane replenish is deferred OFF the command path — it
-                    // runs at the loop top during an idle gap (Tier 3), so a burst
-                    // of window-creates never chains blocking spawns that stall
-                    // other clients' commands.
-                    resize_all_panes(&mut app); meta_dirty = true; notify_events.push("window-linked"); hook_event = Some("after-new-window");
                 }
-                CtrlReq::NewWindowPrint(cmd, name, detached, start_dir, format_str, resp, title, empty, env_sets) => {
+                CtrlReq::NewWindowPrint(cmd, name, detached, start_dir, format_str, resp, title, empty, env_sets, placement) => {
                     if let Some(cmds) = app.hooks.get("before-new-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    let prev_idx = app.active_idx;
                     let start_dir = start_dir.map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                     // No server chdir here: the pane's start directory is handed to the
                     // shell alone, never to the ConPTY host. See the #630 note on
                     // CtrlReq::NewWindow above.
-                    if let Err(e) = create_window_with_env(&*pty_system, &mut app, cmd.as_deref(), start_dir.as_deref(), empty, &env_sets) {
-                        eprintln!("psmux: new-window error: {e}");
-                    }
+                    let result = run_new_window(
+                        &mut app, &*pty_system, cmd.as_deref(), name.as_deref(), detached,
+                        start_dir.as_deref(), title, empty, &env_sets, &placement, &mut notify_events);
                     crate::resize_window::refresh_dynamic_window_sizes(&mut app);
-                    if let Some(n) = name { let n = crate::util::clean_name(&n); app.windows.last_mut().map(|w| { w.name = n; w.manual_rename = true; }); }
-                    if let Some(t) = title {
-                        if let Some(win) = app.windows.last_mut() {
-                            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                                p.title_locked = !t.is_empty();
-                                p.title = t;
-                            }
+                    match result {
+                        Ok(created) => {
+                            // Use full format engine for -P output (tmux compatible).
+                            // `-S` selecting an existing window prints nothing (tmux
+                            // returns before the print).
+                            let pane_info = match created {
+                                Some(pos) => {
+                                    let fmt = format_str.as_deref().unwrap_or("#{session_name}:#{window_index}");
+                                    crate::format::expand_format_for_window(fmt, &app, pos)
+                                }
+                                None => String::new(),
+                            };
+                            let _ = resp.send(pane_info);
+                            resize_all_panes(&mut app); meta_dirty = true; state_dirty = true;
+                            if created.is_some() { notify_events.push("window-linked"); hook_event = Some("after-new-window"); }
+                        }
+                        Err(msg) => {
+                            app.status_message = Some((msg.clone(), Instant::now(), None));
+                            resize_all_panes(&mut app); meta_dirty = true; state_dirty = true;
+                            let _ = resp.send(format!("ERROR: {}", msg));
                         }
                     }
-                    // Use full format engine for -P output (tmux compatible)
-                    let new_win_idx = app.windows.len() - 1;
-                    let fmt = format_str.as_deref().unwrap_or("#{session_name}:#{window_index}");
-                    let pane_info = crate::format::expand_format_for_window(fmt, &app, new_win_idx);
-                    if detached { app.active_idx = prev_idx; }
-                    let _ = resp.send(pane_info);
-                    // Replenish warm pane pool for next new-window
-                    // Warm-pane replenish is deferred OFF the command path — it
-                    // runs at the loop top during an idle gap (Tier 3), so a burst
-                    // of window-creates never chains blocking spawns that stall
-                    // other clients' commands.
-                    resize_all_panes(&mut app); meta_dirty = true; notify_events.push("window-linked"); hook_event = Some("after-new-window");
                 }
                 CtrlReq::SplitWindow(k, cmd, detached, start_dir, split_size, resp, title, env_sets, zoom_after_split) => {
                     if let Some(cmds) = app.hooks.get("before-split-window") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }

@@ -1338,6 +1338,7 @@ if control_echo || control_noecho {
         // unlink; both now own their target, so the temp focus must not eat it
         // (issue #693 items 1 and 2).
         let skip_target_focus = matches!(cmd_name, "join-pane" | "joinp" | "move-pane" | "movep"
+            | "new-window" | "neww"
             | "move-window" | "movew" | "swap-window" | "swapw"
             | "break-pane" | "breakp"
             | "link-window" | "linkw" | "unlink-window" | "unlinkw"
@@ -1760,7 +1761,11 @@ let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "
 // link-window's -t is the same CMD_FIND_WINDOW_INDEX destination
 // (cmd-move-window.c:83) and unlink-window's -t names the window to unlink
 // (cmd-kill-window.c:75-83); both own their target now (#693 items 1 and 2).
+// new-window's -t is the same kind of destination: `sess:N` naming no window
+// is the index the new window takes (cmd-new-window.c, CMD_FIND_WINDOW_INDEX),
+// so validating it as an existing window dropped every such command at rc 0.
 let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "movep"
+    | "new-window" | "neww"
     | "move-window" | "movew" | "swap-window" | "swapw"
     | "break-pane" | "breakp"
     | "link-window" | "linkw" | "unlink-window" | "unlinkw"
@@ -1890,16 +1895,30 @@ match cmd {
                 .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)) && !args.iter().any(|f| f.starts_with("-F") && f.len() > 2 && &f[2..] == **a))
                 .map(|s| s.trim_matches('"').to_string())
         };
+        // -t (already peeled off into raw_target), -a, -b, -k and -S decide the
+        // index; the server resolves them against its window list.
+        let placement = crate::types::NewWindowPlacement::from_args(&args, raw_target.as_deref());
         if print_info {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
+            let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets, placement));
             if let Ok(text) = rrx.recv_timeout(Duration::from_millis(2000)) {
-                let _ = write!(write_stream, "{}\n", text);
-                let _ = write_stream.flush();
+                if !text.is_empty() {
+                    let _ = write!(write_stream, "{}\n", text);
+                    let _ = write_stream.flush();
+                }
             }
             if !persistent { break; }
+        } else if persistent {
+            let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets, placement, None));
         } else {
-            let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets));
+            // A one-shot caller learns the outcome: tmux exits 1 on
+            // "create window failed: index N in use" and "can't find window".
+            let (otx, orx) = mpsc::channel::<Result<(), String>>();
+            let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets, placement, Some(otx)));
+            if let Ok(Err(e)) = orx.recv_timeout(Duration::from_secs(5)) {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+            }
         }
     }
     "split-window" | "splitw" | "split-pane" | "splitp" => {
@@ -5167,16 +5186,25 @@ fn dispatch_control_command(
                 .filter(|w| w[0] == "-e")
                 .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
                 .collect();
+            let placement = crate::types::NewWindowPlacement::from_args(args, raw_target);
             if print_info {
                 let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
+                let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets, placement));
                 if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
+                    let text = match text.strip_prefix("ERROR: ") {
+                        Some(e) => format!("\u{0001}ERR\u{0001}{}", e),
+                        None => text,
+                    };
                     let _ = resp_tx.send(text);
                 }
                 true
             } else {
-                let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets));
-                let _ = resp_tx.send(String::new());
+                let (otx, orx) = mpsc::channel::<Result<(), String>>();
+                let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets, placement, Some(otx)));
+                match orx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
+                    _ => { let _ = resp_tx.send(String::new()); }
+                }
                 true
             }
         }
