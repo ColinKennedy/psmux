@@ -21,6 +21,109 @@ thread_local! {
     static PANE_POS_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
     static BUFFER_IDX_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
     static NAMED_BUFFER_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CLIENT_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Expand `f` with the `client_*` variables answering for client `cid`.
+///
+/// tmux builds every format tree around one client (`format_defaults(ft, c,
+/// ...)`): list-clients hands it each row's client and display-message hands it
+/// `-c` (cmd-list-clients.c, cmd-display-message.c:119). psmux used to answer
+/// `client0` and the SERVER's pid for every client (issue #724). `None` leaves
+/// the session's best client in charge, as before.
+pub fn with_format_client<R>(cid: Option<u64>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) { CLIENT_OVERRIDE.set(self.0); }
+    }
+    let _restore = Restore(CLIENT_OVERRIDE.replace(cid));
+    f()
+}
+
+/// The client a format is expanded for: the explicit one, else tmux's best
+/// client for the session (cmd_find_best_client: the most recently active).
+pub fn format_client(app: &AppState) -> Option<&crate::types::ClientInfo> {
+    if let Some(ci) = CLIENT_OVERRIDE.get().and_then(|id| app.client_registry.get(&id)) {
+        return Some(ci);
+    }
+    if let Some(ci) = app.latest_client_id.and_then(|id| app.client_registry.get(&id)) {
+        return Some(ci);
+    }
+    app.client_registry.values().max_by_key(|c| (c.last_activity, c.id))
+}
+
+/// Find a client by name or tty the way tmux's cmd_find_client does. While a
+/// reconnecting client's old connection is not yet reaped, two entries share
+/// its name; the newest one is the live client.
+pub fn find_client_by_name(app: &AppState, target: &str) -> Option<u64> {
+    app.client_registry
+        .values()
+        .filter(|ci| crate::cli::client_spec_matches(&ci.tty_name, target))
+        .map(|ci| ci.id)
+        .max()
+}
+
+/// Resolve a `display-message -c` selection to a registered client id.
+pub fn resolve_client_sel(app: &AppState, sel: &crate::types::ClientSel) -> Option<u64> {
+    match sel {
+        crate::types::ClientSel::Id(id) => app.client_registry.contains_key(id).then_some(*id),
+        crate::types::ClientSel::Name(n) => find_client_by_name(app, n),
+    }
+}
+
+/// `#{client_flags}`, in the order tmux's server_client_get_flags lists them.
+pub fn client_flags_string(ci: &crate::types::ClientInfo) -> String {
+    let mut flags: Vec<&str> = vec!["attached"];
+    if ci.focused { flags.push("focused"); }
+    if ci.is_control { flags.push("control-mode"); }
+    if ci.readonly { flags.push("read-only"); }
+    // Every psmux client speaks UTF-8 (the client forces the console code page).
+    flags.push("UTF-8");
+    flags.join(",")
+}
+
+/// Seconds since the Unix epoch of a moment `ago` in the past.
+fn epoch_secs_ago(ago: std::time::Duration) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now - ago.as_secs() as i64
+}
+
+/// tmux's `LIST_CLIENTS_TEMPLATE` (cmd-list-clients.c). The `[user ...]` part,
+/// shown only for a client of another uid, is left out: Windows has no uid and
+/// every client of a psmux server runs as its owner.
+pub fn default_list_clients_format() -> &'static str {
+    "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}] #{?client_flags,(,}#{client_flags}#{?client_flags,),}"
+}
+
+/// One line per registered client, oldest first, each expanded for its own
+/// client. A filter that expands false drops the row (`list-clients -f`).
+pub fn format_list_clients(app: &AppState, fmt: &str, filter: Option<&str>) -> String {
+    let mut clients: Vec<&crate::types::ClientInfo> = app.client_registry.values().collect();
+    clients.sort_by_key(|c| c.id);
+    let mut out = String::new();
+    for ci in clients {
+        let line = with_format_client(Some(ci.id), || {
+            if let Some(f) = filter {
+                if !format_truthy(&expand_format(f, app)) {
+                    return None;
+                }
+            }
+            Some(expand_format(fmt, app))
+        });
+        if let Some(line) = line {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// tmux's format_true: empty and "0" are false, anything else is true.
+fn format_truthy(s: &str) -> bool {
+    !s.is_empty() && s != "0"
 }
 
 /// Set the buffer index for per-buffer format expansion in list-buffers -F.
@@ -1304,7 +1407,85 @@ const UNKNOWN_VAR: &str = "\u{0}psmux:unknown-var";
 
 /// Expand a plain variable name. Unknown names expand to the empty string,
 /// matching tmux.
+/// Every `client_*` variable, answered for ONE client: the row of a
+/// list-clients, the `-c` of a display-message, else the best client (issue
+/// #724). Resolved before any window lookup, because a client exists whether
+/// or not the session has a window to describe.
+fn expand_client_var(var: &str, app: &AppState) -> Option<String> {
+    Some(match var {
+        // The width and height fall back to the session's own geometry when no
+        // client is attached, as they did before.
+        "client_width" => match format_client(app) {
+            Some(ci) => ci.width.to_string(),
+            None => app.client_area.width.to_string(),
+        },
+        "client_height" => {
+            let h = format_client(app).map(|ci| ci.height).unwrap_or(app.client_area.height);
+            (h + if app.status_visible { 1 } else { 0 }).to_string()
+        }
+        "client_session" => app.session_name.clone(),
+        // The session this client came from, empty when it has not switched.
+        // This was aliased to client_session, so it echoed the CURRENT session
+        // and could neither predict what `-l` would do nor verify what it did
+        // (issue #566). tmux reports empty for a client with no last session,
+        // which is what an unset value gives here.
+        "client_last_session" => format_client(app)
+            .and_then(|info| info.last_session.clone())
+            .unwrap_or_default(),
+        // tmux leaves these empty when there is no client (ft->c == NULL).
+        "client_name" | "client_tty" => format_client(app).map(|ci| ci.tty_name.clone()).unwrap_or_default(),
+        "client_pid" => format_client(app)
+            .filter(|ci| ci.pid != 0)
+            .map(|ci| ci.pid.to_string())
+            .unwrap_or_default(),
+        "client_readonly" => format_client(app).map(|ci| if ci.readonly { "1".into() } else { "0".into() }).unwrap_or_default(),
+        "client_control_mode" => format_client(app).map(|ci| if ci.is_control { "1".into() } else { "0".into() }).unwrap_or_default(),
+        "client_flags" => format_client(app).map(client_flags_string).unwrap_or_default(),
+        "client_prefix" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) { "1".into() } else { "0".into() },
+        "client_activity" => match format_client(app) {
+            Some(ci) => epoch_secs_ago(ci.last_activity.elapsed()).to_string(),
+            None => app.created_at.timestamp().to_string(),
+        },
+        "client_created" => match format_client(app) {
+            Some(ci) => epoch_secs_ago(ci.connected_at.elapsed()).to_string(),
+            None => app.created_at.timestamp().to_string(),
+        },
+        "client_activity_string" | "client_created_string" => {
+            let at = format_client(app).map(|ci| {
+                if var == "client_activity_string" { ci.last_activity.elapsed() } else { ci.connected_at.elapsed() }
+            });
+            match at {
+                Some(ago) => (chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or_default())
+                    .format("%a %b %e %H:%M:%S %Y").to_string(),
+                None => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
+            }
+        }
+        "client_key_table" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) {
+            "prefix".into()
+        } else if let Some(t) = app.current_key_table.as_ref() {
+            // `switch-client -T <table>` latched a custom table (issue #640);
+            // tmux reports `c->keytable->name` here.
+            t.clone()
+        } else {
+            match app.mode {
+                Mode::CopyMode => "copy-mode-vi".into(),
+                _ => "root".into(),
+            }
+        },
+        "client_termname" | "client_termtype" => env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+        "client_termfeatures" => "256,RGB,title".into(),
+        "client_utf8" => "1".into(),
+        "client_cell_width" => "8".into(),
+        "client_cell_height" => "16".into(),
+        "client_written" | "client_discarded" => "0".into(),
+        _ => return None,
+    })
+}
+
 pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
+    if var.starts_with("client_") {
+        if let Some(v) = expand_client_var(var, app) { return v; }
+    }
     let v = expand_var_inner(var, app, win_idx);
     if v == UNKNOWN_VAR { String::new() } else { v }
 }
@@ -2038,44 +2219,7 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
         "buffer_created" => app.created_at.timestamp().to_string(),
 
         // ── Client ──
-        "client_width" => app.client_area.width.to_string(),
-        "client_height" => (app.client_area.height + if app.status_visible { 1 } else { 0 }).to_string(),
-        "client_session" => app.session_name.clone(),
-        // The session this client came from, empty when it has not switched.
-        // This was aliased to client_session, so it echoed the CURRENT session
-        // and could neither predict what `-l` would do nor verify what it did
-        // (issue #566). tmux reports empty for a client with no last session,
-        // which is what an unset value gives here.
-        "client_last_session" => app
-            .latest_client_id
-            .and_then(|cid| app.client_registry.get(&cid))
-            .and_then(|info| info.last_session.clone())
-            .unwrap_or_default(),
-        "client_name" | "client_tty" => "client0".into(),
-        "client_pid" => std::process::id().to_string(),
-        "client_prefix" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) { "1".into() } else { "0".into() },
-        "client_activity" | "client_created" => app.created_at.timestamp().to_string(),
-        "client_activity_string" | "client_created_string" => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
-        "client_control_mode" => "0".into(),
-        "client_flags" => "focused".into(),
-        "client_key_table" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) {
-            "prefix".into()
-        } else if let Some(t) = app.current_key_table.as_ref() {
-            // `switch-client -T <table>` latched a custom table (issue #640);
-            // tmux reports `c->keytable->name` here.
-            t.clone()
-        } else {
-            match app.mode {
-                Mode::CopyMode => "copy-mode-vi".into(),
-                _ => "root".into(),
-            }
-        },
-        "client_termname" | "client_termtype" => env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        "client_termfeatures" => "256,RGB,title".into(),
-        "client_utf8" => "1".into(),
-        "client_cell_width" => "8".into(),
-        "client_cell_height" => "16".into(),
-        "client_written" | "client_discarded" => "0".into(),
+        // Every client_* variable is answered by expand_client_var (#724).
 
         // ── Server ──
         "host" | "hostname" => hostname_cached(),
@@ -2418,3 +2562,7 @@ mod tests_issue712_format_modifier_utf8;
 #[cfg(test)]
 #[path = "../tests-rs/test_format_modifier_chain_parity.rs"]
 mod tests_format_modifier_chain_parity;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue724_client_formats.rs"]
+mod tests_issue724_client_formats;

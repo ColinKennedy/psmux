@@ -1368,6 +1368,55 @@ fn invalid_set_option_flag(flag_chars: &str) -> Option<char> {
         .find(|flag| !crate::SET_OPTION_CLI_FLAGS.contains(*flag))
 }
 
+/// Does a client whose tty is `tty` answer to the client target `spec`?
+///
+/// tmux's cmd_find_client: a single trailing colon is dropped, then the name,
+/// the tty, and the tty without its `/dev/` prefix all match. A psmux client's
+/// name IS its tty (`/dev/pts/N`), so `/dev/pts/3`, `pts/3` and `/dev/pts/3:`
+/// all find the same client (issue #724).
+pub fn client_spec_matches(tty: &str, spec: &str) -> bool {
+    let t = spec.strip_suffix(':').unwrap_or(spec);
+    !t.is_empty() && (tty == t || tty.strip_prefix("/dev/") == Some(t))
+}
+
+/// Does this `attach-session` argument list ask for a read only client?
+///
+/// tmux spells it `-r` (cmd-attach-session.c, "c:dEf:rt:x", which sets
+/// CLIENT_READONLY) or `-f read-only` (a comma list where a leading `!` turns a
+/// flag off). Boolean flags cluster, so `-dr` counts; `-c`, `-f` and `-t` take
+/// a value, which is skipped so a session or directory named `r` is not read
+/// as the flag (issue #724).
+pub fn attach_wants_readonly<'a>(args: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut readonly = false;
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" { break; }
+        if !a.starts_with('-') || a.starts_with("--") || a.len() < 2 { continue; }
+        let body = &a[1..];
+        for (i, c) in body.char_indices() {
+            match c {
+                'r' => readonly = true,
+                'c' | 'f' | 't' => {
+                    let rest = &body[i + c.len_utf8()..];
+                    let value = if rest.is_empty() { it.next().unwrap_or("") } else { rest };
+                    if c == 'f' {
+                        for flag in value.split(',') {
+                            match flag {
+                                "read-only" => readonly = true,
+                                "!read-only" => readonly = false,
+                                _ => {}
+                            }
+                        }
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    readonly
+}
+
 /// Extract a flag value from args, supporting tmux short-flag CLI forms:
 ///   * Two-token form: `-F value`
 ///   * Concatenated form: `-Fvalue`

@@ -3690,28 +3690,37 @@ pub mod process_kill {
     /// sockets are returned — a psmux *client* never listens, so clients can never
     /// appear here and are structurally safe from the reaper.
     pub fn loopback_listener_pids() -> Vec<(u32, u16)> {
+        loopback_tcp_rows(TCP_TABLE_OWNER_PID_LISTENER)
+            .into_iter()
+            .map(|r| (r.pid, r.local_port))
+            .collect()
+    }
+
+    const TCP_TABLE_OWNER_PID_CONNECTIONS: u32 = 4;
+
+    /// One IPv4 TCP table row whose local address is 127.0.0.1.
+    struct LoopbackTcpRow { local_port: u16, remote_port: u16, pid: u32 }
+
+    fn loopback_tcp_rows(table_class: u32) -> Vec<LoopbackTcpRow> {
         let mut out = Vec::new();
         unsafe {
             let mut size: u32 = 0;
             // First call sizes the buffer.
             let _ = GetExtendedTcpTable(
-                std::ptr::null_mut(), &mut size, 0, AF_INET,
-                TCP_TABLE_OWNER_PID_LISTENER, 0,
+                std::ptr::null_mut(), &mut size, 0, AF_INET, table_class, 0,
             );
             if size == 0 { return out; }
             let mut buf = vec![0u8; size as usize];
             let mut attempts = 0;
             let mut ret = GetExtendedTcpTable(
-                buf.as_mut_ptr(), &mut size, 0, AF_INET,
-                TCP_TABLE_OWNER_PID_LISTENER, 0,
+                buf.as_mut_ptr(), &mut size, 0, AF_INET, table_class, 0,
             );
             // The table can grow between the sizing and filling calls; retry a
             // couple of times on ERROR_INSUFFICIENT_BUFFER with the new size.
             while ret == ERROR_INSUFFICIENT_BUFFER && attempts < 3 {
                 buf.resize(size as usize, 0);
                 ret = GetExtendedTcpTable(
-                    buf.as_mut_ptr(), &mut size, 0, AF_INET,
-                    TCP_TABLE_OWNER_PID_LISTENER, 0,
+                    buf.as_mut_ptr(), &mut size, 0, AF_INET, table_class, 0,
                 );
                 attempts += 1;
             }
@@ -3723,19 +3732,35 @@ pub mod process_kill {
             let base = buf.as_ptr();
             let num = (base as *const u32).read_unaligned() as usize;
             const ROW: usize = 24;
+            // dwLocalPort / dwRemotePort are network byte order in the low 16 bits.
+            let port_of = |raw: u32| (((raw & 0xff) << 8) | ((raw >> 8) & 0xff)) as u16;
             for i in 0..num {
                 let row = base.add(4 + i * ROW);
                 if 4 + i * ROW + ROW > buf.len() { break; }
                 let local_addr = (row.add(4) as *const u32).read_unaligned();
                 if local_addr != LOOPBACK_ADDR { continue; }
-                let local_port_raw = (row.add(8) as *const u32).read_unaligned();
-                // dwLocalPort is network byte order in the low 16 bits.
-                let port = (((local_port_raw & 0xff) << 8) | ((local_port_raw >> 8) & 0xff)) as u16;
-                let pid = (row.add(20) as *const u32).read_unaligned();
-                out.push((pid, port));
+                out.push(LoopbackTcpRow {
+                    local_port: port_of((row.add(8) as *const u32).read_unaligned()),
+                    remote_port: port_of((row.add(16) as *const u32).read_unaligned()),
+                    pid: (row.add(20) as *const u32).read_unaligned(),
+                });
             }
         }
         out
+    }
+
+    /// The process that owns the CLIENT end of a loopback connection: the row
+    /// whose local port is the peer's port and whose remote port is ours.
+    ///
+    /// This is how a server learns `#{client_pid}` (issue #724). It needs
+    /// nothing from the client, so it is right for every kind of client (a TUI
+    /// attach, `attach -r`, `-CC`) and for a client built before the field
+    /// existed.
+    pub fn loopback_peer_pid(peer_port: u16, our_port: u16) -> Option<u32> {
+        loopback_tcp_rows(TCP_TABLE_OWNER_PID_CONNECTIONS)
+            .into_iter()
+            .find(|r| r.local_port == peer_port && r.remote_port == our_port && r.pid != 0)
+            .map(|r| r.pid)
     }
 
     /// Current system time as a FILETIME (100ns ticks). Callers capture this
@@ -3788,6 +3813,7 @@ pub mod process_kill {
 
     // Orphaned-server reaper stubs (issue #448) — no-ops off Windows.
     pub fn loopback_listener_pids() -> Vec<(u32, u16)> { Vec::new() }
+    pub fn loopback_peer_pid(_peer_port: u16, _our_port: u16) -> Option<u32> { None }
     pub fn now_process_filetime() -> u64 { 0 }
     pub fn process_creation_time(_pid: u32) -> Option<u64> { None }
     pub fn terminate_server_pid(_pid: u32, _max_creation_ft: Option<u64>) {}

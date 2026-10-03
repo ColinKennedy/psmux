@@ -447,12 +447,21 @@ bind-key -n C-h if-shell -F "#{pane_at_left}" "send-keys C-h" "select-pane -L"
 
 ### Client variables
 
+Each of these describes one client: the row's client in `list-clients -F`, the client named by
+`display-message -c`, and otherwise the most recently active client of the session. With no
+client attached, the identity variables (`client_name`, `client_pid`, `client_readonly`,
+`client_flags`, `client_control_mode`) are empty, as in tmux.
+
 | Variable | Description |
 |----------|-------------|
+| `#{client_name}` / `#{client_tty}` | Name of the client, `/dev/pts/<pid>`. Unique across the `-L` namespace and kept when the client switches session |
+| `#{client_pid}` | PID of the attached client process (a TUI, `attach -r` or `-CC` client) |
+| `#{client_readonly}` | `1` for a client attached with `attach -r` (or `-f read-only`), else `0` |
+| `#{client_flags}` | tmux style flag list, for example `attached,read-only,UTF-8` (also `focused`, `control-mode`) |
+| `#{client_control_mode}` | `1` for a `-CC` control mode client |
 | `#{client_width}` / `#{client_height}` | Size of the client terminal |
 | `#{client_prefix}` | `1` if the prefix key was pressed |
 | `#{client_key_table}` | Key table the client is currently in, for example `root` |
-| `#{client_pid}` | PID of the client process |
 | `#{client_session}` / `#{client_last_session}` | Current and previous session of the client |
 | `#{client_activity}` / `#{client_created}` | Timestamps for the client |
 | `#{client_activity_string}` / `#{client_created_string}` | The same, already formatted |
@@ -517,9 +526,6 @@ rather than live state. They exist for tmux format compatibility. Do not build l
 | `#{pane_start_path}` / `#{pane_tabs}` | empty |
 | `#{cursor_flag}` | `0` |
 | `#{scroll_region_upper}` | `0` |
-| `#{client_name}` / `#{client_tty}` | `client0` |
-| `#{client_control_mode}` | `0` |
-| `#{client_flags}` | `focused` |
 | `#{client_termfeatures}` | a fixed string |
 | `#{client_utf8}` | `1` |
 | `#{client_cell_width}` / `#{client_cell_height}` | a fixed value |

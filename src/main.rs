@@ -705,6 +705,39 @@ fn build_send_paste_control(cmd_args: &[&str]) -> io::Result<String> {
     Ok(format!("send-paste {}\n", payload))
 }
 
+/// Send `line` to the server of every live session in the namespace and keep
+/// each one that answered, in session name order (issue #724). tmux has one
+/// server for all of them; psmux has one per session, so a server wide query
+/// is a fan out. The routing variables are restored afterwards.
+fn query_every_session(ns: Option<&str>, line: &str) -> Vec<(String, String)> {
+    let saved_session = env::var("PSMUX_TARGET_SESSION").ok();
+    let saved_full = env::var("PSMUX_TARGET_FULL").ok();
+    env::remove_var("PSMUX_TARGET_FULL");
+    let mut out = Vec::new();
+    for name in crate::session::list_session_names_ns(ns) {
+        env::set_var("PSMUX_TARGET_SESSION", &name);
+        if let Ok(text) = send_control_with_response(line.to_string()) {
+            out.push((name, text));
+        }
+    }
+    match saved_session {
+        Some(v) => env::set_var("PSMUX_TARGET_SESSION", v),
+        None => env::remove_var("PSMUX_TARGET_SESSION"),
+    }
+    if let Some(v) = saved_full { env::set_var("PSMUX_TARGET_FULL", v); }
+    out
+}
+
+/// The session (port file base name) whose server has the client `spec`
+/// attached, by name or tty as tmux's cmd_find_client accepts them.
+fn session_holding_client(ns: Option<&str>, spec: &str) -> Option<String> {
+    let line = format!("list-clients -F {}\n", crate::util::quote_arg("#{client_name}"));
+    query_every_session(ns, &line)
+        .into_iter()
+        .find(|(_, text)| text.lines().any(|tty| crate::cli::client_spec_matches(tty.trim(), spec)))
+        .map(|(name, _)| name)
+}
+
 fn main() {
     crate::startup_trace::mark("cli.entry");
     if let Err(e) = run_main() {
@@ -1567,6 +1600,14 @@ fn run_main() -> io::Result<()> {
                 env::set_var("PSMUX_SESSION_NAME", name);
                 env::set_var("PSMUX_SESSION_DISPLAY_NAME", shown);
                 env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                // `attach -r` / `attach -f read-only` (issue #724). The flag was
+                // parsed and dropped, so a read only client could type and no
+                // tool could tell it apart from a writable one.
+                if crate::cli::attach_wants_readonly(sub_args.iter().map(|s| s.as_str())) {
+                    env::set_var("PSMUX_CLIENT_READONLY", "1");
+                } else {
+                    env::remove_var("PSMUX_CLIENT_READONLY");
+                }
             }
             "server" => {
                 // Internal command - run headless server (used when spawning background server)
@@ -2958,16 +2999,24 @@ fn run_main() -> io::Result<()> {
                     // flag's new correctness would come at the cost of a silent
                     // no-op, which is worse than either behaviour.
                     //
-                    // Clients are listed by tty, and tty_name is derived from the
-                    // client id, so `%3` and `/dev/pts/3` name the same client.
+                    // Clients are listed by tty, and `%3` names /dev/pts/3.
                     let wanted = match t.strip_prefix('%') {
                         Some(n) if n.chars().all(|c| c.is_ascii_digit()) => format!("/dev/pts/{}", n),
                         _ => t.clone(),
                     };
-                    if let Ok(listing) = send_control_with_response("list-clients\n".to_string()) {
-                        let known = listing.lines().any(|l| {
-                            l.split(':').next().map(|tty| tty.trim() == wanted).unwrap_or(false)
-                        });
+                    // Without -s, go to the session the client is attached to:
+                    // a client name is unique across the namespace now (#724),
+                    // the way a tmux tty is unique across its one server.
+                    if s_target.is_none() {
+                        if let Some(sess) = session_holding_client(l_socket_name.as_deref(), &wanted) {
+                            env::set_var("PSMUX_TARGET_SESSION", &sess);
+                        }
+                    }
+                    let names = format!("list-clients -F {}\n", crate::util::quote_arg("#{client_name}"));
+                    if let Ok(listing) = send_control_with_response(names) {
+                        let known = listing
+                            .lines()
+                            .any(|tty| crate::cli::client_spec_matches(tty.trim(), &wanted));
                         if !known {
                             eprintln!("psmux: can't find client: {}", t);
                             std::process::exit(1);
@@ -3441,6 +3490,7 @@ fn run_main() -> io::Result<()> {
                 }
                 let mut message: Vec<String> = Vec::new();
                 let mut target: Option<String> = None;
+                let mut client: Option<String> = None;
                 let mut print_to_stdout = false;
                 let mut duration_ms: Option<u64> = None;
                 let mut i = 1;
@@ -3449,6 +3499,14 @@ fn run_main() -> io::Result<()> {
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
                                 target = Some(t.to_string());
+                                i += 1;
+                            }
+                        }
+                        // -c target-client (issue #724). It used to land in the
+                        // message text, so `-c /dev/pts/4` printed itself.
+                        "-c" => {
+                            if let Some(c) = cmd_args.get(i + 1) {
+                                client = Some(c.to_string());
                                 i += 1;
                             }
                         }
@@ -3466,7 +3524,7 @@ fn run_main() -> io::Result<()> {
                             && !a.starts_with("--")
                             && {
                                 let last = a.chars().last().unwrap_or(' ');
-                                matches!(last, 't' | 'd' | 'I')
+                                matches!(last, 't' | 'd' | 'I' | 'c')
                                     && a[1..a.len()-1].chars().all(|c| matches!(c, 'p'))
                             } =>
                         {
@@ -3475,6 +3533,7 @@ fn run_main() -> io::Result<()> {
                             if let Some(val) = cmd_args.get(i + 1) {
                                 match last {
                                     't' => { target = Some(val.to_string()); }
+                                    'c' => { client = Some(val.to_string()); }
                                     'd' => { duration_ms = val.parse::<u64>().ok(); }
                                     _ => {}
                                 }
@@ -3487,6 +3546,21 @@ fn run_main() -> io::Result<()> {
                 }
                 let msg = message.join(" ");
                 let mut cmd = "display-message".to_string();
+                if let Some(ref c) = client {
+                    // With no target, the format describes the named client's
+                    // own session, so ask the server that holds the client.
+                    // psmux runs one server per session; tmux has one server
+                    // and finds the session through the client.
+                    let untargeted = target.is_none()
+                        && !explicit_session_target
+                        && std::env::var("PSMUX_TARGET_FULL").is_err();
+                    if untargeted {
+                        if let Some(session) = session_holding_client(l_socket_name.as_deref(), c) {
+                            env::set_var("PSMUX_TARGET_SESSION", session);
+                        }
+                    }
+                    cmd.push_str(&format!(" -c {}", crate::util::quote_arg(c)));
+                }
                 if let Some(t) = target { cmd.push_str(&format!(" -t {}", t)); }
                 if print_to_stdout { cmd.push_str(" -p"); }
                 if let Some(d) = duration_ms { cmd.push_str(&format!(" -d {}", d)); }
@@ -4357,10 +4431,43 @@ fn run_main() -> io::Result<()> {
                 }
                 return Ok(());
             }
-            // list-clients - List all clients
+            // list-clients [-F format] [-f filter] [-O order] [-r] [-t session]
             "list-clients" | "lsc" => {
-                let resp = send_control_with_response("list-clients\n".to_string())?;
-                print!("{}", resp);
+                // Every flag was dropped here, so `-F` never reached the server
+                // and every line was the default one (issue #724).
+                let mut cmd = "list-clients".to_string();
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    let a = cmd_args[i].as_str();
+                    match a {
+                        "-F" | "-f" | "-O" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" {} {}", a, crate::util::quote_arg(v)));
+                                i += 1;
+                            }
+                        }
+                        "-r" => cmd.push_str(" -r"),
+                        _ if a.len() > 2 && (a.starts_with("-F") || a.starts_with("-f") || a.starts_with("-O")) => {
+                            cmd.push_str(&format!(" {} {}", &a[..2], crate::util::quote_arg(&a[2..])));
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                cmd.push('\n');
+                if explicit_session_target {
+                    print!("{}", send_control_with_response(cmd)?);
+                } else {
+                    // tmux lists the clients of EVERY session on the server.
+                    // psmux runs one server per session, so ask each of them.
+                    let replies = query_every_session(l_socket_name.as_deref(), &cmd);
+                    if replies.is_empty() {
+                        print!("{}", send_control_with_response(cmd)?);
+                    }
+                    for (_, text) in replies {
+                        print!("{}", text);
+                    }
+                }
                 return Ok(());
             }
             // switch-client - Switch the current client to another session

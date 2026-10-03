@@ -3230,11 +3230,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // this when the command actually contains `#{`).
                     let _ = resp.send(expand_format(&fmt, &app));
                 }
-                CtrlReq::ClientAttach(cid) => {
+                CtrlReq::ClientAttach(cid, pid) => {
                     // Registration and the attached counter are one idempotent
                     // operation. A duplicate attach for the same connection
                     // must not leave the session permanently ghost-attached.
-                    if app.register_client(cid, false) {
+                    if app.register_client_with_pid(cid, false, pid) {
                         // A client that attaches here has just changed the
                         // session it is looking at, which is exactly when tmux
                         // fires it: server-client.c:448
@@ -3645,6 +3645,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SendText(s) => { app.status_message = None; crate::input::stamp_interactive_text(&mut app); send_text_to_active(&mut app, &s)?; echo_pending_until = Some(Instant::now()); }
                 CtrlReq::ClientActivity(cid) => {
+                    // `#{client_activity}` is the last input from THIS client
+                    // (tmux c->activity_time), not its last resize (#724).
+                    if let Some(info) = app.client_registry.get_mut(&cid) {
+                        info.last_activity = Instant::now();
+                    }
                     // Typing, clicking, scrolling: this client is the one in
                     // use, so `window-size latest` must size the window for
                     // it.  The resize only runs when the geometry changes.
@@ -4994,29 +4999,36 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::DisplayMessage(resp, fmt, target_pane_idx, set_status_bar, duration_ms) => {
+                CtrlReq::DisplayMessage(resp, fmt, target_pane_idx, set_status_bar, duration_ms, client_sel) => {
                     // Propagate OSC titles so #{pane_title} reflects latest state
                     helpers::propagate_osc_titles(&mut app);
-                    let result = if let Some(pane_idx) = target_pane_idx {
+                    // `-c` picks the client the client_* variables describe. A
+                    // client tmux cannot find is not an error for this command
+                    // (CMD_CLIENT_CANFAIL): the best client answers instead.
+                    let client = client_sel.as_ref().and_then(|s| crate::format::resolve_client_sel(&app, s));
+                    let result = crate::format::with_format_client(client, || if let Some(pane_idx) = target_pane_idx {
                         // -t targeting: evaluate format for the specific pane
                         // using PANE_POS_OVERRIDE so #{pane_active} reflects
                         // the REAL active pane, not the target (#113)
                         crate::format::expand_format_for_pane(&fmt, &app, app.active_idx, pane_idx)
                     } else {
                         expand_format(&fmt, &app)
-                    };
+                    });
                     if set_status_bar {
                         app.status_message = Some((result.clone(), Instant::now(), duration_ms));
                         state_dirty = true;
                     }
                     let _ = resp.send(result);
                 }
-                CtrlReq::DisplayMessageById(resp, fmt, pane_id, set_status_bar, duration_ms) => {
+                CtrlReq::DisplayMessageById(resp, fmt, pane_id, set_status_bar, duration_ms, client_sel) => {
                     // Bare %N pane targeting (#332) — resolve the pane ID
                     // globally across all windows and expand the format with
                     // PANE_POS_OVERRIDE pointing at it.
                     helpers::propagate_osc_titles(&mut app);
-                    let result = crate::format::expand_format_for_pane_by_id(&fmt, &app, pane_id);
+                    let client = client_sel.as_ref().and_then(|s| crate::format::resolve_client_sel(&app, s));
+                    let result = crate::format::with_format_client(client, || {
+                        crate::format::expand_format_for_pane_by_id(&fmt, &app, pane_id)
+                    });
                     if set_status_bar {
                         app.status_message = Some((result.clone(), Instant::now(), duration_ms));
                         state_dirty = true;
@@ -6295,47 +6307,39 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // client, even though `#{session_attached}` correctly read 0.
                     // The registry is the single source of truth here, exactly as
                     // it already is for the ListClientsFormat (-F) path below.
-                    let mut output = String::new();
-                    let mut clients: Vec<&crate::types::ClientInfo> = app.client_registry.values().collect();
-                    clients.sort_by_key(|c| c.id);
-                    for ci in &clients {
-                        let activity_secs = ci.last_activity.elapsed().as_secs();
-                        let kind = if ci.is_control { " (control mode)" } else { "" };
-                        output.push_str(&format!("{}: {}: {} [{}x{}] (utf8){} [activity={}s ago]\n",
-                            ci.tty_name,
-                            app.session_name,
-                            app.windows[app.active_idx].name,
-                            ci.width, ci.height,
-                            kind,
-                            activity_secs,
-                        ));
-                    }
-                    let _ = resp.send(output);
+                    //
+                    // Issue #724: the row is tmux's LIST_CLIENTS_TEMPLATE,
+                    // expanded for each client in turn.
+                    let fmt = crate::format::default_list_clients_format();
+                    let _ = resp.send(crate::format::format_list_clients(&app, fmt, None));
                 }
-                CtrlReq::ListClientsFormat(resp, fmt) => {
-                    let mut output = String::new();
-                    let mut clients: Vec<&crate::types::ClientInfo> = app.client_registry.values().collect();
-                    clients.sort_by_key(|c| c.id);
-                    for ci in &clients {
-                        let activity_secs = ci.last_activity.elapsed().as_secs();
-                        let line = fmt
-                            .replace("#{client_name}", &ci.tty_name)
-                            .replace("#{client_tty}", &ci.tty_name)
-                            .replace("#{client_width}", &ci.width.to_string())
-                            .replace("#{client_height}", &ci.height.to_string())
-                            .replace("#{client_activity}", &activity_secs.to_string())
-                            .replace("#{client_session}", &app.session_name)
-                            .replace("#{session_name}", &app.session_name)
-                            .replace("#{client_control_mode}", if ci.is_control { "1" } else { "0" });
-                        output.push_str(&line);
-                        output.push('\n');
+                CtrlReq::ListClientsFormat(resp, fmt, filter) => {
+                    // Every row is expanded for ITS client, so `#{client_pid}`,
+                    // `#{client_readonly}` and the rest tell clients apart
+                    // (issue #724; this used to be a string replace of eight
+                    // names that the CLI never even forwarded -F to).
+                    let _ = resp.send(crate::format::format_list_clients(&app, &fmt, filter.as_deref()));
+                }
+                CtrlReq::SetClientReadonly(cid, readonly) => {
+                    if let Some(info) = app.client_registry.get_mut(&cid) {
+                        info.readonly = readonly;
                     }
-                    let _ = resp.send(output);
+                }
+                CtrlReq::SetClientFocus(cid, focused) => {
+                    if let Some(info) = app.client_registry.get_mut(&cid) {
+                        info.focused = focused;
+                    }
                 }
                 CtrlReq::ForceDetachClient(target_cid) => {
                     // Force-detach a specific client by shutting down its TCP stream
                     app.client_sizes.remove(&target_cid);
-                    let was_present = app.client_registry.remove(&target_cid).is_some();
+                    let removed = app.client_registry.remove(&target_cid);
+                    let was_present = removed.is_some();
+                    // The name it was listed under (issue #724: no longer
+                    // always derived from the connection id).
+                    let detached_name = removed
+                        .map(|ci| ci.tty_name)
+                        .unwrap_or_else(|| crate::types::client_tty_name(target_cid, None));
                     if was_present {
                         app.attached_clients = app.attached_clients.saturating_sub(1);
                     }
@@ -6358,7 +6362,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     // Fire detach notification
                     control::emit_notification(&app, crate::types::ControlNotification::ClientDetached {
-                        client: format!("/dev/pts/{}", target_cid),
+                        client: detached_name,
                     });
                     hook_event = Some("client-detached");
                     if app.attached_clients == 0 && app.destroy_unattached {
@@ -6380,10 +6384,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::ForceDetachClientByTty(tty, kill_parent) => {
-                    // Look up the client by tty_name (e.g. "/dev/pts/2") and force-detach.
-                    let target_cid: Option<u64> = app.client_registry.iter()
-                        .find(|(_, ci)| ci.tty_name == tty)
-                        .map(|(cid, _)| *cid);
+                    // Look up the client by name the way tmux's cmd_find_client
+                    // does (tty, tty without /dev/, trailing colon; #724).
+                    let target_cid: Option<u64> = crate::format::find_client_by_name(&app, &tty)
+                        .or_else(|| {
+                            // `detach-client -t %N` for a client still listed
+                            // under its connection id N.
+                            tty.strip_prefix("/dev/pts/")
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .filter(|cid| app.client_registry.contains_key(cid))
+                        });
+                    let tty = target_cid
+                        .and_then(|cid| app.client_registry.get(&cid))
+                        .map(|ci| ci.tty_name.clone())
+                        .unwrap_or(tty);
                     if let Some(cid) = target_cid {
                         // Send a clean directive first so the client exits instead of
                         // reconnecting on the stream drop. -P also kills the parent.
@@ -7547,7 +7561,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         state_dirty = true;
                     }
                 }
-                CtrlReq::ControlRegister { client_id, echo, notif_tx } => {
+                CtrlReq::ControlRegister { client_id, echo, notif_tx, pid } => {
                     app.control_clients.insert(client_id, crate::types::ControlClient {
                         client_id,
                         cmd_counter: 0,
@@ -7565,7 +7579,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     });
                     // Register control clients with the same idempotent
                     // counter/registry invariant as normal TUI clients.
-                    app.register_client(client_id, true);
+                    app.register_client_with_pid(client_id, true, pid);
                     // Real tmux fires server hooks (session-changed, window-add,
                     // etc.) as side effects of the initial attach-session command.
                     // iTerm2 depends on %session-changed to enable writes
