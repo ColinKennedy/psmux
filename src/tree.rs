@@ -114,6 +114,66 @@ pub fn replace_leaf_with_split(node: &mut Node, path: &Vec<usize>, kind: LayoutK
     }
 }
 
+/// `replace_leaf_with_split` with the new leaf placed FIRST when `before` is
+/// set (join-pane / move-pane `-b`, cmd-join-pane.c `SPAWN_BEFORE`).
+pub fn replace_leaf_with_split_ordered(node: &mut Node, path: &Vec<usize>, kind: LayoutKind, new_leaf: Node, before: bool) {
+    replace_leaf_with_split(node, path, kind, new_leaf);
+    if !before { return; }
+    if let Some(Node::Split { children, .. }) = get_split_mut(node, path) {
+        if children.len() == 2 { children.swap(0, 1); }
+    }
+}
+
+/// True when `win.active_path` names a pane, not a split. Every consumer that
+/// walks the path to a `Pane` (key input, paste, copy mode) gets `None` for a
+/// split, so a window in that state has no keyboard focus at all (#725).
+pub fn active_path_is_leaf(win: &crate::types::Window) -> bool {
+    matches!(get_node(&win.root, &win.active_path), Some(Node::Leaf(_)))
+}
+
+fn get_node<'a>(node: &'a Node, path: &[usize]) -> Option<&'a Node> {
+    let mut cur = node;
+    for &idx in path {
+        match cur { Node::Split { children, .. } => { cur = children.get(idx)?; } Node::Leaf(_) => return None }
+    }
+    Some(cur)
+}
+
+/// Where a pane grafted by `graft_pane` ended up.
+pub struct Grafted {
+    /// Path of the grafted pane in the target window.
+    pub new_path: Vec<usize>,
+    /// Path of the pane that was active in the target window before the graft,
+    /// re-found by id because the graft moved it one level down.
+    pub prev_active_path: Option<Vec<usize>>,
+}
+
+/// Graft `new_leaf` beside the pane at `path` of `win` (join-pane, move-pane,
+/// cross session join), then re-anchor `win.active_path` on a LEAF.
+///
+/// The graft turns the leaf at `path` into a split, so any `active_path` that
+/// pointed at it (the default target) now names a split node. Left that way the
+/// window had no keyboard focus: typed keys reached no pane until something
+/// re-focused one by id (#725). tmux makes the joined pane active unless `-d`
+/// (cmd-join-pane.c, `window_set_active_pane(dst_w, src_wp, 1)` inside
+/// `if (!args_has(args, 'd'))`), so `focus_new` selects it, and otherwise the
+/// pane that was active before keeps the focus.
+pub fn graft_pane(win: &mut crate::types::Window, path: &Vec<usize>, kind: LayoutKind, new_leaf: Node, before: bool, focus_new: bool) -> Option<Grafted> {
+    let new_id = match &new_leaf { Node::Leaf(p) => Some(p.id), Node::Split { .. } => collect_pane_ids(&new_leaf).first().copied() };
+    let prev_id = get_active_pane_id(&win.root, &win.active_path);
+    replace_leaf_with_split_ordered(&mut win.root, path, kind, new_leaf, before);
+    let new_path = new_id.and_then(|id| find_path_by_id(&win.root, id))?;
+    let prev_active_path = prev_id.and_then(|id| find_path_by_id(&win.root, id));
+    if focus_new {
+        win.active_path = new_path.clone();
+        if let Some(id) = new_id { touch_mru(&mut win.pane_mru, id); }
+    } else {
+        win.active_path = prev_active_path.clone().unwrap_or_else(|| first_leaf_path(&win.root));
+    }
+    debug_assert!(active_path_is_leaf(win), "graft_pane left active_path {:?} on a split", win.active_path);
+    Some(Grafted { new_path, prev_active_path })
+}
+
 pub fn kill_leaf(node: &mut Node, path: &Vec<usize>) {
     *node = remove_node(std::mem::replace(node, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] }), path);
 }

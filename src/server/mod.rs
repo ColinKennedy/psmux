@@ -5120,101 +5120,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
-                CtrlReq::JoinPane { src_win, src_pane, target_win, target_pane, horizontal, detach }
-                | CtrlReq::MovePane { src_win, src_pane, target_win, target_pane, horizontal, detach } => {
+                CtrlReq::JoinPane { src_win, src_pane, target_win, target_pane, horizontal, detach, before }
+                | CtrlReq::MovePane { src_win, src_pane, target_win, target_pane, horizontal, detach, before } => {
                     unzoom_if_zoomed(&mut app);
-                    // Resolve source/target display indices to Vec positions
-                    // (default: active window). win_pos honors gapped indices.
-                    let src_pos = match src_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
-                    let tgt_pos = match target_win { Some(d) => app.win_pos(d), None => Some(app.active_idx) };
-                    // Surface an explicit error instead of silently doing nothing when the
-                    // target cannot be resolved (issue #437). psmux defaults base-index to 0,
-                    // so a tmux user typing `join-pane -t :2` on a 2-window session targets a
-                    // non-existent window; the old silent no-op made join-pane appear broken.
-                    if src_pos.is_none() {
-                        app.status_message = Some((format!("join-pane: can't find source window: {}", src_win.unwrap_or(0)), Instant::now(), None));
-                        meta_dirty = true;
-                    } else if tgt_pos.is_none() {
-                        app.status_message = Some((format!("join-pane: can't find window: {}", target_win.unwrap_or(0)), Instant::now(), None));
-                        meta_dirty = true;
-                    } else if src_pos == tgt_pos {
-                        app.status_message = Some(("join-pane: can't join a pane to its own window".to_string(), Instant::now(), None));
-                        meta_dirty = true;
-                    } else {
-                        let src_idx = src_pos.unwrap();
-                        let raw_target_win = tgt_pos.unwrap();
-                        // Resolve source pane path within source window
-                        let src_path = if let Some(pidx) = src_pane {
-                            // Get Nth pane path in DFS order
-                            let mut leaves = Vec::new();
-                            tree::collect_leaf_paths_pub(&app.windows[src_idx].root, &mut Vec::new(), &mut leaves);
-                            if let Some((_, p)) = leaves.get(pidx) {
-                                p.clone()
-                            } else {
-                                app.windows[src_idx].active_path.clone()
-                            }
-                        } else {
-                            app.windows[src_idx].active_path.clone()
-                        };
-                        // Unzoom source window if needed
-                        if let Some(saved) = app.windows[src_idx].zoom_saved.take() {
-                            let win = &mut app.windows[src_idx];
-                            for (p, sz) in saved.into_iter() {
-                                if let Some(Node::Split { sizes, .. }) = crate::tree::get_split_mut(&mut win.root, &p) { *sizes = sz; }
-                            }
-                        }
-                        let src_root = std::mem::replace(&mut app.windows[src_idx].root,
-                            Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
-                        let (remaining, extracted) = tree::extract_node(src_root, &src_path);
-                        if let Some(pane_node) = extracted {
-                            let src_empty = remaining.is_none();
-                            if let Some(rem) = remaining {
-                                app.windows[src_idx].root = rem;
-                                app.windows[src_idx].active_path = tree::first_leaf_path(&app.windows[src_idx].root);
-                            }
-                            // Adjust target index if source window will be removed and target is after it
-                            let tgt = if src_empty && raw_target_win > src_idx { raw_target_win - 1 } else { raw_target_win };
-                            if src_empty {
-                                app.windows.remove(src_idx);
-                                app.on_window_removed(src_idx);
-                                if app.active_idx >= app.windows.len() {
-                                    app.active_idx = app.windows.len().saturating_sub(1);
-                                }
-                            }
-                            // Graft pane into target window
-                            if tgt < app.windows.len() {
-                                // Resolve target pane path
-                                let tgt_path = if let Some(tpidx) = target_pane {
-                                    let mut leaves = Vec::new();
-                                    tree::collect_leaf_paths_pub(&app.windows[tgt].root, &mut Vec::new(), &mut leaves);
-                                    if let Some((_, p)) = leaves.get(tpidx) {
-                                        p.clone()
-                                    } else {
-                                        app.windows[tgt].active_path.clone()
-                                    }
-                                } else {
-                                    app.windows[tgt].active_path.clone()
-                                };
-                                let split_kind = if horizontal { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-                                tree::replace_leaf_with_split(&mut app.windows[tgt].root, &tgt_path, split_kind, pane_node);
-                                // -d grafts the pane without switching to the
-                                // target window (cmd-join-pane.c:515 to 521:
-                                // the session_select is inside `if (!d)`).
-                                if !detach { app.active_idx = tgt; }
-                                else if app.active_idx >= app.windows.len() {
-                                    app.active_idx = app.windows.len() - 1;
-                                }
-                            }
-                            resize_all_panes(&mut app);
-                            meta_dirty = true;
-                            hook_event = Some("after-join-pane");
-                        } else {
-                            // Extraction failed — restore
-                            if let Some(rem) = remaining {
-                                app.windows[src_idx].root = rem;
-                            }
-                        }
+                    // One implementation with the embedded fallback (#725).
+                    if crate::commands::join_pane_local(&mut app, src_win, src_pane, target_win, target_pane, horizontal, detach, before) {
+                        resize_all_panes(&mut app);
+                        hook_event = Some("after-join-pane");
                     }
+                    meta_dirty = true;
                 }
                 // ── Cross-session pane forwarding ───────────────────────
                 CtrlReq::PaneForwardExtract(win_idx, pane_idx, resp) => {

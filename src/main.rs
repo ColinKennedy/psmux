@@ -3726,6 +3726,7 @@ fn run_main() -> io::Result<()> {
                 let mut source_spec = String::new();
                 let mut horizontal = false;
                 let mut detach = false;
+                let mut before = false;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
@@ -3736,6 +3737,8 @@ fn run_main() -> io::Result<()> {
                         // (cmd-join-pane.c:515). Dropping it here is why
                         // join-pane -d switched anyway (#689).
                         "-d" => detach = true,
+                        // -b is forwarded for the same reason (#725).
+                        "-b" => before = true,
                         "-s" => {
                             if let Some(t) = cmd_args.get(i + 1) {
                                 source_spec = t.to_string();
@@ -3829,6 +3832,7 @@ fn run_main() -> io::Result<()> {
                     let mut cmd = "join-pane".to_string();
                     if horizontal { cmd.push_str(" -h"); }
                     if detach { cmd.push_str(" -d"); }
+                    if before { cmd.push_str(" -b"); }
                     if !source_spec.is_empty() { cmd.push_str(&format!(" -s {}", source_spec)); }
                     if !target_spec.is_empty() { cmd.push_str(&format!(" -t {}", target_spec)); }
                     cmd.push('\n');
