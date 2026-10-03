@@ -106,6 +106,14 @@ function Assert-Latency {
 function Write-Pass { param([string]$msg) $script:PASS++; $script:TOTAL_TESTS++; Write-Host "  PASS: $msg" -ForegroundColor Green }
 function Write-Fail { param([string]$msg) $script:FAIL++; $script:TOTAL_TESTS++; Write-Host "  FAIL: $msg" -ForegroundColor Red }
 function Write-Info { param([string]$msg) Write-Host "  INFO: $msg" -ForegroundColor Gray }
+function Get-Median { param([double[]]$Samples)
+    if (-not $Samples -or $Samples.Count -eq 0) { return 0 }
+    $s = @($Samples | Sort-Object)
+    $n = $s.Count
+    if ($n % 2 -eq 1) { return [double]$s[[math]::Floor($n / 2)] }
+    return ([double]$s[$n / 2 - 1] + [double]$s[$n / 2]) / 2
+}
+
 function Write-Metric { param([string]$label, [double]$ms)
     $color = if ($ms -lt 2000) { "Green" } elseif ($ms -lt 5000) { "Yellow" } else { "Red" }
     Write-Host ("  {0,-50} {1,8:N0} ms" -f $label, $ms) -ForegroundColor $color
@@ -351,13 +359,40 @@ if ($windowTimes.Count -gt 0) {
     } else {
         Write-Fail "new-window: $slowWindows of $($windowTimes.Count) creations over 300ms - the spare pool is not being refilled ahead of demand  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]"
     }
-    # Same arithmetic for the mean: three fast (60 ms), one cold (770 ms) and
-    # one half wait (360 ms) is 262 ms, so 250 flapped with the count above.
-    if ($winAvg -le 300) {
-        Write-Pass ("new-window average {0:N0}ms is within budget (300ms)" -f $winAvg)
+    # The mean used to be gated at 300 ms as well. That double counted the one
+    # cold creation the budget above already allows: with the cold one at 770
+    # ms the mean is 262, with it at 1000 ms the mean is 308, so the gate
+    # flipped on how long THIS machine takes to start one pwsh, which the
+    # count gate had already judged. Sweep 2026-10-03_14-07-51 failed on
+    # [50, 31, 1547, 309, 29] with the count gate passing. Two gates replace it:
+    #
+    #   median - at depth two the centre of five creations must be a warm
+    #            claim, so the median is held to the same 300 ms.
+    #   cold   - the slowest creation is a pwsh start psmux did not have ready,
+    #            so it is judged against the suite's own measurement of a bare
+    #            `pwsh -NoProfile` start on this machine, taken minutes earlier
+    #            (Test 0). A cold creation is that start plus ConPTY and the
+    #            prompt poll, about 2x here (665 to 808 ms against 300 to 335).
+    #            3x is the line: beyond it the machine is not starting ONE
+    #            shell, it is starting several at once (the demand spawn and
+    #            the two refills racing through Store package activation, which
+    #            batches concurrent CreateProcessW calls; measured 1434 and
+    #            1547 ms, 4.3x and 4.6x, on 2026-10-03), and that is the
+    #            product's spawn ordering to answer for, not the shell's.
+    $winMedian = Get-Median $windowTimes
+    if ($winMedian -le 300) {
+        Write-Pass ("new-window median {0:N0}ms is within budget (300ms)" -f $winMedian)
     } else {
-        Write-Fail ("new-window average {0:N0}ms exceeds 300ms" -f $winAvg)
+        Write-Fail ("new-window median {0:N0}ms exceeds 300ms  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]" -f $winMedian)
     }
+    $winMax = ($windowTimes | Measure-Object -Maximum).Maximum
+    $coldLimit = [math]::Round(3 * $baselineAvg)
+    if ($winMax -le $coldLimit) {
+        Write-Pass ("new-window cold creation {0:N0}ms is within 3x the bare pwsh start ({1:N0}ms on this machine, limit {2}ms)" -f $winMax, $baselineAvg, $coldLimit)
+    } else {
+        Write-Fail ("new-window cold creation {0:N0}ms exceeds 3x the bare pwsh start ({1:N0}ms, limit {2}ms): several shells are starting at once instead of one  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]" -f $winMax, $baselineAvg, $coldLimit)
+    }
+    Write-Metric "  New window MEDIAN" $winMedian
 }
 Write-Host ""
 

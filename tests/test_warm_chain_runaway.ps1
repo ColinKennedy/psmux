@@ -174,9 +174,16 @@ if ($liveWarmCount -le 1) { P "at most one genuinely-live warm server observed (
 else { F "multiple ($liveWarmCount) simultaneously live-verified warm servers observed -- possible duplicate-warm-spawn regression" }
 
 # Check 4: total process count stays bounded relative to requested concurrency
-# (no unbounded/runaway growth -- allow N plus a small multiple for transient
-# warm replenish children).
-$bound = $N + 30
+# (no unbounded/runaway growth). The bound is derived, not guessed: at the
+# instant of the sample each of the N claimants may own one server plus one
+# replacement standby it has just spawned and not yet handed on, so 2N is the
+# most a healthy pool can show. A runaway chain (the bug this suite guards)
+# grows past that without limit, and checks 1 to 3 above catch its shape
+# exactly. The old bound of N + 30 was a guess and flapped on the timing of the
+# sample alone: 69, 69, 74, 72, 74, 68, 72 and 73 on master builds across
+# 2026-10-03 (sweep 2026-10-03_14-07-51 failed at 73 with every other check
+# passing, and three reruns of the suite alone gave 0 and 1).
+$bound = 2 * $N
 if ($procs.Count -le $bound) { P "psmux.exe process count bounded ($($procs.Count) <= $bound for N=$N concurrent claimants)" }
 else { F "psmux.exe process count unbounded: $($procs.Count) processes for $N claimants (bound was $bound)" }
 
