@@ -6375,6 +6375,11 @@ impl<W: std::io::Write> PsmuxBackend<W> {
         }
     }
 
+    /// Ask for the hidden cursor to rest at `pos` (0-based) when the frame ends.
+    pub fn park_cursor(&mut self, pos: (u16, u16)) {
+        self.cursor.request_park(pos);
+    }
+
     /// Bytes that must follow the frame content inside the same write but do
     /// not move the cursor on their own (DECSCUSR).
     pub fn queue_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -6431,13 +6436,16 @@ pub struct HostCursor {
     want: Option<(u16, u16)>,
     /// ratatui asked for show_cursor without a position yet.
     want_show_here: bool,
+    /// Where a hidden cursor should rest when the frame ends (tmux moves the
+    /// cursor even with DECTCEM off, and IME composition anchors to it).
+    park: Option<(u16, u16)>,
 }
 
 impl Default for HostCursor {
     fn default() -> Self {
         // Unknown host state: assume visible and unplaced so the first frame
         // hides before drawing and positions explicitly.
-        Self { shown: true, at: None, in_frame: false, want: None, want_show_here: false }
+        Self { shown: true, at: None, in_frame: false, want: None, want_show_here: false, park: None }
     }
 }
 
@@ -6446,6 +6454,12 @@ impl HostCursor {
         self.in_frame = true;
         self.want = None;
         self.want_show_here = false;
+        self.park = None;
+    }
+
+    /// Where the cursor rests while hidden at the end of this frame.
+    pub fn request_park(&mut self, pos: (u16, u16)) {
+        self.park = Some(pos);
     }
 
     pub fn in_frame(&self) -> bool {
@@ -6512,9 +6526,18 @@ impl HostCursor {
                         out.extend_from_slice(b"\x1b[?25h");
                         self.shown = true;
                     }
-                } else if self.shown {
-                    out.extend_from_slice(b"\x1b[?25l");
-                    self.shown = false;
+                } else {
+                    if self.shown {
+                        out.extend_from_slice(b"\x1b[?25l");
+                        self.shown = false;
+                    }
+                    if let Some((x, y)) = self.park {
+                        if self.at != Some((x, y)) {
+                            use std::io::Write as _;
+                            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
+                            self.at = Some((x, y));
+                        }
+                    }
                 }
             }
         }
@@ -6647,6 +6670,10 @@ impl<W: std::io::Write> ratatui::backend::Backend for PsmuxBackend<W> {
 #[cfg(test)]
 #[path = "../tests-rs/test_issue697_cursor_flicker.rs"]
 mod tests_issue697_cursor_flicker;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue726_hidden_cursor_ime_park.rs"]
+mod tests_issue726_hidden_cursor_ime_park;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue589_undercurl.rs"]

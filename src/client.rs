@@ -6849,6 +6849,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // which causes rapid cursor flicker during high-frequency
         // output (e.g. opencode streaming).
         let mut post_draw_cursor: Option<(u16, u16)> = None; // pane-local (col, row)
+        let mut post_draw_park: Option<(u16, u16)> = None; // hidden cursor, pane-local (col, row)
         {
             fn active_cursor_info(node: &LayoutJson) -> Option<(bool, u16, u16, bool)> {
                 match node {
@@ -6863,6 +6864,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             if let Some((hide, cr, cc, copy)) = active_cursor_info(&root) {
                 if !hide && !clock_active && !copy {
                     post_draw_cursor = Some((cc, cr));
+                } else if hide && !clock_active && !copy {
+                    post_draw_park = Some((cc, cr));
                 }
             }
         }
@@ -8441,6 +8444,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             // once it is back where it belongs.  An unchanged frame writes
             // nothing, so the host never sees a ?25l/?25h pair it did not need.
             terminal.backend_mut().request_cursor(cursor_visible);
+            if cursor_visible.is_none() && !(srv_popup_active && srv_popup_has_pty) {
+                if let (Some((cc, cr)), Some(outer)) = (post_draw_park, active_pane_area) {
+                    let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
+                    let cy = inner.y + cr.min(inner.height.saturating_sub(1));
+                    let cx = inner.x + cc.min(inner.width.saturating_sub(1));
+                    terminal.backend_mut().park_cursor((cx, cy));
+                }
+            }
             // DECSCUSR only when style actually changes (avoids blink
             // timer resets in WT).
             if effective != last_cursor_style {
