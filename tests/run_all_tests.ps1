@@ -1073,6 +1073,19 @@ function Show-ProgressDashboard {
 # ancestry.  Everything is by PID with the start time re-checked at kill time.
 $script:OrphanKeepNames = '^(psmux|tmux|pmux|WindowsTerminal|OpenConsole|claude|node|Code|wezterm-gui|alacritty)\.exe$'
 
+# The three image names a psmux server can run under: the crate builds psmux,
+# pmux and tmux, and a server is spawned from `std::env::current_exe()`, so a
+# suite that calls bare `tmux` or `pmux` leaves a server and a warm standby of
+# that name. psmux itself counts all three (src/session.rs
+# `PSMUX_SERVER_IMAGE_NAMES`), and so does the orphan reaper above, but
+# Clean-Server asked for `psmux` alone: a lone tmux.exe standby made its guard
+# false, so the whole teardown, the graceful kill-server included, was skipped.
+$script:PsmuxServerNames = @('psmux', 'pmux', 'tmux')
+
+function Get-PsmuxServerProcess {
+    Get-Process -Name $script:PsmuxServerNames -ErrorAction SilentlyContinue
+}
+
 function Get-ProcSnapshot {
     $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
     $byId = @{}; $kids = @{}
@@ -1165,13 +1178,13 @@ function Invoke-OrphanPaneReap {
 
 function Clean-Server {
     # If no psmux processes exist there is nothing to tear down; just clear files.
-    $alive = @(Get-Process psmux -ErrorAction SilentlyContinue)
+    $alive = @(Get-PsmuxServerProcess)
     if ($alive.Count -gt 0) {
-        # Image name kills, and only ever of psmux. Recorded so the ledger shows
-        # what the runner was doing in the seconds around a disappearance: run
-        # 2026-09-20_00-19-17 died inside this very function, between "Queuing
-        # test_newsession_flags" and "START test_newsession_flags".
-        Write-KillNote ("CLEAN-SERVER killing {0} psmux process(es) by image name: {1}" -f $alive.Count, (($alive | ForEach-Object { $_.Id }) -join ','))
+        # Image name kills, and only ever of a psmux server image. Recorded so
+        # the ledger shows what the runner was doing in the seconds around a
+        # disappearance: run 2026-09-20_00-19-17 died inside this very function,
+        # between "Queuing test_newsession_flags" and "START test_newsession_flags".
+        Write-KillNote ("CLEAN-SERVER killing {0} psmux process(es) by image name: {1}" -f $alive.Count, (($alive | ForEach-Object { "{0}:{1}" -f $_.ProcessName, $_.Id }) -join ','))
         # Gracefully ask all servers to exit, but BOUNDED: a wedged server must not
         # hang the runner (the old unbounded `& $PSMUX kill-server` could block forever).
         try {
@@ -1193,7 +1206,7 @@ function Clean-Server {
         $orphanCandidates = @()
         $treeRecs = @()
         $snap = Get-ProcSnapshot
-        foreach ($srv in @(Get-Process psmux -ErrorAction SilentlyContinue)) {
+        foreach ($srv in @(Get-PsmuxServerProcess)) {
             $srvP = $snap.ById[$srv.Id]
             if (-not $srvP -or -not $snap.Kids.ContainsKey($srv.Id)) { continue }
             foreach ($c in $snap.Kids[$srv.Id]) {
@@ -1205,7 +1218,7 @@ function Clean-Server {
             }
         }
         # Force-kill any lingering processes, then poll (up to 3s) instead of fixed sleeps
-        Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-PsmuxServerProcess | Stop-Process -Force -ErrorAction SilentlyContinue
         foreach ($childPid in $orphanCandidates) {
             $c = Get-Process -Id $childPid -ErrorAction SilentlyContinue
             if ($c -and $c.ProcessName -match '^(pwsh|powershell|cmd|conhost)$') {
@@ -1216,10 +1229,10 @@ function Clean-Server {
         if ($orphanCandidates.Count -gt 0) { Write-KillNote ("CLEAN-SERVER reaped {0} pane shell(s) of the killed server(s) by pid: {1}; {2} process(es) of their trees were still alive and stopped: {3}" -f $orphanCandidates.Count, ($orphanCandidates -join ','), $stoppedTree, (($treeRecs | Where-Object { $orphanCandidates -notcontains $_.Pid } | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Pid }) -join ',')) }
         $deadline = [DateTime]::Now.AddSeconds(3)
         while ([DateTime]::Now -lt $deadline) {
-            if (-not (Get-Process psmux -ErrorAction SilentlyContinue)) { break }
+            if (@(Get-PsmuxServerProcess).Count -eq 0) { break }
             Start-Sleep -Milliseconds 150
         }
-        Get-Process psmux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-PsmuxServerProcess | Stop-Process -Force -ErrorAction SilentlyContinue
         # Brief settle so the OS releases TCP ports/file handles of killed servers
         Start-Sleep -Milliseconds 500
     }
