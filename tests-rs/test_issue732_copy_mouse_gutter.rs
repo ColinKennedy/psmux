@@ -229,3 +229,97 @@ fn the_raw_verbs_are_unchanged_without_a_gutter() {
     remote_mouse_up(&mut app, 5, 0);
     assert_eq!(app.paste_buffers.first().map(String::as_str), Some("CDEF"));
 }
+
+// Two panes side by side, copy mode in the left one.
+//
+// The gutter width is per pane: tmux reads it from the pane the mouse event
+// is for (`cmd_mouse_pane`, then `window_copy_cursor_unoffset`), and
+// `window_copy_line_number_width` counts that pane's own history and height.
+// psmux moves copy mode onto the pane a press lands on, and paints that pane
+// with its own gutter from then on, so a pointer over it is brought back
+// through ITS gutter, never through the gutter of the pane copy mode was in.
+// The left pane is given 1500 lines of history so its gutter is 5 wide while
+// the right pane's is 4, which tells the two apart.
+
+/// A pane whose first row reads `text` instead of the capital alphabet.
+fn make_pane_reading(id: usize, text: &str) -> crate::types::Pane {
+    let pane = make_pane(id);
+    pane.term.lock().expect("term lock").process(format!("\r{}", text).as_bytes());
+    pane
+}
+
+const LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
+const LEFT_GUTTER: usize = 5;
+
+/// Left pane 41 has a long history and is in copy mode, right pane 42 holds
+/// the lower case alphabet on its first row and no history. Returns the app
+/// and the right pane's screen x.
+fn two_panes() -> (AppState, u16) {
+    let mut app = app_with("absolute");
+    crate::copy_mode::exit_copy_mode(&mut app);
+    let area = Rect { x: 0, y: 0, width: COLS * 2 + 1, height: ROWS };
+    app.last_window_area = area;
+    let win = &mut app.windows[0];
+    win.area = area;
+    let mut left = make_pane(41);
+    let term = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 2000)));
+    {
+        let mut t = term.lock().expect("term lock");
+        for n in 0..1500 {
+            t.process(format!("line{}\r\n", n).as_bytes());
+        }
+    }
+    left.term = term;
+    win.root = Node::Split {
+        kind: crate::types::LayoutKind::Horizontal,
+        sizes: vec![50, 50],
+        children: vec![Node::Leaf(left), Node::Leaf(make_pane_reading(42, LOWER))],
+    };
+    win.active_path = vec![0];
+    win.pane_mru = vec![41, 42];
+    let mut rects = Vec::new();
+    crate::tree::compute_rects(&win.root, area, &mut rects);
+    let right_x = rects.iter().find(|(p, _)| *p == vec![1]).expect("right pane rect").1.x;
+    crate::copy_mode::enter_copy_mode(&mut app);
+    assert!(app.mode.in_copy(), "copy mode is on in the left pane");
+    assert_eq!(crate::copy_mode::active_gutter_width(&app), LEFT_GUTTER);
+    assert_eq!(crate::copy_mode::gutter_width_at(&app, &[1]), GUTTER as usize);
+    (app, right_x)
+}
+
+#[test]
+fn a_press_on_another_pane_is_measured_over_that_panes_gutter() {
+    let (mut app, _) = two_panes();
+    handle_pane_mouse(&mut app, 42, 0, 10, 0, true);
+    assert_eq!(app.windows[0].active_path, vec![1], "the press focuses the right pane");
+    assert!(app.mode.in_copy(), "copy mode moves with the press");
+    assert_eq!(
+        app.copy_pos,
+        Some((0, 10 - GUTTER)),
+        "the right pane is drawn behind its own 4 wide gutter, not the left pane's 5"
+    );
+    // The release on the same cell is the same click: nothing moves.
+    handle_pane_mouse(&mut app, 42, 0, 10, 0, false);
+    assert_eq!(app.copy_pos, Some((0, 10 - GUTTER)));
+    assert!(app.copy_anchor.is_none(), "a click makes no selection");
+}
+
+#[test]
+fn the_raw_press_on_another_pane_is_measured_over_that_panes_gutter() {
+    let (mut app, right_x) = two_panes();
+    remote_mouse_down(&mut app, right_x + 10, 0);
+    assert_eq!(app.windows[0].active_path, vec![1]);
+    assert_eq!(app.copy_pos, Some((0, 10 - GUTTER)));
+    remote_mouse_up(&mut app, right_x + 10, 0);
+    assert_eq!(app.copy_pos, Some((0, 10 - GUTTER)));
+    assert!(app.copy_anchor.is_none());
+}
+
+#[test]
+fn a_drag_on_another_pane_yanks_the_letters_under_the_pointer() {
+    let (mut app, _) = two_panes();
+    handle_pane_mouse(&mut app, 42, 0, 2 + GUTTER as i16, 0, true);
+    handle_pane_mouse(&mut app, 42, 32, 5 + GUTTER as i16, 0, true);
+    handle_pane_mouse(&mut app, 42, 0, 5 + GUTTER as i16, 0, false);
+    assert_eq!(app.paste_buffers.first().map(String::as_str), Some("cdef"));
+}
