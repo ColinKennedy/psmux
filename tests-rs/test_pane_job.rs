@@ -127,3 +127,21 @@ fn the_pane_job_can_be_turned_off() {
     drop(pair);
     assert!(survived, "without the job the dropped child's ping keeps running (old behaviour)");
 }
+
+#[test]
+fn a_spawn_reports_its_time_inside_create_process() {
+    // The surge gate (tests/test_issue686_pool_surge_and_reap.ps1) judges
+    // psmux on a spawn's cost MINUS its time inside CreateProcessW, because
+    // Windows returns concurrent creations of the Store pwsh in batches.  That
+    // only works if the OS share is measured, and never exceeds the spawn.
+    let _env = crate::util::lock_test_env();
+    let t0 = Instant::now();
+    let (pair, child, cmd_pid, _ping) = spawn_cmd_ping();
+    let os_us = portable_pty::last_spawn_create_us();
+    let wall_us = t0.elapsed().as_micros() as u64;
+    drop(child);
+    let _ = wait_until(3000, || !process_is_alive(cmd_pid));
+    drop(pair);
+    assert!(os_us > 0, "the CreateProcessW share was never measured");
+    assert!(os_us <= wall_us, "CreateProcessW share {os_us} us exceeds the whole spawn {wall_us} us");
+}

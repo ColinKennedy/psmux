@@ -14,6 +14,7 @@ use winapi::um::winbase::INFINITE;
 pub mod conpty;
 mod procthreadattr;
 mod psuedocon;
+pub(crate) mod spawn_trace;
 
 /// Which ConPTY implementation this process loaded: the system one, or a
 /// conpty.dll named by `PSMUX_CONPTY_DIR`.  Diagnostics only.
@@ -71,8 +72,15 @@ pub struct WinChild {
 /// rounds when the server is killed 0 to 150 ms after `new-session -d`, where
 /// cb783dc left a RUNNING shell and its conhost in 11 to 14 of 15).  Such a
 /// shell never ran and holds no conhost; the test runner's orphan reaper ends
-/// it.  Launching the alias's real image path would close it, at the price of
-/// starting the Store pwsh outside its package activation.
+/// it.  Launching the alias's real image path would not close it: from an
+/// unpackaged caller such as the server, the real path under Program
+/// Files\WindowsApps refuses the job list too (measured, see spawn_command).
+///
+/// Cost, measured with `PSMUX_SPAWN_TRACE=1` on the Store pwsh: creating and
+/// arming the job ~22 us, assigning the suspended process ~30 us, resuming it
+/// ~5 us, against a CreateProcessW of 50 to 300 ms that is the same with the
+/// job off; interleaved cold `new-session -d` to prompt, 45 pairs, job on
+/// minus job off had a median of -12.6 and 3.1 ms in two batches.
 /// `PSMUX_NO_PANE_JOB=1` skips the job, for diagnosis.
 #[derive(Debug)]
 pub(crate) struct PaneJob(OwnedHandle);

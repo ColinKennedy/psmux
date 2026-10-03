@@ -32,6 +32,21 @@
 #      spawns that overlap in time, which was ~322ms serialised and is under
 #      30ms concurrent, and does not depend on how fast this machine is.
 #
+#      The spread is taken over what psmux owns of each spawn: its whole cost
+#      minus the time inside CreateProcessW, which the trace line reports
+#      separately. A psmux lock that serialises spawns makes the waiting ones
+#      wait OUTSIDE their own CreateProcessW, so it still shows in full. What
+#      no longer counts is Windows: the Store pwsh is created through package
+#      activation, and measured with no psmux and no job object at all (an
+#      unpackaged C# probe, eight threads, Windows 11 26200), eight concurrent
+#      CreateProcessW calls of it took ~300ms each and returned in batches at
+#      the same instant, one batch 86 to 250ms after another, where cmd.exe
+#      took 2 to 17ms. That batching failed this gate on builds with and
+#      without the pane job object (spread 154.6ms on 10/02 before the job
+#      existed, 185.9ms after: three spares landing together and a fourth
+#      one batch later, its whole delay inside CreateProcessW). The whole cost
+#      spread is still printed.
+#
 #   2. The user visible number that follows from it: the p50 of a ten call
 #      burst. This one is a guard rather than the discriminator, because the
 #      serialised build's p50 was 57ms with the damage in its tail. It is here
@@ -154,7 +169,10 @@ if (-not (Test-Path $TraceFile)) {
         if ($l -match '^\[\s*([\d\.]+)\s+pid=\d+\]\s+pool: spawned spare pane=(\d+).* in ([\d\.]+)ms') {
             $end = [double]$Matches[1]
             $cost = [double]$Matches[3]
-            $spawns += [pscustomobject]@{ Pane = [int]$Matches[2]; End = $end; Start = $end - $cost; Cost = $cost }
+            $pane = [int]$Matches[2]
+            # The OS share; absent from builds older than the field.
+            $os = if ($l -match 'in CreateProcessW ([\d\.]+)ms') { [double]$Matches[1] } else { 0.0 }
+            $spawns += [pscustomobject]@{ Pane = $pane; End = $end; Start = $end - $cost; Cost = $cost; Os = $os; Own = $cost - $os }
         }
     }
     Write-Info "$($spawns.Count) spare spawns traced"
@@ -168,22 +186,29 @@ if (-not (Test-Path $TraceFile)) {
         # consecutive waves, whose costs legitimately differ with machine load.
         $worstSpread = 0.0
         $worstGroup = $null
+        $worstWhole = 0.0
+        $worstWholeGroup = $null
         foreach ($a in $spawns) {
             $group = @($spawns | Where-Object { [math]::Abs($_.Start - $a.Start) -le 30 })
             if ($group.Count -lt 4) { continue }
-            $costs = $group | ForEach-Object { $_.Cost }
-            $spread = (($costs | Measure-Object -Maximum).Maximum) - (($costs | Measure-Object -Minimum).Minimum)
+            $own = $group | ForEach-Object { $_.Own }
+            $spread = (($own | Measure-Object -Maximum).Maximum) - (($own | Measure-Object -Minimum).Minimum)
             if ($spread -gt $worstSpread) { $worstSpread = $spread; $worstGroup = $group }
+            $costs = $group | ForEach-Object { $_.Cost }
+            $whole = (($costs | Measure-Object -Maximum).Maximum) - (($costs | Measure-Object -Minimum).Minimum)
+            if ($whole -gt $worstWhole) { $worstWhole = $whole; $worstWholeGroup = $group }
         }
-        if ($null -eq $worstGroup) {
+        if ($null -eq $worstGroup -and $null -eq $worstWholeGroup) {
             Write-Fail "no four spare spawns ever started together; the surge did not run concurrently at all"
         } else {
-            $desc = ($worstGroup | Sort-Object Pane | ForEach-Object { "pane=$($_.Pane):$([math]::Round($_.Cost,1))ms" }) -join ' '
-            Write-Info "worst group of spawns that started together ($($worstGroup.Count) spawns): $desc"
+            if ($null -eq $worstGroup) { $worstGroup = $worstWholeGroup }
+            $fmt = { param($g) ($g | Sort-Object Pane | ForEach-Object { "pane=$($_.Pane):$([math]::Round($_.Cost,1))ms(os $([math]::Round($_.Os,1)))" }) -join ' ' }
+            Write-Info "whole cost spread $([math]::Round($worstWhole,1))ms, Windows included: $(& $fmt $worstWholeGroup)"
+            Write-Info "worst group by psmux's own share ($($worstGroup.Count) spawns): $(& $fmt $worstGroup)"
             if ($worstSpread -le $SpreadLimitMs) {
-                Write-Pass "spawns that started together cost within $([math]::Round($worstSpread,1))ms of each other (limit ${SpreadLimitMs}ms): the surge is not serialised"
+                Write-Pass "spawns that started together spent within $([math]::Round($worstSpread,1))ms of each other outside CreateProcessW (limit ${SpreadLimitMs}ms): the surge is not serialised"
             } else {
-                Write-Fail "spawns that started together are a staircase: spread $([math]::Round($worstSpread,1))ms over $($worstGroup.Count) of them (limit ${SpreadLimitMs}ms) -- each is queued behind the previous one's CreateProcessW"
+                Write-Fail "spawns that started together are a staircase: psmux's own share spreads $([math]::Round($worstSpread,1))ms over $($worstGroup.Count) of them (limit ${SpreadLimitMs}ms) -- each is queued behind the previous one's CreateProcessW"
             }
         }
     }

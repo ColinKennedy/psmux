@@ -455,8 +455,50 @@ pub fn last_spawn_console_wait_us() -> u64 {
     SPAWN_WAIT_US.with(|c| c.get())
 }
 
+/// How long the last ConPTY spawn on THIS thread spent inside CreateProcessW
+/// itself (every attempt it made), in microseconds.  Diagnostics only: the
+/// rest of a spawn is psmux's own work and waits, this part is the operating
+/// system's.  They must be told apart because the OS part does not scale with
+/// concurrency for a Store packaged shell: measured on Windows 11 26200 from an
+/// unpackaged caller with no psmux code and no job object at all, eight
+/// concurrent CreateProcessW calls of the Store pwsh each took about 300 ms
+/// (one alone takes about 50 ms) and returned in batches at the same instant,
+/// with a straggler finishing 90 to 250 ms after the rest, while eight of
+/// cmd.exe took 2 to 17 ms.  A surge of spares therefore shows a spread of
+/// whole spawn times that psmux neither causes nor can remove, and only the
+/// time OUTSIDE CreateProcessW says whether psmux serialised its spawns
+/// (issue #686).
+pub fn last_spawn_create_us() -> u64 {
+    SPAWN_CREATE_US.with(|c| c.get())
+}
+
+/// Start a new spawn's CreateProcessW account on this thread.
+pub fn reset_spawn_create_us() {
+    SPAWN_CREATE_US.with(|c| c.set(0));
+}
+
 thread_local! {
     static SPAWN_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SPAWN_CREATE_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds the time until it drops to this thread's CreateProcessW account.
+#[cfg(windows)]
+pub(crate) struct SpawnCreateTimer(std::time::Instant);
+
+#[cfg(windows)]
+impl SpawnCreateTimer {
+    pub(crate) fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SpawnCreateTimer {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros() as u64;
+        SPAWN_CREATE_US.with(|c| c.set(c.get().saturating_add(us)));
+    }
 }
 
 /// Shared, refcounted entry into the console state for a ConPTY spawn.
