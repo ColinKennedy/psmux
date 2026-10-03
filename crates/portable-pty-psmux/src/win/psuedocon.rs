@@ -441,7 +441,12 @@ impl PsuedoCon {
         // The pane process is created INSIDE a job of its own (see PaneJob),
         // atomically: no window exists in which it, or anything it starts,
         // lives outside that job.
+        use super::spawn_trace as st;
+        let t_total = st::now_us();
+        let t = st::now_us();
         let mut job = super::PaneJob::create();
+        st::step(t, &format!("spawn.job_create ok={}", job.is_some()));
+        let t = st::now_us();
         let mut attrs = ProcThreadAttributeList::with_capacity(2)?;
         attrs.set_pty(self.con)?;
         if let Some(j) = job.as_ref() {
@@ -452,10 +457,15 @@ impl PsuedoCon {
             }
         }
         si.lpAttributeList = attrs.as_mut_ptr();
+        st::step(t, "spawn.attr_list");
 
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
+        let t = st::now_us();
         let (mut exe, mut cmdline) = cmd.cmdline()?;
+        if st::enabled() {
+            st::step(t, &format!("spawn.cmdline exe={}", String::from_utf16_lossy(&exe).trim_end_matches('\0')));
+        }
         let cmd_os = OsString::from_wide(&cmdline);
 
         let cwd = cmd.current_directory();
@@ -475,10 +485,14 @@ impl PsuedoCon {
         // identity change is exclusive.  Serialising spawns against each other
         // is what made a surge of spares cost one CreateProcessW after another
         // (issue #686).
+        let t = st::now_us();
         let _console_guard = crate::ConPtySpawnGuard::acquire();
+        st::step(t, &format!("spawn.console_guard_acquire shared_wait_us={}", crate::last_spawn_console_wait_us()));
 
         let exe_key = exe.clone();
+        let t = st::now_us();
         let mut env_block = cmd.environment_block();
+        st::step(t, "spawn.env_block");
         let mut create = |si: &mut STARTUPINFOEXW, pi: &mut PROCESS_INFORMATION, extra: DWORD| unsafe {
             CreateProcessW(
                 exe.as_mut_slice().as_mut_ptr(),
@@ -508,9 +522,14 @@ impl PsuedoCon {
         //  3. Without a job, exactly as before.
         let mut res = 0;
         let mut create_err = IoError::from_raw_os_error(0);
-        if job.is_some() && !joblist_refused(&exe_key) {
+        let t = st::now_us();
+        let refused = joblist_refused(&exe_key);
+        st::step(t, &format!("spawn.joblist_refused_check refused={}", refused));
+        if job.is_some() && !refused {
+            let t = st::now_us();
             res = create(&mut si, &mut pi, 0);
             create_err = IoError::last_os_error();
+            st::step(t, &format!("spawn.CreateProcessW kind=joblist ok={} err={}", res != 0, create_err.raw_os_error().unwrap_or(0)));
             if res == 0 {
                 remember_joblist_refused(&exe_key);
                 // The refused attempt leaves THAT job unusable for the assign
@@ -525,21 +544,30 @@ impl PsuedoCon {
             attrs.set_pty(self.con)?;
             si.lpAttributeList = attrs.as_mut_ptr();
             let suspended = job.is_some();
+            let t = st::now_us();
             res = create(&mut si, &mut pi, if suspended { CREATE_SUSPENDED } else { 0 });
             create_err = IoError::last_os_error();
+            st::step(t, &format!("spawn.CreateProcessW kind={} ok={} err={}", if suspended { "suspended" } else { "plain" }, res != 0, create_err.raw_os_error().unwrap_or(0)));
             assign_after = suspended && res != 0;
             if res == 0 && suspended {
                 job = None;
+                let t = st::now_us();
                 res = create(&mut si, &mut pi, 0);
                 create_err = IoError::last_os_error();
+                st::step(t, &format!("spawn.CreateProcessW kind=retry_plain ok={}", res != 0));
             }
         }
         if assign_after {
+            let t = st::now_us();
             if !job.as_ref().is_some_and(|j| j.assign(pi.hProcess)) {
                 job = None;
             }
+            st::step(t, &format!("spawn.AssignProcessToJobObject ok={}", job.is_some()));
+            let t = st::now_us();
             unsafe { ResumeThread(pi.hThread) };
+            st::step(t, "spawn.ResumeThread");
         }
+        st::step(t_total, &format!("spawn.total pid={}", pi.dwProcessId));
         // The std handle slots are restored when `_console_guard` drops, by the
         // last spawn still inside the console state.
         if res == 0 {

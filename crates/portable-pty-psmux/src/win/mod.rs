@@ -14,6 +14,7 @@ use winapi::um::winbase::INFINITE;
 pub mod conpty;
 mod procthreadattr;
 mod psuedocon;
+pub(crate) mod spawn_trace;
 
 /// Which ConPTY implementation this process loaded: the system one, or a
 /// conpty.dll named by `PSMUX_CONPTY_DIR`.  Diagnostics only.

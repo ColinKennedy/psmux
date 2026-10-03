@@ -60,9 +60,12 @@ impl PtySystem for ConPtySystem {
         // Use 64KB pipe buffers (Windows Terminal uses 128KB).
         // Default CreatePipe(..., 0) = ~4KB, causing frequent kernel round-trips.
         const PIPE_BUF: u32 = 64 * 1024;
+        let t_pipes = super::spawn_trace::now_us();
         let (stdin_read, stdin_write) = create_pipe_with_buffer(PIPE_BUF)?;
         let (stdout_read, stdout_write) = create_pipe_with_buffer(PIPE_BUF)?;
+        super::spawn_trace::step(t_pipes, "openpty.pipes");
 
+        let t_con = super::spawn_trace::now_us();
         let con = PsuedoCon::new(
             COORD {
                 X: size.cols as i16,
@@ -71,6 +74,7 @@ impl PtySystem for ConPtySystem {
             stdin_read,
             stdout_write,
         )?;
+        super::spawn_trace::step(t_con, "openpty.CreatePseudoConsole");
 
         let master = ConPtyMasterPty {
             inner: Arc::new(Mutex::new(Inner {
@@ -163,7 +167,9 @@ impl MasterPty for ConPtyMasterPty {
 
 impl SlavePty for ConPtySlavePty {
     fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
+        let t_lock = super::spawn_trace::now_us();
         let mut inner = self.inner.lock().unwrap();
+        super::spawn_trace::step(t_lock, "spawn.inner_mutex_wait");
         match inner.con.spawn_command(cmd.clone()) {
             Ok(child) => Ok(Box::new(child)),
             Err(e) if inner.con.used_passthrough && is_invalid_parameter(&e) => {
