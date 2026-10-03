@@ -358,6 +358,9 @@ set -g copy-mode-line-number-style "fg=brightblack"
 set -g copy-mode-current-line-number-style "fg=yellow,bold"
 ```
 
+The gutter does not move what the mouse points at: a click or a drag in copy
+mode selects the cell under the pointer whichever mode is set.
+
 ### Popup and Window Styling
 
 `display-popup` overlays and the pane contents themselves can be styled separately from the borders around them:
