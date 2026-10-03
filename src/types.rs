@@ -511,6 +511,20 @@ pub struct WarmPane {
     /// Trace bookkeeping (`PSMUX_WARM_TRACE=1`): whether the "spare became
     /// ready" line has already been emitted for this spare.
     pub trace_settled: bool,
+    /// Whether [WarmPane::ready] was set by the [WARM_READY_MAX_WAIT]
+    /// backstop rather than by the shell going quiet. Trace and diagnostics.
+    pub ready_via_backstop: bool,
+    /// The directory this spare's shell was STARTED in: the `cwd` handed to
+    /// `CreateProcessW`, read back off the command it was built with.
+    ///
+    /// A creation asking for that same directory gets a shell that is already
+    /// exactly what a cold spawn there would produce, so it is transplanted as
+    /// is. Re-homing it anyway types `cd <dir>; cls` into the shell, blanks the
+    /// pane, and leaves the window empty until the shell has run that line and
+    /// drawn a fresh prompt, which is a whole shell round trip on the critical
+    /// path of every warm creation, and costs 100 to 300 ms whenever the
+    /// machine is busy (for example while the claim's own refills boot).
+    pub spawn_cwd: Option<std::ffi::OsString>,
     /// The host terminal palette this spare's shell was spawned with, planted
     /// on it as `PSMUX_HOST_COLORS` (`pane::set_host_colors_env`).
     ///
@@ -544,6 +558,37 @@ pub const WARM_READY_QUIET: std::time::Duration = std::time::Duration::from_mill
 pub const WARM_READY_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl WarmPane {
+    /// One token describing this spare for the warm trace:
+    /// `id:age ms:state:data_version:quiet ms`, state being `Q` (ready because
+    /// its output went quiet), `B` (ready only by the backstop) or `W` (still
+    /// warming).
+    pub fn trace_token(&self, now: std::time::Instant) -> String {
+        let st = if !self.ready { "W" } else if self.ready_via_backstop { "B" } else { "Q" };
+        format!(
+            "{}:{:.0}:{}:{}:{:.0}",
+            self.pane_id,
+            now.saturating_duration_since(self.spawned_at).as_secs_f64() * 1000.0,
+            st,
+            self.data_version.load(std::sync::atomic::Ordering::Relaxed),
+            now.saturating_duration_since(self.last_change).as_secs_f64() * 1000.0
+        )
+    }
+    /// Trace only: the last non blank line on this spare's screen.
+    pub fn trace_last_line(&self) -> String {
+        match self.term.lock() {
+            Ok(p) => p
+                .screen()
+                .contents()
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect(),
+            Err(_) => String::from("<poisoned>"),
+        }
+    }
     /// Recompute [`WarmPane::ready`]. Cheap enough for every loop tick: one
     /// relaxed atomic load per spare, and it returns immediately once ready.
     pub fn refresh_ready(&mut self, now: std::time::Instant) -> bool {
@@ -556,10 +601,11 @@ impl WarmPane {
             self.last_change = now;
         }
         let quiet = now.saturating_duration_since(self.last_change);
-        if (dv > 0 && quiet >= WARM_READY_QUIET)
-            || now.saturating_duration_since(self.spawned_at) >= WARM_READY_MAX_WAIT
-        {
+        if dv > 0 && quiet >= WARM_READY_QUIET {
             self.ready = true;
+        } else if now.saturating_duration_since(self.spawned_at) >= WARM_READY_MAX_WAIT {
+            self.ready = true;
+            self.ready_via_backstop = true;
         }
         self.ready
     }
@@ -727,6 +773,11 @@ impl WarmPool {
     }
     /// How many spares have finished starting. Does not recompute readiness;
     /// call after [`WarmPool::refresh_all`] or a [`WarmPool::claim`].
+    /// Trace only: every pooled spare as a [WarmPane::trace_token].
+    pub fn trace_tokens(&self) -> String {
+        let now = std::time::Instant::now();
+        self.spares.iter().map(|w| w.trace_token(now)).collect::<Vec<_>>().join(" ")
+    }
     pub fn ready_len(&self) -> usize {
         self.spares.iter().filter(|w| w.ready).count()
     }

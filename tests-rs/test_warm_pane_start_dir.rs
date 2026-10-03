@@ -173,6 +173,65 @@ fn create_window_live_spare_with_start_dir_transplants_and_rehomes() {
     crate::util::kill_app_shells(&mut app);
 }
 
+/// A spare asked for the directory it was STARTED in is handed over as is.
+///
+/// `new-window` and `split-window` without `-c` ask for the server's working
+/// directory, which is where every spare is spawned, so this is the common
+/// creation. Re-homing it typed `cd <dir>; cls` into a shell that was already
+/// there, blanked the pane, and left the window empty until the shell had run
+/// that line and drawn a fresh prompt: the fifth of five creations at
+/// `warm-pool-size 5` measured 160 to 380 ms with the prompt already on the
+/// spare's screen at claim time, because the claim's own refills were booting
+/// and the shell answered the injected line late.
+#[test]
+fn create_window_live_spare_already_in_start_dir_is_not_rehomed() {
+    let pty = native_pty_system();
+    let mut app = test_app();
+    let mut wp = spawn_warm_pane(&*pty, &mut app).expect("spawn warm pane");
+    wp.ready = true;
+    let warm_id = wp.pane_id;
+    let started_in = wp
+        .spawn_cwd
+        .clone()
+        .expect("a spare records the directory it was started in");
+    let dir = started_in.to_str().expect("utf8 cwd").to_string();
+    // Spelled differently from the recorded one, as a client may send it: a
+    // trailing separator and, on Windows, different case and forward slashes.
+    let asked = if cfg!(windows) {
+        format!("{}\\", dir.to_uppercase().replace('\\', "/"))
+    } else {
+        format!("{}/", dir)
+    };
+    app.warm_pane.push(wp);
+
+    create_window(&*pty, &mut app, None, Some(&asked), false).expect("create_window");
+
+    let pane = active_pane_of(&mut app.windows[0]);
+    assert_eq!(pane.id, warm_id, "the live spare must be transplanted");
+    assert!(
+        pane.squelch_until.is_none(),
+        "a spare started in the requested directory must not be re-homed (no cd, no cls, no squelch)"
+    );
+    assert!(pane.cwd_hint.is_none(), "nothing to hint: the shell is already where it was asked to be");
+    crate::util::kill_app_shells(&mut app);
+}
+
+#[test]
+fn spare_needs_rehome_only_when_started_elsewhere() {
+    use crate::pane::spare_needs_rehome;
+    use std::ffi::OsStr;
+    let here = if cfg!(windows) { r"C:\Users\someone\proj" } else { "/home/someone/proj" };
+    let elsewhere = if cfg!(windows) { r"C:\Users\someone\other" } else { "/home/someone/other" };
+    assert!(!spare_needs_rehome(Some(OsStr::new(here)), here));
+    assert!(spare_needs_rehome(Some(OsStr::new(here)), elsewhere));
+    // Unknown start directory: keep re-homing, the behaviour before the
+    // start directory was recorded.
+    assert!(spare_needs_rehome(None, here));
+    if cfg!(windows) {
+        assert!(!spare_needs_rehome(Some(OsStr::new(here)), r"c:/users/SOMEONE/proj/"));
+    }
+}
+
 /// #450 gate under #436's looser guard: a DEAD spare must not be transplanted
 /// just because `-c` makes the warm pane eligible. #450's liveness gate must
 /// still reject it and fall through to a cold spawn.

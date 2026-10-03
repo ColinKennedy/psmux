@@ -892,6 +892,7 @@ pub(crate) fn silent_rehome(pane: &mut Pane, dir: &str, syntax: RehomeSyntax) {
             std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned())
         })
         .map(|c| crate::util::normalize_dir_for_display(&c));
+    crate::warm_trace!("rehome: pane={} dir={:?} current={:?}", pane.id, dir, stale);
     pane.cwd_hint = Some(crate::types::CwdHint {
         pid: pane.child_pid,
         requested: crate::util::normalize_dir_for_display(dir),
@@ -908,6 +909,24 @@ pub(crate) fn silent_rehome(pane: &mut Pane, dir: &str, syntax: RehomeSyntax) {
     pane.squelch_until = Some(Instant::now() + Duration::from_millis(500));
     let _ = pane.writer.write_all(cd_cmd.as_bytes());
     let _ = pane.writer.flush();
+}
+
+/// Does a spare started in `spawn_cwd` need re-homing to reach `dir`?
+///
+/// Only when it was started somewhere else. A spare is spawned with the
+/// server's working directory as its `cwd`, and `new-window` / `split-window`
+/// without `-c` ask for exactly that directory, so for the common creation the
+/// transplanted shell is already where a cold spawn would have put it. Its
+/// profile has run in that directory too, so whatever the profile did there is
+/// what a cold spawn would also have done; re-homing would undo it, which the
+/// cold path never does.
+///
+/// An unknown `spawn_cwd` keeps the old behaviour and re-homes.
+pub(crate) fn spare_needs_rehome(spawn_cwd: Option<&std::ffi::OsStr>, dir: &str) -> bool {
+    match spawn_cwd.and_then(|c| c.to_str()) {
+        Some(c) => !crate::util::same_dir(c, dir),
+        None => true,
+    }
 }
 
 pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState, command: Option<&str>, start_dir: Option<&str>, empty: bool) -> io::Result<()> {
@@ -1006,17 +1025,22 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     }
     if let Some(mut wp) = claimed {
         crate::warm_trace!(
-            "claim(new-window): pane={} spare_age={:.1}ms pool_left={} ready_left={}",
+            "claim(new-window): pane={} spare_age={:.1}ms pool_left={} ready_left={} took={} last=\"{}\" inflight={} pool=[{}]",
             wp.pane_id,
             wp.spawned_at.elapsed().as_micros() as f64 / 1000.0,
             app.warm_pane.len(),
-            app.warm_pane.ready_len()
+            app.warm_pane.ready_len(),
+            wp.trace_token(std::time::Instant::now()),
+            wp.trace_last_line(),
+            app.warm_pane.inflight,
+            app.warm_pane.trace_tokens()
         );
         // Resize to current terminal dimensions if they changed since pre-spawn
         let area = app.client_area;
         let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
         let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
         let need_resize = rows != wp.rows || cols != wp.cols;
+        crate::warm_trace!("claim: transplant pane={} spare={}x{} target={}x{} need_resize={}", wp.pane_id, wp.cols, wp.rows, cols, rows, need_resize);
         // #450: the spare shell can die while idling in the pool (shell
         // crash, external kill, dead conhost).  Transplanting the corpse
         // yields a broken empty window that the reaper prunes one tick
@@ -1040,6 +1064,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
                 }
                 crate::warm_pane_sync::reconcile_consumed_parser(&mut parser, app);
             }
+            let spare_cwd = wp.spawn_cwd.take();
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
             let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()), start_command: String::new(), cwd_hint: None };
@@ -1051,8 +1076,10 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             // The snippet has to be written in the dialect of the shell the
             // warm pane is actually running, which is whatever `default-shell`
-            // was when the pool spawned it (#600).
-            if let Some(dir) = start_dir {
+            // was when the pool spawned it (#600). A spare that was started in
+            // that directory is already there and is left alone: see
+            // spare_needs_rehome.
+            if let Some(dir) = start_dir.filter(|d| spare_needs_rehome(spare_cwd.as_deref(), d)) {
                 let syntax = rehome_syntax_for_shell(configured_shell.unwrap_or(""));
                 silent_rehome(&mut pane, dir, syntax);
             }
@@ -1522,6 +1549,7 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
     set_tmux_env(&mut shell_cmd, pane_id, p.control_port, p.socket_name.as_deref(), &p.session_name, p.claude_code_fix_tty, p.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, p.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &p.environment);
+    let spawn_cwd = shell_cmd.get_cwd().cloned();
     let t_spawn0 = std::time::Instant::now();
     let child = pair.slave
         .spawn_command(shell_cmd)
@@ -1585,7 +1613,7 @@ pub fn spawn_warm_pane_from(pty_system: &dyn portable_pty::PtySystem, p: &WarmSp
         console_wait as f64 / 1000.0,
         os_create as f64 / 1000.0
     );
-    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring, spawned_at: now, ready: false, last_dv: 0, last_change: now, trace_settled: false, host_colors: p.host_colors.clone() })
+    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring, spawned_at: now, ready: false, last_dv: 0, last_change: now, trace_settled: false, ready_via_backstop: false, spawn_cwd, host_colors: p.host_colors.clone() })
 }
 
 pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
@@ -1823,13 +1851,18 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     }
     if let Some(mut wp) = claimed {
         crate::warm_trace!(
-            "claim(split): pane={} spare_age={:.1}ms pool_left={} ready_left={}",
+            "claim(split): pane={} spare_age={:.1}ms pool_left={} ready_left={} took={} last=\"{}\" inflight={} pool=[{}]",
             wp.pane_id,
             wp.spawned_at.elapsed().as_micros() as f64 / 1000.0,
             app.warm_pane.len(),
-            app.warm_pane.ready_len()
+            app.warm_pane.ready_len(),
+            wp.trace_token(std::time::Instant::now()),
+            wp.trace_last_line(),
+            app.warm_pane.inflight,
+            app.warm_pane.trace_tokens()
         );
         let need_resize = rows != wp.rows || cols != wp.cols;
+        crate::warm_trace!("claim: transplant pane={} spare={}x{} target={}x{} need_resize={}", wp.pane_id, wp.cols, wp.rows, cols, rows, need_resize);
         // #450: never transplant a spare whose shell died in the pool —
         // see the matching gate in create_window.  Fall through to the
         // cold-spawn path below instead.
@@ -1847,12 +1880,14 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
                 }
                 crate::warm_pane_sync::reconcile_consumed_parser(&mut parser, app);
             }
+            let spare_cwd = wp.spawn_cwd.take();
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let new_pane_id = wp.pane_id;
             let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, win32_input_latched: false, scroll_fg_cache: None, mouse_proto_owner: None, wheel_auth: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, live_term: None, pane_style: None, pane_options: Default::default(), squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()), start_command: String::new(), cwd_hint: None };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell,
-            // in the dialect that shell speaks (#600).
-            if let Some(dir) = start_dir {
+            // in the dialect that shell speaks (#600), unless it was started in
+            // that directory (spare_needs_rehome).
+            if let Some(dir) = start_dir.filter(|d| spare_needs_rehome(spare_cwd.as_deref(), d)) {
                 let syntax = rehome_syntax_for_shell(&app.default_shell);
                 silent_rehome(&mut new_pane, dir, syntax);
             }

@@ -78,6 +78,17 @@ booting beats a cold spawn that is not started at all.
 A `default-shell` that never writes anything would otherwise never be handed
 out, so a spare older than 1500 ms counts as started regardless.
 
+Measured on 2026-10-04, the quiet rule fires earlier than its name suggests.
+Of 1009 promotions traced over nine full runs of the perf suite and twenty runs
+of its depth five section, none needed the backstop, but 872 happened while
+the spare's screen was still blank: the first output (`dv=1` or `dv=2`) is
+the pseudoconsole's own setup sequence, and a Store pwsh then stays silent for
+more than 250 ms while it loads, under load or when several start together.
+Such a spare is counted as ready 300 to 800 ms after spawn without a prompt
+yet. It matters only to creations that follow each other within about a
+second; a spare that has idled for seconds, as in the depth five contract,
+always has its prompt.
+
 ### Bursts (surge)
 
 Depth on its own cannot serve a *run* of creations. Ten windows opened back to
@@ -161,6 +172,36 @@ nothing measurable: burst mean 247, 246, 154 ms against 97, 136, 187 on
 master, refusals 16, 48, 8 against 13, 11, 32. An earlier set of three had
 shown the opposite, which is the size of the noise on this machine.
 
+### A claimed spare keeps the directory it started in
+
+A spare's shell can not be moved from outside once it is running, so a creation
+that asks for a directory (`new-window -c <dir>`, and also a `new-window` or
+`split-window` without `-c`, which asks for the calling client's working
+directory) used to have the claim type ` cd '<dir>'; ...; cls` into the
+transplanted shell. The shell has to read that line, run it and draw a fresh
+prompt before the window shows anything again, so every warm creation carried a
+whole shell round trip, and that round trip is exactly what slows down when the
+machine is busy, for example while the claim's own refills are booting.
+
+That is what made the depth five contract in `tests/test_pane_startup_perf.ps1`
+(TEST 3b) flaky. Its five spares are all four seconds old, and the trace showed
+the prompt on every one of them at claim time (100 of 100 claims over twenty
+runs). Yet under load the fifth creation came out at 126 to 178 ms in six runs
+of ten, against 50 to 80 ms for the first four, because its shell was answering
+the injected `cd` alongside four booting refills. In some runs the first
+`capture-pane` after `new-window` found the pane completely blank: the `cls`
+had landed and the new prompt had not.
+
+Spares are spawned in the server's working directory. A creation from a client
+working in that same directory (the suite's case, and any script or shell that
+started the server from where it runs) is handed a shell that is already where
+a cold spawn would have put it, whose profile has already run there exactly as
+it would after a cold spawn. The claim now records the directory each spare was
+started in and only rehomes a spare that was started somewhere else. Over two
+sets of ten runs under the same load the fifth creation is 55 to 107 ms, and
+no creation of the hundred exceeds 107 ms. A creation asking for any other directory
+still rehomes, as before.
+
 ### Teardown
 
 A spare that is still being spawned belongs to nobody: the shell exists, its
@@ -211,6 +252,14 @@ exclusively. Spares that started together and differ only in `in
 CreateProcessW` were held up by Windows, not by psmux: the Store packaged pwsh
 is created through package activation, which returns concurrent creations in
 batches.
+
+A claim line describes the spare it took and every spare left behind as
+`id:age:state:data_version:quiet`, state being `Q` (started, its output went
+quiet), `B` (counted as started only by the 1500 ms backstop) or `W` (still
+starting), followed by the last line on the taken spare's screen. A `READY`
+line says which rule promoted the spare (`via=quiet` or `via=BACKSTOP`) and
+what its screen showed at that moment. `rehome:` lines show every claim that
+typed a `cd` into its shell.
 
 `PSMUX_SPAWN_TRACE=1` goes one level deeper and times every step of each
 spawn (job object, attribute list, console state, each `CreateProcessW`

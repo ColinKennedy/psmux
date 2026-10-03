@@ -54,6 +54,8 @@ fn spare(pane_id: usize) -> crate::types::WarmPane {
         last_dv: 0,
         last_change: now,
         trace_settled: false,
+        ready_via_backstop: false,
+        spawn_cwd: None,
         host_colors: None,
     }
 }
