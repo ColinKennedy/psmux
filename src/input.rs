@@ -4418,6 +4418,10 @@ mod tests_issue610_ctrl_backspace;
 #[path = "../tests-rs/test_issue588_win32_input_escape.rs"]
 mod tests_issue588_win32_input_escape;
 
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue729_named_key_records.rs"]
+mod tests_issue729_named_key_records;
+
 #[cfg(test)]
 #[path = "../tests-rs/test_issue684_paste_route.rs"]
 mod tests_issue684_paste_route;
