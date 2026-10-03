@@ -155,17 +155,35 @@ pub fn validate_switch_target(
     Ok(())
 }
 
+/// The window and pane half of a join-pane `-s` / `-t` spec (everything after
+/// the session's colon, or the whole spec when it has no session half) in the
+/// form the pane-forward commands read: `%<id>` and `@<id>` as they are, and
+/// anything else behind a colon, so `1.0` is window 1 pane 0 and not session
+/// "1" pane 0, and an empty half is `:` (the active window and pane).
+pub fn window_pane_half(spec: &str) -> String {
+    let rest = match spec.split_once(':') {
+        Some((_, r)) => r,
+        None => spec,
+    };
+    if rest.starts_with(['%', '@']) {
+        rest.to_string()
+    } else {
+        format!(":{}", rest)
+    }
+}
+
 /// Orchestrate a cross-session pane transfer.
 ///
 /// Called from main.rs when join-pane's `-s` session differs from `-t` session.
+/// `src_spec` and `tgt_spec` are window/pane halves from [`window_pane_half`].
+/// The target is checked on its server BEFORE the source pane is extracted,
+/// so a target that does not resolve leaves both sessions untouched.
 /// Returns Ok(()) on success or an error description.
 pub fn orchestrate_cross_session_join(
     src_session: &str,
-    src_window: usize,
-    src_pane: usize,
+    src_spec: &str,
     tgt_session: &str,
-    tgt_window: Option<usize>,
-    tgt_pane: Option<usize>,
+    tgt_spec: &str,
     horizontal: bool,
 ) -> io::Result<()> {
     // 1. Resolve both sessions
@@ -173,8 +191,12 @@ pub fn orchestrate_cross_session_join(
     let (tgt_port, tgt_key) = resolve_session(tgt_session)?;
     let src_addr = format!("127.0.0.1:{}", src_port);
 
+    // The target window and pane must exist before anything moves.
+    validate_switch_target(tgt_port, &tgt_key, &crate::cli::parse_target(tgt_spec))
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
+
     // 2. Tell source to extract the pane and start forwarding
-    let extract_cmd = format!("pane-forward-extract {}.{}", src_window, src_pane);
+    let extract_cmd = format!("pane-forward-extract {}", src_spec);
     let extract_resp = send_to_session(src_port, &src_key, &extract_cmd)?;
 
     // Parse: FORWARD <forward_id> <listen_port> <pid> <title> <rows> <cols> <screen_b64_len>
@@ -218,13 +240,11 @@ pub fn orchestrate_cross_session_join(
         }
     };
 
-    // 3. Build inject command for target
-    let _tgt_spec = match (tgt_window, tgt_pane) {
-        (Some(w), Some(p)) => format!("{}.{}", w, p),
-        (Some(w), None) => format!("{}", w),
-        _ => String::new(),
-    };
+    // 3. Build inject command for target. `-tgt=` carries the target window
+    // and pane; it used to be computed here and never sent, so the pane
+    // landed beside the target session's active pane.
     let h_flag = if horizontal { " -h" } else { "" };
+    let tgt_flag = format!(" -tgt={}", tgt_spec);
     let screen_payload = screen_b64.as_deref().unwrap_or("");
     // The server reads commands line by line, and its inject handler collects
     // the payload from the remaining same-line tokens (connection.rs). Base64
@@ -237,7 +257,7 @@ pub fn orchestrate_cross_session_join(
         format!(" {}", screen_payload)
     };
     let inject_cmd = format!(
-        "pane-forward-inject {} {} {} {} {} {} {} {} {} {}{}{}",
+        "pane-forward-inject {} {} {} {} {} {} {} {} {} {}{}{}{}",
         src_session,
         src_addr,
         src_key,
@@ -249,6 +269,7 @@ pub fn orchestrate_cross_session_join(
         cols,
         screen_payload.len(),
         h_flag,
+        tgt_flag,
         payload_token,
     );
 

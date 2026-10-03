@@ -2393,6 +2393,13 @@ pub fn swap_pane_by_spec(
     dst: &str,
     detach: bool,
 ) -> Result<bool, String> {
+    // A pane in another session lives in another server: refuse it rather
+    // than swap this session's pane of the same number.
+    for spec in [src, Some(dst)].into_iter().flatten() {
+        if let Some(s) = crate::commands::foreign_session_in_spec(app, spec) {
+            return Err(crate::commands::cross_session_refusal("swap-pane", &s));
+        }
+    }
     if app.windows.is_empty() { return Err("can't find pane".to_string()); }
     let active = app.active_idx.min(app.windows.len() - 1);
     let (sw, sp) = match src {

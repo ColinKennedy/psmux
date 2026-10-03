@@ -2621,6 +2621,18 @@ pub struct TempTarget {
 }
 
 impl TempTarget {
+    /// The window and pane halves of a parsed `-s` / `-t` spec (the session
+    /// half is the caller's business).
+    pub fn from_parsed(pt: &ParsedTarget) -> Self {
+        TempTarget {
+            win: pt.window,
+            win_is_id: pt.window_is_id,
+            win_name: pt.window_name.clone(),
+            pane: pt.pane,
+            pane_is_id: pt.pane_is_id,
+        }
+    }
+
     /// True when the target names objects by their stable ids (@window and
     /// %pane), the form `ValidateTarget` replies with: a later structural
     /// change (a kill, a split, a swap) can make it vanish but can never make
@@ -2979,14 +2991,21 @@ pub enum CtrlReq {
     /// cmd-join-pane.c:515 to 521; it used to be parsed nowhere, so join-pane
     /// always switched).
     JoinPane {
-        src_win: Option<usize>,
-        src_pane: Option<usize>,
-        target_win: Option<usize>,
-        target_pane: Option<usize>,
+        /// The raw `-s` spec, kept for its session half: a source in another
+        /// session is refused instead of read as a window of this one.
+        src_raw: Option<String>,
+        /// `-s`: window and pane, a `%id` pane included (it used to be read
+        /// as a pane INDEX of the active window).
+        src: TempTarget,
+        /// `-t`: window and pane, a `%id` pane included.
+        dst: TempTarget,
         horizontal: bool,
         detach: bool,
         /// `-b`: the moved pane goes left of / above the target (#725).
         before: bool,
+        /// Err is tmux's message (`can't join a pane to its own window`,
+        /// `can't find pane: %N`), printed by the CLI at exit 1.
+        resp: mpsc::Sender<Result<(), String>>,
     },
     /// respawn-pane. Fields: optional workdir (-c), kill flag (-k), command
     /// (`--`/positional shell-command), empty (-E), and the per-request reply.
@@ -3154,21 +3173,12 @@ pub enum CtrlReq {
     /// Set session group (used by new-session -t)
     SetSessionGroup(String),
     FindWindow(mpsc::Sender<String>, String),
-    /// move-pane: alias for join-pane
-    MovePane {
-        src_win: Option<usize>,
-        src_pane: Option<usize>,
-        target_win: Option<usize>,
-        target_pane: Option<usize>,
-        horizontal: bool,
-        detach: bool,
-        /// `-b`: the moved pane goes left of / above the target (#725).
-        before: bool,
-    },
     /// Extract a pane and start I/O forwarding for cross-session transfer.
-    /// Fields: window index, pane index, response channel.
+    /// Fields: the source window and pane (None: the active one; a window
+    /// that does not exist or a pane index past the end answers `ERR`),
+    /// response channel.
     /// Response: "FORWARD <id> <port> <pid> <title> <rows> <cols> <screen_b64_len>\n<screen_b64>"
-    PaneForwardExtract(usize, usize, mpsc::Sender<String>),
+    PaneForwardExtract(TempTarget, mpsc::Sender<String>),
     /// Inject a proxy pane from a cross-session transfer.
     /// Fields: source_session, source_addr, source_key, forward_id, fwd_port,
     ///         pid, title, rows, cols, screen_b64, target_window, target_pane, horizontal
@@ -3183,9 +3193,12 @@ pub enum CtrlReq {
         rows: u16,
         cols: u16,
         screen_b64: String,
-        target_win: Option<usize>,
-        target_pane: Option<usize>,
+        /// The target window and pane (None everywhere: the active pane).
+        target: TempTarget,
         horizontal: bool,
+        /// `ERR <message>` when the target does not resolve; the pane is not
+        /// grafted anywhere else.
+        resp: mpsc::Sender<Result<(), String>>,
     },
     /// Resize a forwarded pane's real PTY. Fields: forward_id, rows, cols.
     PaneForwardResize(u64, u16, u16),

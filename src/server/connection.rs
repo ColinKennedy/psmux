@@ -2969,46 +2969,50 @@ match cmd {
         }
     }
     "join-pane" | "joinp" | "move-pane" | "movep" => {
-        // Parse -s source and -h/-v direction.
-        // -t target is already parsed by the global -t handler above into target_win / target_pane.
-        let horizontal = args.iter().any(|a| *a == "-h");
-        // Parse -s source (session:window.pane format)
-        let mut src_win: Option<usize> = None;
-        let mut src_pane: Option<usize> = None;
-        {
-            let mut si = 0;
-            while si < args.len() {
-                if args[si] == "-s" {
-                    if let Some(sv) = args.get(si + 1) {
-                        let pt = parse_target(sv);
-                        src_win = pt.window;
-                        src_pane = pt.pane;
-                    }
-                    si += 2; continue;
-                }
-                si += 1;
-            }
+        // -t was parsed by the generic -t handler above into target_win /
+        // target_pane (with pane_is_id); -s is parsed here. Both keep the
+        // `%id` form: `-s %3` used to become pane INDEX 3 of the active
+        // window, so a source already in the target window joined nothing,
+        // or the wrong pane, at exit 0.
+        let horizontal = args.contains(&"-h");
+        let src_raw = flag_value(&args, "-s");
+        let src = src_raw.as_deref()
+            .map(|sv| crate::types::TempTarget::from_parsed(&parse_target(sv)))
+            .unwrap_or_default();
+        let mut dst = crate::types::TempTarget {
+            win: target_win,
+            win_is_id: target_win_is_id,
+            win_name: target_win_name.clone(),
+            pane: target_pane,
+            pane_is_id,
+        };
+        // No -t window: a bare integer is the target window (legacy compat).
+        if dst.win.is_none() && dst.win_name.is_none() && !dst.pane_is_id {
+            dst.win = args.iter().enumerate()
+                .find(|(i, a)| a.parse::<usize>().is_ok() && (*i == 0 || !matches!(args[*i - 1], "-s" | "-l" | "-p")))
+                .and_then(|(_, s)| s.parse::<usize>().ok());
+            dst.win_is_id = false;
         }
-        // If no -s given, try bare integer as target window (legacy compat)
-        let tgt_win = target_win.or_else(|| {
-            args.iter()
-                .find(|a| a.parse::<usize>().is_ok())
-                .and_then(|s| s.parse::<usize>().ok())
-        });
-        // Always send the request (server will use defaults for None fields)
+        let (resp_s, resp_r) = mpsc::channel();
         let _ = tx.send(CtrlReq::JoinPane {
-            src_win,
-            src_pane,
-            target_win: tgt_win,
-            target_pane: target_pane,
+            src_raw,
+            src,
+            dst,
             horizontal,
             // -d: graft the pane without switching to the target window
             // (cmd-join-pane.c:515). It was parsed nowhere, so join-pane
             // always switched, the same defect break-pane had (#689).
-            detach: args.iter().any(|a| *a == "-d"),
+            detach: args.contains(&"-d"),
             // -b: the moved pane goes left of / above the target (#725).
             before: args.contains(&"-b"),
+            resp: resp_s,
         });
+        if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
+            if !persistent {
+                let _ = writeln!(write_stream, "ERROR: {}", e);
+                let _ = write_stream.flush();
+            }
+        }
     }
     "respawn-pane" | "respawnp" => {
         let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
@@ -3059,13 +3063,19 @@ match cmd {
     }
     // ── Cross-session pane forwarding commands ──────────────────────
     "pane-forward-extract" => {
-        // Usage: pane-forward-extract <win>.<pane>
-        let spec = args.first().copied().unwrap_or("0.0");
-        let pt = parse_target(spec);
-        let win = pt.window.unwrap_or(0);
-        let pane = pt.pane.unwrap_or(0);
+        // Usage: pane-forward-extract <spec>, where <spec> is `:<win>.<pane>`,
+        // `:<win>` (its active pane) or `%<id>`; the leading colon keeps a `1.0`
+        // from parsing as session "1", pane 0. An older CLI sends a bare
+        // `<win>.<pane>`, which is read as before.
+        let spec = args.first().copied().unwrap_or(":0.0");
+        let target = if spec.starts_with([':', '%', '@']) {
+            crate::types::TempTarget::from_parsed(&parse_target(spec))
+        } else {
+            let pt = parse_target(spec);
+            crate::types::TempTarget { win: Some(pt.window.unwrap_or(0)), pane: Some(pt.pane.unwrap_or(0)), ..Default::default() }
+        };
         let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::PaneForwardExtract(win, pane, rtx));
+        let _ = tx.send(CtrlReq::PaneForwardExtract(target, rtx));
         if let Ok(resp) = rrx.recv_timeout(std::time::Duration::from_millis(5000)) {
             let _ = write!(write_stream, "{}\n", resp);
             let _ = write_stream.flush();
@@ -3091,6 +3101,17 @@ match cmd {
             let cols: u16 = args[8].parse().unwrap_or(80);
             let screen_b64_len: usize = args[9].parse().unwrap_or(0);
             let horizontal = args.iter().any(|a| *a == "-h");
+            // `-tgt=<spec>`: the window and pane the joined pane goes next to
+            // (`:<win>`, `:<win>.<pane>`, `%<id>`). The CLI used to drop it,
+            // so a join that named a target pane landed beside the active
+            // one. A generic `-t` from an older client still counts.
+            let target = match args.iter().find_map(|a| a.strip_prefix("-tgt=")) {
+                Some(spec) => crate::types::TempTarget::from_parsed(&parse_target(spec)),
+                None => crate::types::TempTarget {
+                    win: target_win, win_is_id: target_win_is_id, win_name: target_win_name.clone(),
+                    pane: target_pane, pane_is_id,
+                },
+            };
             // Read screen base64 data from remaining args/payload
             let screen_b64 = if screen_b64_len > 0 {
                 // The base64 data may be appended after the args as a separate read
@@ -3108,12 +3129,16 @@ match cmd {
             } else {
                 String::new()
             };
+            let (rs, rr) = mpsc::channel();
             let _ = tx.send(CtrlReq::PaneForwardInject {
                 source_session, source_addr, source_key,
                 forward_id, fwd_port, pid, title, rows, cols, screen_b64,
-                target_win: target_win, target_pane: target_pane, horizontal,
+                target, horizontal, resp: rs,
             });
-            let _ = write!(write_stream, "OK\n");
+            match rr.recv_timeout(std::time::Duration::from_millis(5000)) {
+                Ok(Err(e)) => { let _ = writeln!(write_stream, "ERR {}", e); }
+                _ => { let _ = writeln!(write_stream, "OK"); }
+            }
             let _ = write_stream.flush();
         } else {
             let _ = write!(write_stream, "ERR not enough args\n");
