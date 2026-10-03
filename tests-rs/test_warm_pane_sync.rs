@@ -131,6 +131,8 @@ fn resize_to_same_size_is_noop() {
         last_dv: 0,
         last_change: now,
         trace_settled: false,
+        ready_via_backstop: false,
+        spawn_cwd: None,
         host_colors: None,
     });
 
@@ -175,6 +177,8 @@ fn push_spare_with_palette(app: &mut AppState, planted: Option<crate::types::Hos
         last_dv: 0,
         last_change: now,
         trace_settled: false,
+        ready_via_backstop: false,
+        spawn_cwd: None,
         host_colors: planted,
     });
 }

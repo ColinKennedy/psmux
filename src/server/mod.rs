@@ -2404,9 +2404,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if wp.ready && !wp.trace_settled {
                         wp.trace_settled = true;
                         crate::warm_trace::log(&format!(
-                            "pool: spare pane={} READY {:.1}ms after spawn",
+                            "pool: spare pane={} READY {:.1}ms after spawn via={} dv={} last=\"{}\"",
                             wp.pane_id,
-                            wp.spawned_at.elapsed().as_micros() as f64 / 1000.0
+                            wp.spawned_at.elapsed().as_micros() as f64 / 1000.0,
+                            if wp.ready_via_backstop { "BACKSTOP" } else { "quiet" },
+                            wp.last_dv,
+                            wp.trace_last_line()
                         ));
                     }
                 }
