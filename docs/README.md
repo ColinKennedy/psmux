@@ -39,7 +39,7 @@ Step by step, tested on the shipped binary, copy pasteable.
 | [Mouse Over SSH](mouse-ssh.md) | Mouse support on remote Windows servers and the Windows build requirements |
 | [Claude Code](claude-code.md) | Claude Code agent teams: teammates spawn into psmux panes automatically |
 | [FAQ](faq.md) | Common questions: mouse and wheel behaviour, Windows builds, shells, colours |
-| [Diagnostics](diagnostics.md) | Debug logs, crash logs, state files, what to attach to a bug report |
+| [Diagnostics](diagnostics.md) | Debug logs, crash logs, state files, measuring the terminal around you, what to attach to a bug report |
 
 ## Scripting and integration
 
