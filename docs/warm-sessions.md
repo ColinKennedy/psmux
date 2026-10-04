@@ -230,9 +230,10 @@ entirely.
 
 So the server now holds the pool refill and the standby spawn until the first
 pane's shell has started, by the same test a spare's readiness uses (it has
-written and then been quiet for 250 ms, or 1.5 s have passed). Only the idle
-refill tick is held: a creation that claims during the hold still schedules its
-own refill. Measured over 20 interleaved cold reps, `new-session` with a pwsh
+written and then been quiet for 250 ms, or 1.5 s have passed). That first
+version held only the idle refill tick and cost the first window dearly; the
+next section has what the hold does now. Measured over 20 interleaved cold
+reps, `new-session` with a pwsh
 command, launch to the shell's first script line:
 
 | build  | fast mode           | slow mode           |
@@ -244,6 +245,62 @@ With the default shell and the user's profile, launch to the prompt visible in
 `capture-pane` went from 989 to 1035 ms to 734 to 833 ms (14 interleaved reps
 each). The standby and the spares arrive about 600 ms later than before; a
 `new-window` three seconds after launch still claims a ready spare.
+
+### The first window after launch
+
+That first version moved the cost instead of removing it. A `new-window`
+right after the prompt (what agent team tooling does: it creates panes the
+moment `new-session` returns) arrived during the hold, found the pool empty
+and cold spawned. And the trace showed it worse than one shell: the server's
+own first window takes the early spare through the claim path, so the user's
+first `new-window` counted as the second claim of a burst and surged eight
+spares beside its cold spawn, plus the standby when the hold let go. Test 2
+of `tests/test_pane_startup_perf.ps1` went from a first window of 37 to 283
+ms to 1692 to 2066 ms.
+
+What one companion costs, measured the same way as above: one pwsh 7 beside
+the measured one adds ~70 ms, two add ~110 ms, four ~200 ms. A neighbour that
+starts later costs less: two started 150, 300 and 450 ms after the measured
+shell added ~90, ~50 and ~0 ms. Releasing the hold earlier than the prompt
+(at a fixed 150 or 250 ms into the boot) made the first window 200 to 490 ms
+but put 60 to 110 ms back on every launch, so it was not taken.
+
+What the hold does now:
+
+* It watches every pane that exists while it is on, not only the first, so a
+  window or split created during the hold cold spawns alone and the hold
+  waits for that shell too. Nothing is refilled during the hold, from the
+  tick or from a claim.
+* A shell counts as started at its first visible text (the prompt, or
+  whatever its profile prints first; ConPTY's own startup sequences draw
+  nothing), so the release no longer waits 250 ms of quiet after the prompt.
+  Written then quiet for 250 ms still counts, for a shell that draws nothing,
+  and 1.5 s after the last pane joined the hold lets go regardless.
+* On release the pool trickles: one spare booting at a time until one is
+  ready or somebody claims. The standby is spawned last, once the pool has
+  its spares or 2 s after the release; only the next `new-session` needs it.
+* The server's own first window no longer counts as a claim for the surge.
+
+Interleaved, test 2's sequence (detached session, prompt, then five
+`new-window` back to back, 15 ms prompt polling), first window over 8 reps:
+
+| build                    | first window         | the whole vector, one rep      |
+|--------------------------|----------------------|--------------------------------|
+| before the hold          | 37 to 283 ms         | 39, 32, 1374, 78, 36           |
+| first hold               | 1692 to 2066 ms      | 2020, 232, 40, 35, 34          |
+| this                     | 611 to 701 ms        | 613, 79, 25, 1351, 37          |
+
+The first window is now one shell booting alone, about what a bare pwsh with
+the profile costs here. The 1.2 to 1.7 s creation later in the sequence is the
+surge (two quick claims that both missed): it was the third creation before
+the hold and is the fourth now, and the suite's budget of two slow creations
+covers it. Cold launch keeps its single mode: 682 to 724 ms over 20 reps
+against 666 to 706 for the first hold and 744 to 938 (8 fast, 12 slow) before
+it; a second interleaved set put the first hold at 695 to 717 and this at 675
+to 718. `tests/test_perf_vs_terminals.ps1` T4b, whose first window is one
+shell booting alone right after the prompt (350 to 456 ms), came out 281.7,
+220.1, 280.8 and 247.3 ms against its 300 ms limit; with five samples the p90
+is 0.6 of that one creation, so the margin is that shell's boot.
 
 ### Teardown
 

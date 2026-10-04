@@ -994,6 +994,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
         was_ready = r;
     }
     if warm_eligible {
+        app.pool_trickle = false;
         app.warm_pane.note_claim(was_ready);
         if !was_ready {
             crate::warm_trace!(
@@ -1422,14 +1423,36 @@ pub fn warm_spawn_permit() -> Option<WarmSpawnPermit> {
 /// Nothing happens when the pool is off (`warm off`, `warm-pool-size 0`,
 /// `PSMUX_NO_WARM`): those produce a target of zero, hence no deficit. The
 /// thread count is bounded by [`crate::types::WARM_POOL_SURGE_MAX`].
+/// The refill right after the boot hold trickles: one spare booting at a time
+/// until one is ready, so the shell a user's next creation will wait on boots
+/// with at most one companion (one pwsh 7 beside another costs it ~70 ms, two
+/// cost ~110 ms). A claim ends the trickle (the claim sites clear the flag),
+/// and so does the first ready spare.
+pub fn trickle_deficit(trickle: &mut bool, pool: &crate::types::WarmPool, deficit: usize) -> usize {
+    if !*trickle {
+        return deficit;
+    }
+    if pool.ready_len() > 0 {
+        *trickle = false;
+        return deficit;
+    }
+    let booting = pool.inflight + (pool.len() - pool.ready_len());
+    deficit.min(1usize.saturating_sub(booting))
+}
+
 pub fn schedule_warm_refill(app: &mut AppState) {
     if !app.warm_enabled {
+        return;
+    }
+    // A shell somebody is waiting on is still booting (`types::BootHold`):
+    // a claim during the hold cold spawns alone and the refill waits for it.
+    if app.boot_hold.is_some() {
         return;
     }
     let Some(tx) = app.warm_refill_tx.clone() else { return };
     let standby = app.is_warm_server();
     let target = app.warm_pane.effective_target(standby);
-    let deficit = app.warm_pane.deficit_for(target);
+    let deficit = trickle_deficit(&mut app.pool_trickle, &app.warm_pane, app.warm_pane.deficit_for(target));
     for _ in 0..deficit {
         let Some(params) = warm_spawn_params(app) else { break };
         let spawn_pane_id = params.pane_id;
@@ -1838,6 +1861,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
         was_ready = r;
     }
     if warm_eligible {
+        app.pool_trickle = false;
         app.warm_pane.note_claim(was_ready);
         if !was_ready {
             crate::warm_trace!(

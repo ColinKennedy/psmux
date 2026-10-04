@@ -52,10 +52,12 @@
 //!   `srv.window`       the initial window exists
 //!   `srv.prewarm`      the spare pane pool has been filled
 //!   `srv.loop`         the main request loop is about to run
-//!   `srv.boot.output`  the first pane wrote output while the boot hold is on,
-//!                      with its data version (`types::BootHold`)
-//!   `srv.boot.release` the boot hold released: pool refill and the warm
-//!                      standby spawn go out now
+//!   `srv.boot.watch`   the boot hold started watching a pane (the first one,
+//!                      or a window or split created during the hold)
+//!   `srv.boot.output`  a watched pane wrote output, with its data version
+//!                      and whether it now shows visible text (`types::BootHold`)
+//!   `srv.boot.release` the boot hold released: the pool trickles from now on
+//!                      and the standby follows once the pool has its spares
 //!
 //! The `srv.listen` .. `srv.bound` span is the session registry: six small
 //! files, and on a machine with realtime AV scanning each create costs several

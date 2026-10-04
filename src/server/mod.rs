@@ -180,6 +180,27 @@ fn serialize_overlay_json(app: &AppState) -> String {
     out
 }
 
+/// The longest the standby waits after the boot hold for the pool to have its
+/// spares. It is only needed by the NEXT `new-session`.
+const STANDBY_OWED_MAX: Duration = Duration::from_millis(2000);
+
+/// Put every pane that exists now under the boot hold. A window or split
+/// created while the hold is on is a shell somebody is waiting on, so the hold
+/// keeps the pool and the standby back until it has started too.
+fn boot_hold_watch_panes(app: &mut AppState) {
+    let Some(mut hold) = app.boot_hold.take() else { return };
+    let now = Instant::now();
+    for w in app.windows.iter() {
+        crate::tree::for_each_pane(&w.root, &mut |p| {
+            if !hold.watching(p.id) && hold.watch(p.id, p.data_version.clone(), p.term.clone(), now) {
+                crate::startup_trace::mark_detail("srv.boot.watch", &format!("pane={}", p.id));
+                crate::warm_trace!("pool: boot hold watching pane={}", p.id);
+            }
+        });
+    }
+    app.boot_hold = Some(hold);
+}
+
 fn should_spawn_warm_server(app: &AppState) -> bool {
     app.warm_enabled && app.session_name != "__warm__" && !app.destroy_unattached
 }
@@ -2272,16 +2293,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         crate::commands::fire_hooks(&mut app, "session-created");
     }
     // Hold the background shell spawns (pool refill, warm standby) until the
-    // first pane's shell has started: booting beside it is what made a cold
-    // launch bimodal. See `types::BootHold` for the measurement.
+    // first pane's shell, and any created during the hold, has started:
+    // booting beside it is what made a cold launch bimodal. See
+    // `types::BootHold` for the measurement.
     if app.warm_enabled {
-        let first = app.windows.first()
-            .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
-            .map(|p| p.data_version.clone());
-        if let Some(dv) = first {
-            app.boot_hold = Some(crate::types::BootHold::new(dv, Instant::now()));
-        }
+        app.boot_hold = Some(crate::types::BootHold::new(Instant::now()));
+        boot_hold_watch_panes(&mut app);
     }
+    // The first window took the early spare through the claim path. That is
+    // the server starting, not a user creating a window, so it must not make
+    // the user's first `new-window` look like the second claim of a burst.
+    app.warm_pane.forget_claims();
     // Spawn a warm server for the NEXT new-session when the current session
     // is allowed to keep background state alive (owed to the hold release
     // when there is a hold).
@@ -2392,6 +2414,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // handing the push to the next iteration costs an iteration and not a
     // millisecond of keystroke-to-screen latency.
     let mut push_deferred = false;
+    // The standby spawn the boot hold owes, and since when (see the release).
+    let mut standby_owed_at: Option<Instant> = None;
     loop {
         // Set when this iteration marked the state dirty only because a pty
         // batch is still PENDING in `PTY_DATA_READY`. See the request arm and
@@ -2436,9 +2460,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // `pane::schedule_warm_refill`); this tick covers deficits that come
         // from elsewhere, such as a reaped corpse or a resize.
         //
-        // Except while the first shell is still booting (`types::BootHold`):
-        // nothing is waiting on the pool yet, and the owed standby spawn goes
-        // out together with the refill the moment the hold releases.
+        // Except while a shell somebody is waiting on is still booting
+        // (`types::BootHold`). On release the pool trickles (one spare at a
+        // time until one is ready or somebody claims), and the owed standby
+        // goes out last, once the pool has its spares or STANDBY_OWED_MAX
+        // has passed: every one of them would otherwise boot beside the shell
+        // the user's next creation is about to wait on.
+        if app.boot_hold.is_some() {
+            boot_hold_watch_panes(&mut app);
+        }
         let held = match app.boot_hold.as_mut() {
             Some(h) => !h.released(Instant::now()),
             None => false,
@@ -2447,11 +2477,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             if let Some(h) = app.boot_hold.take() {
                 crate::startup_trace::mark("srv.boot.release");
                 crate::warm_trace!("pool: boot hold released, standby owed={}", h.standby_owed);
+                app.pool_trickle = true;
                 if h.standby_owed && should_spawn_warm_server(&app) {
-                    spawn_warm_server(&app);
+                    standby_owed_at = Some(Instant::now());
                 }
             }
             crate::pane::schedule_warm_refill(&mut app);
+            if let Some(t) = standby_owed_at {
+                let want = app.warm_pane.effective_target(false).min(crate::types::WARM_POOL_SIZE_DEFAULT);
+                if app.warm_pane.ready_len() >= want || t.elapsed() >= STANDBY_OWED_MAX {
+                    standby_owed_at = None;
+                    crate::warm_trace!("pool: owed standby spawn now (ready={})", app.warm_pane.ready_len());
+                    if should_spawn_warm_server(&app) {
+                        spawn_warm_server(&app);
+                    }
+                }
+            }
         }
         // Give back the spares a finished surge was holding. Checked a few
         // times a second rather than every tick: it walks the pool and kills
