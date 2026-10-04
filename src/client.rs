@@ -2341,6 +2341,21 @@ const RECONNECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// either way.
 const ATTACH_CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 
+/// The value of `last_sent_size` that means "the server has not been told this
+/// client's size". The size-send check is a plain `!=`, so this sentinel makes
+/// the next loop tick report the size again.
+///
+/// Two things set it back: the server's `status_lines` changing (the content
+/// height the server needs changes with it), and a reconnect. The reconnect one
+/// is not an optimisation: the server keys `client_sizes` on the connection and
+/// a reconnect is a new connection with a new server-side client id, so the
+/// size the window was being sized from died with the old id. Without the
+/// reset, an idle desktop client that got torn down and reconnected became
+/// invisible to `window-size latest` for the rest of its life, and the window
+/// stayed at the other (phone/SSH) client's size even after that client left
+/// (see `tests-rs/test_client_size_after_reconnect.rs`).
+const SIZE_NOT_REPORTED: (u16, u16) = (0, 0);
+
 fn establish_connection_with_timeout(
     addr: &str,
     key: &str,
@@ -2861,7 +2876,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut popup_rect_last: Option<Rect> = None;
     let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
     let current_session = name.clone();
-    let mut last_sent_size: (u16, u16) = (0, 0);
+    let mut last_sent_size: (u16, u16) = SIZE_NOT_REPORTED;
     let mut last_status_lines: u16 = 1; // track server's status_lines for correct client-size height
     let mut last_dump_time = Instant::now() - Duration::from_millis(250);
     let mut force_dump = true;
@@ -3476,6 +3491,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         frame_rx = new_rx;
                         force_dump = true;
                         dump_in_flight = false;
+                        // The reconnect is a new TCP connection, and the server
+                        // keys client sizes on the connection: the size it sized
+                        // the window with is gone. Report it again on the next
+                        // tick, or `window-size latest` can never pick this
+                        // client again (SIZE_NOT_REPORTED above).
+                        last_sent_size = SIZE_NOT_REPORTED;
                     }
                     // If quit is already set (user detached while reconnect was
                     // in-flight), let new_writer drop here so the TcpStream
@@ -7066,7 +7087,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         if new_sl != last_status_lines {
             last_status_lines = new_sl;
             // Force a client-size re-send on the next iteration
-            last_sent_size = (0, 0);
+            last_sent_size = SIZE_NOT_REPORTED;
         }
         let status_format = state.status_format;
         let pane_border_style = parse_pane_border_colors(

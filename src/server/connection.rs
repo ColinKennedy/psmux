@@ -848,6 +848,31 @@ pub(crate) fn readonly_client_may_run(cmd: &str) -> bool {
     )
 }
 
+/// Did a client read merely not complete, rather than fail?
+///
+/// Every client connection is read with a `set_read_timeout` budget, and the
+/// expiry of that budget is what keeps a persistent reader looping instead of
+/// blocking. It is **not** a dead client, and the three reader loops must not
+/// treat it as one.
+///
+/// `WouldBlock`/`TimedOut` are not the only shapes that expiry takes. Rust
+/// opens its sockets with `WSA_FLAG_OVERLAPPED`, and on Windows a receive that
+/// times out on such a socket can surface as `WSA_IO_PENDING` (os error 997,
+/// "overlapped I/O operation is in progress"), which maps to
+/// `ErrorKind::Uncategorized`. Treating that as fatal closed the connection of
+/// a perfectly healthy idle desktop client; the client reconnected under a
+/// fresh client id, and because a reconnect used not to re-report its size,
+/// `window-size latest` could never size the window for it again (see
+/// `tests-rs/test_client_size_after_reconnect.rs`). `WSAEINTR` (10004, which
+/// Rust also leaves as `Uncategorized`) and `WSAETIMEDOUT` (10060) belong in the
+/// same bucket: the read did not fail, it just did not complete.
+fn is_read_retry(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    ) || matches!(e.raw_os_error(), Some(997) | Some(10004) | Some(10060))
+}
+
 /// Handle a single TCP connection from a client.
 /// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
 /// to the main server event loop via the `tx` channel.
@@ -1178,7 +1203,8 @@ if control_echo || control_noecho {
             match r.read_line(&mut line) {
                 Ok(0) => break, // EOF
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
+                    // A read budget that expired is not a client that died.
+                    if is_read_retry(&e) {
                         continue;
                     }
                     break;
@@ -1584,7 +1610,7 @@ loop {
             }
             Err(e) => {
                 // In persistent mode, timeouts are expected - keep waiting
-                if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
+                if persistent && is_read_retry(&e) {
                     line.clear(); // Clear any partial data from interrupted read
                     continue;
                 }
@@ -4999,7 +5025,7 @@ match cmd {
             break;
         }
         Err(e) => {
-            if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
+            if persistent && is_read_retry(&e) {
                 line.clear(); // Clear any partial data from interrupted read
                 continue; // Persistent mode - keep waiting
             }
@@ -6349,3 +6375,7 @@ mod tests_issue691_hook_table;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue693_targets.rs"]
 mod tests_issue693_targets;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_client_read_timeout.rs"]
+mod tests_client_read_timeout;
