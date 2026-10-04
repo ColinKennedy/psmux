@@ -107,8 +107,22 @@ Write-Info "planted a spawn lock naming a dead pid"
 $got = WaitWarm 30
 if ($got -ge 0) { Write-Pass "the standby appeared ${got}s after the creation despite the stale lock" }
 else { Write-Fail "no standby in 30s with a stale lock present (before the fix: none, and the lock stayed)" }
-if (-not (Test-Path $lock)) { Write-Pass "the abandoned lock was cleared" }
-else { Write-Fail "the abandoned lock is still on disk" }
+# The abandoned lock is cleared by the spawner taking the lock for itself, and
+# the standby's port file can appear about 200 ms before that spawner releases
+# its own guard (measured 3 of 3 on 2026-10-05 after the boot hold moved the
+# standby spawn past the first shell: content "<live pid>:<start>" at the
+# instant the port file lands, gone 200 ms later). So the dead pid must be gone
+# now, and the file itself within a bound that a live holder honours.
+$content = try { (Get-Content $lock -Raw -EA Stop).Trim() } catch { "" }
+if ($content -ne "4294967280") { Write-Pass "the abandoned lock was cleared (lock now '$content')" }
+else { Write-Fail "the abandoned lock is still on disk with the dead pid" }
+$released = $false
+for ($i = 0; $i -lt 30; $i++) {
+    if (-not (Test-Path $lock)) { $released = $true; break }
+    Start-Sleep -Milliseconds 100
+}
+if ($released) { Write-Pass "the spawner released its own lock within $($i * 100) ms of the standby appearing" }
+else { Write-Fail "a lock is still on disk 3 s after the standby appeared: '$(try { (Get-Content $lock -Raw).Trim() } catch { '' })'" }
 
 # ---------------------------------------------------------------- Test 3
 # The lock still does its job: a spawn that is genuinely in progress keeps it,

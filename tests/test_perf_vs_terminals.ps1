@@ -1610,8 +1610,21 @@ if (-not $SkipKeys -and $KeyLat) {
         if ($bestSplit) {
             Check "T3a psmux keystroke median, psmux's own hops" $bestSplit.psmux_median 2.5 "ms" `
                 ("{0}, {1}: end to end minus the pane shell's own echo time, per keystroke from the server's pty trace; pane shell echo median {2:F2} ms" -f $bestSplitCell, $bestSplit.server, $bestSplit.shell_median) -LoadSensitive
-            Check "T3c psmux keystroke p99, psmux's own hops" $bestSplit.psmux_p99 6 "ms" `
-                ("{0}: the same split, p99 over {1} keystrokes" -f $bestSplitCell, $bestSplit.n)
+            # T3c used to hold the p99 of these 40 keystrokes to 6 ms. Over 40
+            # samples the p99 IS the single worst key, and on 2026-10-04 that
+            # key failed the gate in three runs out of five on two builds
+            # (own hops 10.4, 8.6 and 9.0 ms) with the medians flat at 1.2 to
+            # 1.7 ms and the pane shell's own echo p99 at 18 ms in the same
+            # runs: the key had landed on an extra 15.6 ms conhost tick, and the
+            # split charges the remainder of that tick to psmux. One key cannot
+            # measure a tail. The p90 (the fourth worst of 40) keeps the 6 ms
+            # line as the hard gate; the single worst key is reported beside it,
+            # and its tail is judged where there are enough samples to judge
+            # one: test_keystroke_latency_gate holds the p99 over 120 keys and
+            # three runs to 8 ms.
+            Check "T3c psmux keystroke p90, psmux's own hops" $bestSplit.psmux_p90 6 "ms" `
+                ("{0}: the same split, p90 over {1} keystrokes" -f $bestSplitCell, $bestSplit.n)
+            Info ("{0}: psmux's own hops, worst of {1} keystrokes (the p99 of this sample) {2:F2} ms; judged over 120 keys by test_keystroke_latency_gate, not here" -f $bestSplitCell, $bestSplit.n, $bestSplit.psmux_p99)
             if ($script:Floor) {
                 Check "T3d pane shell echo under psmux over the standalone ConPTY floor" ($bestSplit.shell_median - $script:Floor.median) 7 "ms" `
                     ("pane shell {0:F2} ms against the floor's {1:F2} ms; a reply psmux answers late would add a whole 15.6 ms tick here" -f $bestSplit.shell_median, $script:Floor.median)
