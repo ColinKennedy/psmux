@@ -202,6 +202,49 @@ sets of ten runs under the same load the fifth creation is 55 to 107 ms, and
 no creation of the hundred exceeds 107 ms. A creation asking for any other directory
 still rehomes, as before.
 
+### Nothing boots beside the first shell
+
+A fresh server starts the session's own shell and then has background shells
+to start: the two pool spares and the warm standby server, which brings its own
+shell and spare. They used to go out the moment the loop started, so a cold
+`new-session` booted four more pwsh processes while the user's shell was still
+booting.
+
+pwsh 7 does not tolerate that. With no psmux involved at all, one pwsh launched
+together with four others reached its first line of script about 200 ms later
+than alone (median boot 440 ms alone, 640 ms with four neighbours), and its own
+CPU time was the same either way (about 420 ms), so it was waiting, not
+computing. It is not the Store activation (launching the package's `pwsh.exe`
+directly behaves the same) and not the startup profile file (decoys with their
+own `LOCALAPPDATA` behave the same). Four Windows PowerShell 5.1 neighbours
+cost the same shell only about 30 ms. The machine has 32 logical processors.
+
+That is the whole of the old bimodal cold launch. Traced with
+`PSMUX_STARTUP_TRACE`, `PSMUX_SPAWN_TRACE` and `PSMUX_WARM_TRACE` over 24 cold
+reps, every step up to `srv.child.spawned` (about 327 ms, including the 185 ms
+first `CreateProcessW` of the Store pwsh) was identical in the fast and the slow
+mode; the 110 to 125 ms difference lay entirely between `CreateProcessW`
+returning and the shell's first script line. Turning the pool off, or the
+standby off, each removed the slow mode; turning both off removed the cost
+entirely.
+
+So the server now holds the pool refill and the standby spawn until the first
+pane's shell has started, by the same test a spare's readiness uses (it has
+written and then been quiet for 250 ms, or 1.5 s have passed). Only the idle
+refill tick is held: a creation that claims during the hold still schedules its
+own refill. Measured over 20 interleaved cold reps, `new-session` with a pwsh
+command, launch to the shell's first script line:
+
+| build  | fast mode           | slow mode           |
+|--------|---------------------|---------------------|
+| before | 739 to 759 ms (12)  | 854 to 921 ms (8)   |
+| after  | 663 to 709 ms (20)  | none                |
+
+With the default shell and the user's profile, launch to the prompt visible in
+`capture-pane` went from 989 to 1035 ms to 734 to 833 ms (14 interleaved reps
+each). The standby and the spares arrive about 600 ms later than before; a
+`new-window` three seconds after launch still claims a ready spare.
+
 ### Teardown
 
 A spare that is still being spawned belongs to nobody: the shell exists, its

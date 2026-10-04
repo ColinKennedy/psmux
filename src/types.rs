@@ -557,6 +557,55 @@ pub const WARM_READY_QUIET: std::time::Duration = std::time::Duration::from_mill
 /// behaviour rather than a new failure.
 pub const WARM_READY_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Holds a fresh server's background shell spawns (the spare pool refill and
+/// the warm standby server) until the session's first shell has started.
+///
+/// Measured: a pwsh 7 that boots while other pwsh 7 processes boot beside it
+/// waits, it does not compute. With no psmux involved at all, one pwsh launched
+/// together with four others reached its first line of script ~200 ms later
+/// than alone (440 ms vs 640 ms) at the same CPU time (~420 ms either way),
+/// while four Windows PowerShell 5.1 neighbours cost it only ~30 ms. A cold
+/// `new-session` used to start exactly four such neighbours while the user's
+/// own shell was booting (two spares, then the standby server and its spare),
+/// and that is the whole of the old bimodal launch: ~750 ms when the user's
+/// shell got ahead of them, ~860 ms when it did not, against ~690 ms with
+/// nothing beside it. Nothing waits on these spawns at startup, so they wait
+/// for the shell somebody is looking at.
+///
+/// "Started" is the same test a spare's readiness uses: the pane has written
+/// something and then gone quiet for [`WARM_READY_QUIET`], with
+/// [`WARM_READY_MAX_WAIT`] as the backstop for a command that prints nothing
+/// or never stops printing. A creation that claims from the pool during the
+/// hold still schedules its own refill; only the idle tick is held.
+pub struct BootHold {
+    data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    started: std::time::Instant,
+    last_dv: u64,
+    last_change: std::time::Instant,
+    /// The standby server spawn that was due at startup and is owed on release.
+    pub standby_owed: bool,
+}
+
+impl BootHold {
+    pub fn new(data_version: std::sync::Arc<std::sync::atomic::AtomicU64>, now: std::time::Instant) -> Self {
+        let last_dv = data_version.load(std::sync::atomic::Ordering::Relaxed);
+        Self { data_version, started: now, last_dv, last_change: now, standby_owed: false }
+    }
+    /// Whether the held shell has started (or the backstop has expired).
+    pub fn released(&mut self, now: std::time::Instant) -> bool {
+        let dv = self.data_version.load(std::sync::atomic::Ordering::Relaxed);
+        if dv != self.last_dv {
+            self.last_dv = dv;
+            self.last_change = now;
+            if crate::startup_trace::on() {
+                crate::startup_trace::mark_detail("srv.boot.output", &format!("dv={}", dv));
+            }
+        }
+        (dv > 0 && now.saturating_duration_since(self.last_change) >= WARM_READY_QUIET)
+            || now.saturating_duration_since(self.started) >= WARM_READY_MAX_WAIT
+    }
+}
+
 impl WarmPane {
     /// One token describing this spare for the warm trace:
     /// `id:age ms:state:data_version:quiet ms`, state being `Q` (ready because
@@ -1739,6 +1788,9 @@ pub struct AppState {
     /// Pool of pre spawned spare shells, ready for an instant new-window or
     /// split. Depth comes from the `warm-pool-size` option; see [`WarmPool`].
     pub warm_pane: WarmPool,
+    /// Startup hold on background shell spawns, see [`BootHold`]. `Some` only
+    /// from the first window's creation until its shell has started.
+    pub boot_hold: Option<BootHold>,
     /// Where a finished background spare is posted back to the server loop.
     /// Held here rather than only in `run_server` so a claim can schedule its
     /// own refill the moment it happens: the claim that misses goes on to cold
@@ -2697,6 +2749,7 @@ impl AppState {
             warm_enabled: std::env::var("PSMUX_NO_WARM").map(|v| v != "1" && v != "true").unwrap_or(true),
             allow_alternate_screen: true,
             warm_pane: WarmPool::new(default_warm_pool_size()),
+            boot_hold: None,
             warm_refill_tx: None,
             warm_refill_rx: None,
             pending_plugin_scripts: Vec::new(),
