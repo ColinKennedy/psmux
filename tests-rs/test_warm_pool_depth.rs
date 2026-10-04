@@ -471,56 +471,128 @@ fn ready_spare(pane_id: usize) -> crate::types::WarmPane {
     wp
 }
 
-// ── boot hold: background spawns wait for the first shell ──────────
+// ── boot hold: background spawns wait for shells somebody waits on ──
 
-fn hold_at(t0: std::time::Instant, dv0: u64) -> (crate::types::BootHold, std::sync::Arc<std::sync::atomic::AtomicU64>) {
-    let dv = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(dv0));
-    (crate::types::BootHold::new(dv.clone(), t0), dv)
+type Dv = std::sync::Arc<std::sync::atomic::AtomicU64>;
+type Term = std::sync::Arc<std::sync::Mutex<vt100::Parser>>;
+
+fn held_shell() -> (Dv, Term) {
+    (
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(30, 120, 0))),
+    )
+}
+
+/// What the pane reader does: feed the parser, then bump the version.
+fn shell_writes(dv: &Dv, term: &Term, bytes: &[u8]) {
+    term.lock().unwrap().process(bytes);
+    dv.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ms(t0: std::time::Instant, n: u64) -> std::time::Instant {
+    t0 + std::time::Duration::from_millis(n)
 }
 
 #[test]
-fn boot_hold_waits_for_output_then_quiet() {
-    // A cold launch used to boot four more pwsh processes beside the user's
-    // own, which made the user's shell ~110 ms slower on most launches. The
-    // hold keeps them back until the first shell has written and settled.
+fn boot_hold_releases_at_the_first_visible_text() {
+    // ConPTY writes its own startup sequences first; they draw nothing, so
+    // the shell is still booting. The prompt is the first visible text.
     let t0 = std::time::Instant::now();
-    let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
-    let (mut h, dv) = hold_at(t0, 0);
-    assert!(!h.released(ms(300)), "no output yet: the shell is still booting");
-    dv.store(3, std::sync::atomic::Ordering::Relaxed);
-    assert!(!h.released(ms(400)), "output just arrived");
-    dv.store(5, std::sync::atomic::Ordering::Relaxed);
-    assert!(!h.released(ms(500)), "still writing");
-    assert!(!h.released(ms(500) + crate::types::WARM_READY_QUIET - std::time::Duration::from_millis(1)));
-    assert!(h.released(ms(500) + crate::types::WARM_READY_QUIET), "written, then quiet: started");
+    let mut h = crate::types::BootHold::new(t0);
+    let (dv, term) = held_shell();
+    h.watch(1, dv.clone(), term.clone(), t0);
+    assert!(!h.released(ms(t0, 50)), "no output yet");
+    shell_writes(&dv, &term, b"\x1b[?9001h\x1b[?1004h\x1b[H\x1b[2J");
+    assert!(!h.released(ms(t0, 60)), "ConPTY setup is not a started shell");
+    assert!(!h.released(ms(t0, 200)), "and quiet after it is not either, under the quiet window");
+    shell_writes(&dv, &term, b"PS C:\\> ");
+    assert!(h.released(ms(t0, 210)), "the prompt releases at once, no quiet window");
 }
 
 #[test]
-fn boot_hold_has_a_backstop() {
-    // A command that prints nothing, or never stops printing, must not keep
-    // the pool and the standby server away for ever.
+fn boot_hold_waits_for_a_window_created_during_it() {
+    // The first new-window of a launch arrives while the hold is on, finds
+    // the pool empty and cold spawns. Releasing the pool beside that spawn
+    // made the first window 1.7 to 1.9 s; the hold keeps watching it.
     let t0 = std::time::Instant::now();
-    let (mut silent, _dv) = hold_at(t0, 0);
-    assert!(silent.released(t0 + crate::types::WARM_READY_MAX_WAIT), "silent shell");
-    let (mut chatty, dv) = hold_at(t0, 0);
+    let mut h = crate::types::BootHold::new(t0);
+    let (dv1, term1) = held_shell();
+    h.watch(1, dv1.clone(), term1.clone(), t0);
+    let (dv2, term2) = held_shell();
+    assert!(h.watch(2, dv2.clone(), term2.clone(), ms(t0, 100)));
+    assert!(!h.watch(2, dv2.clone(), term2.clone(), ms(t0, 110)), "a pane is watched once");
+    shell_writes(&dv1, &term1, b"PS C:\\> ");
+    assert!(!h.released(ms(t0, 400)), "the first shell is up, the window's is not");
+    shell_writes(&dv2, &term2, b"PS C:\\> ");
+    assert!(h.released(ms(t0, 700)), "both up");
+}
+
+#[test]
+fn boot_hold_counts_a_quiet_shell_that_draws_nothing() {
+    let t0 = std::time::Instant::now();
+    let mut h = crate::types::BootHold::new(t0);
+    let (dv, term) = held_shell();
+    h.watch(1, dv.clone(), term.clone(), t0);
+    shell_writes(&dv, &term, b"\x1b[H\x1b[2J");
+    assert!(!h.released(ms(t0, 10)));
+    assert!(!h.released(ms(t0, 10) + crate::types::WARM_READY_QUIET - std::time::Duration::from_millis(1)));
+    assert!(h.released(ms(t0, 10) + crate::types::WARM_READY_QUIET), "written, then quiet");
+}
+
+#[test]
+fn boot_hold_has_a_backstop_from_the_last_watched_pane() {
+    // A shell that never draws and never stops writing must not keep the
+    // pool and the standby away for ever; the backstop restarts when a new
+    // pane joins, since somebody is now waiting on that one.
+    let t0 = std::time::Instant::now();
+    let mut h = crate::types::BootHold::new(t0);
+    let (dv1, term1) = held_shell();
+    h.watch(1, dv1.clone(), term1.clone(), t0);
+    let (dv2, term2) = held_shell();
+    h.watch(2, dv2, term2, ms(t0, 1000));
     let mut t = t0;
-    let mut n = 0;
-    while t < t0 + crate::types::WARM_READY_MAX_WAIT {
-        n += 1;
-        dv.store(n, std::sync::atomic::Ordering::Relaxed);
-        assert!(!chatty.released(t), "a chatty shell holds until the backstop");
+    while t < ms(t0, 1000) + crate::types::WARM_READY_MAX_WAIT {
+        shell_writes(&dv1, &term1, b"\x1b[H");
+        assert!(!h.released(t), "chatty and invisible: held until the backstop");
         t += std::time::Duration::from_millis(50);
     }
-    assert!(chatty.released(t0 + crate::types::WARM_READY_MAX_WAIT));
+    assert!(h.released(ms(t0, 1000) + crate::types::WARM_READY_MAX_WAIT));
 }
 
 #[test]
-fn boot_hold_counts_quiet_from_when_it_began() {
-    // A transplanted spare may already have output on screen. Quiet is
-    // counted from the moment the hold began, not from that older output,
-    // so the hold still lasts at least one quiet window.
-    let t0 = std::time::Instant::now();
-    let (mut h, _dv) = hold_at(t0, 7);
-    assert!(!h.released(t0 + std::time::Duration::from_millis(10)));
-    assert!(h.released(t0 + crate::types::WARM_READY_QUIET));
+fn boot_hold_release_trickles_the_pool_one_spare_at_a_time() {
+    // Right after the hold, the next creation will wait on whatever spare is
+    // booting. Two spares and the standby booting together made that wait the
+    // slowest part of the first window, so the pool starts one at a time
+    // until one is ready.
+    let mut trickle = true;
+    let mut pool = WarmPool::new(2);
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 2), 1, "one at a time");
+    pool.inflight = 1;
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 1), 0, "one already booting");
+    pool.inflight = 0;
+    pool.push(fake_spare(2));
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 1), 0, "landed but still warming");
+    assert!(trickle);
+    pool.push(ready_spare(3));
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 1), 1, "a ready spare ends the trickle");
+    assert!(!trickle);
+    // And once off it stays off: the pool refills at full width again.
+    let empty = WarmPool::new(2);
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &empty, 2), 2);
 }
+
+#[test]
+fn forgetting_claims_keeps_the_first_new_window_out_of_a_surge() {
+    // The server's own first window goes through the claim path. Counting it
+    // made the user's first new-window the second claim of a "burst" and
+    // fired eight shells beside it.
+    let mut pool = WarmPool::new(2);
+    pool.note_claim(false);
+    pool.forget_claims();
+    pool.note_claim(false);
+    assert!(!pool.is_surging(), "one real claim is not a burst");
+    pool.note_claim(false);
+    assert!(pool.is_surging(), "two real claims that missed still are");
+}
+

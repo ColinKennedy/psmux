@@ -558,51 +558,100 @@ pub const WARM_READY_QUIET: std::time::Duration = std::time::Duration::from_mill
 pub const WARM_READY_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Holds a fresh server's background shell spawns (the spare pool refill and
-/// the warm standby server) until the session's first shell has started.
+/// the warm standby server) while a shell somebody is waiting on is booting.
 ///
 /// Measured: a pwsh 7 that boots while other pwsh 7 processes boot beside it
 /// waits, it does not compute. With no psmux involved at all, one pwsh launched
-/// together with four others reached its first line of script ~200 ms later
-/// than alone (440 ms vs 640 ms) at the same CPU time (~420 ms either way),
-/// while four Windows PowerShell 5.1 neighbours cost it only ~30 ms. A cold
-/// `new-session` used to start exactly four such neighbours while the user's
-/// own shell was booting (two spares, then the standby server and its spare),
-/// and that is the whole of the old bimodal launch: ~750 ms when the user's
-/// shell got ahead of them, ~860 ms when it did not, against ~690 ms with
-/// nothing beside it. Nothing waits on these spawns at startup, so they wait
-/// for the shell somebody is looking at.
+/// together with K others reached its first line of script later than alone by
+/// ~70 ms (K=1), ~110 ms (K=2) and ~200 ms (K=4), at the same CPU time, while
+/// four Windows PowerShell 5.1 neighbours cost it only ~30 ms. A neighbour that
+/// starts later costs less: two started 150, 300 and 450 ms after the measured
+/// shell cost it ~90, ~50 and ~0 ms. A cold `new-session` used to start four
+/// such neighbours while the user's own shell was booting, which was the whole
+/// of the old bimodal launch.
 ///
-/// "Started" is the same test a spare's readiness uses: the pane has written
-/// something and then gone quiet for [`WARM_READY_QUIET`], with
-/// [`WARM_READY_MAX_WAIT`] as the backstop for a command that prints nothing
-/// or never stops printing. A creation that claims from the pool during the
-/// hold still schedules its own refill; only the idle tick is held.
+/// The hold watches every pane that exists while it is on, not only the first:
+/// a window or split created during the hold finds the pool empty and cold
+/// spawns, and releasing the pool beside that spawn would hand the contention
+/// the launch lost straight to the first window. A shell counts as started
+/// when its screen shows visible text (a pwsh prompt, or whatever its profile
+/// prints first; ConPTY's own startup sequences draw nothing), or when it has
+/// written and then been quiet for [`WARM_READY_QUIET`] (a shell that draws
+/// nothing visible). [`WARM_READY_MAX_WAIT`] after the last pane joined, the
+/// hold lets go regardless.
 pub struct BootHold {
-    data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    started: std::time::Instant,
-    last_dv: u64,
-    last_change: std::time::Instant,
+    shells: Vec<HeldShell>,
+    armed: std::time::Instant,
     /// The standby server spawn that was due at startup and is owed on release.
     pub standby_owed: bool,
 }
 
-impl BootHold {
-    pub fn new(data_version: std::sync::Arc<std::sync::atomic::AtomicU64>, now: std::time::Instant) -> Self {
-        let last_dv = data_version.load(std::sync::atomic::Ordering::Relaxed);
-        Self { data_version, started: now, last_dv, last_change: now, standby_owed: false }
+struct HeldShell {
+    pane_id: usize,
+    data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+    last_dv: u64,
+    last_change: std::time::Instant,
+    started: bool,
+}
+
+/// Whether a pane's screen shows any visible character.
+fn screen_has_text(term: &std::sync::Mutex<vt100::Parser>) -> bool {
+    match term.lock() {
+        Ok(p) => p.screen().contents().chars().any(|c| !c.is_whitespace()),
+        Err(_) => true,
     }
-    /// Whether the held shell has started (or the backstop has expired).
-    pub fn released(&mut self, now: std::time::Instant) -> bool {
-        let dv = self.data_version.load(std::sync::atomic::Ordering::Relaxed);
-        if dv != self.last_dv {
-            self.last_dv = dv;
-            self.last_change = now;
-            if crate::startup_trace::on() {
-                crate::startup_trace::mark_detail("srv.boot.output", &format!("dv={}", dv));
-            }
+}
+
+impl BootHold {
+    pub fn new(now: std::time::Instant) -> Self {
+        Self { shells: Vec::new(), armed: now, standby_owed: false }
+    }
+    /// Start watching a pane. A pane already watched is ignored; a new one
+    /// restarts the backstop, since somebody is now waiting on it.
+    pub fn watch(
+        &mut self,
+        pane_id: usize,
+        data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.shells.iter().any(|s| s.pane_id == pane_id) {
+            return false;
         }
-        (dv > 0 && now.saturating_duration_since(self.last_change) >= WARM_READY_QUIET)
-            || now.saturating_duration_since(self.started) >= WARM_READY_MAX_WAIT
+        let last_dv = data_version.load(std::sync::atomic::Ordering::Relaxed);
+        let started = last_dv > 0 && screen_has_text(&term);
+        self.shells.push(HeldShell { pane_id, data_version, term, last_dv, last_change: now, started });
+        self.armed = now;
+        true
+    }
+    pub fn watching(&self, pane_id: usize) -> bool {
+        self.shells.iter().any(|s| s.pane_id == pane_id)
+    }
+    /// Whether every watched shell has started (or the backstop has expired).
+    pub fn released(&mut self, now: std::time::Instant) -> bool {
+        let mut all = true;
+        for s in self.shells.iter_mut().filter(|s| !s.started) {
+            let dv = s.data_version.load(std::sync::atomic::Ordering::Relaxed);
+            if dv != s.last_dv {
+                s.last_dv = dv;
+                s.last_change = now;
+                if screen_has_text(&s.term) {
+                    s.started = true;
+                }
+                if crate::startup_trace::on() {
+                    crate::startup_trace::mark_detail(
+                        "srv.boot.output",
+                        &format!("pane={} dv={} started={}", s.pane_id, dv, s.started),
+                    );
+                }
+            }
+            if !s.started && dv > 0 && now.saturating_duration_since(s.last_change) >= WARM_READY_QUIET {
+                s.started = true;
+            }
+            all &= s.started;
+        }
+        all || now.saturating_duration_since(self.armed) >= WARM_READY_MAX_WAIT
     }
 }
 
@@ -881,6 +930,14 @@ impl WarmPool {
         if !satisfied || self.ready_len() == 0 || self.is_surging() {
             self.surge_until = Some(now + WARM_SURGE_HOLD);
         }
+    }
+    /// Forget every claim so far. A server's own first window takes the early
+    /// spare through the claim path, and counting that as a claim made the
+    /// user's first `new-window` a "burst" and fired a full surge of shells
+    /// beside it.
+    pub fn forget_claims(&mut self) {
+        self.last_claim = None;
+        self.surge_until = None;
     }
     pub fn is_surging(&self) -> bool {
         matches!(self.surge_until, Some(t) if std::time::Instant::now() < t)
@@ -1791,6 +1848,9 @@ pub struct AppState {
     /// Startup hold on background shell spawns, see [`BootHold`]. `Some` only
     /// from the first window's creation until its shell has started.
     pub boot_hold: Option<BootHold>,
+    /// After the boot hold releases, the pool starts one spare at a time
+    /// until one is ready or somebody claims. See [`BootHold`].
+    pub pool_trickle: bool,
     /// Where a finished background spare is posted back to the server loop.
     /// Held here rather than only in `run_server` so a claim can schedule its
     /// own refill the moment it happens: the claim that misses goes on to cold
@@ -2750,6 +2810,7 @@ impl AppState {
             allow_alternate_screen: true,
             warm_pane: WarmPool::new(default_warm_pool_size()),
             boot_hold: None,
+            pool_trickle: false,
             warm_refill_tx: None,
             warm_refill_rx: None,
             pending_plugin_scripts: Vec::new(),
