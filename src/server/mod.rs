@@ -2271,10 +2271,25 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         crate::commands::fire_hooks(&mut app, "client-attached");
         crate::commands::fire_hooks(&mut app, "session-created");
     }
+    // Hold the background shell spawns (pool refill, warm standby) until the
+    // first pane's shell has started: booting beside it is what made a cold
+    // launch bimodal. See `types::BootHold` for the measurement.
+    if app.warm_enabled {
+        let first = app.windows.first()
+            .and_then(|w| crate::tree::active_pane(&w.root, &w.active_path))
+            .map(|p| p.data_version.clone());
+        if let Some(dv) = first {
+            app.boot_hold = Some(crate::types::BootHold::new(dv, Instant::now()));
+        }
+    }
     // Spawn a warm server for the NEXT new-session when the current session
-    // is allowed to keep background state alive.
+    // is allowed to keep background state alive (owed to the hold release
+    // when there is a hold).
     if should_spawn_warm_server(&app) {
-        spawn_warm_server(&app);
+        match app.boot_hold.as_mut() {
+            Some(h) => h.standby_owed = true,
+            None => spawn_warm_server(&app),
+        }
     }
     crate::startup_trace::mark("srv.loop");
     let mut state_dirty = true;
@@ -2420,7 +2435,24 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // surging. Claims schedule their own refill too (see
         // `pane::schedule_warm_refill`); this tick covers deficits that come
         // from elsewhere, such as a reaped corpse or a resize.
-        crate::pane::schedule_warm_refill(&mut app);
+        //
+        // Except while the first shell is still booting (`types::BootHold`):
+        // nothing is waiting on the pool yet, and the owed standby spawn goes
+        // out together with the refill the moment the hold releases.
+        let held = match app.boot_hold.as_mut() {
+            Some(h) => !h.released(Instant::now()),
+            None => false,
+        };
+        if !held {
+            if let Some(h) = app.boot_hold.take() {
+                crate::startup_trace::mark("srv.boot.release");
+                crate::warm_trace!("pool: boot hold released, standby owed={}", h.standby_owed);
+                if h.standby_owed && should_spawn_warm_server(&app) {
+                    spawn_warm_server(&app);
+                }
+            }
+            crate::pane::schedule_warm_refill(&mut app);
+        }
         // Give back the spares a finished surge was holding. Checked a few
         // times a second rather than every tick: it walks the pool and kills
         // processes, and nothing here is urgent.

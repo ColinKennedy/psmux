@@ -470,3 +470,57 @@ fn ready_spare(pane_id: usize) -> crate::types::WarmPane {
     wp.ready = true;
     wp
 }
+
+// ── boot hold: background spawns wait for the first shell ──────────
+
+fn hold_at(t0: std::time::Instant, dv0: u64) -> (crate::types::BootHold, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let dv = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(dv0));
+    (crate::types::BootHold::new(dv.clone(), t0), dv)
+}
+
+#[test]
+fn boot_hold_waits_for_output_then_quiet() {
+    // A cold launch used to boot four more pwsh processes beside the user's
+    // own, which made the user's shell ~110 ms slower on most launches. The
+    // hold keeps them back until the first shell has written and settled.
+    let t0 = std::time::Instant::now();
+    let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+    let (mut h, dv) = hold_at(t0, 0);
+    assert!(!h.released(ms(300)), "no output yet: the shell is still booting");
+    dv.store(3, std::sync::atomic::Ordering::Relaxed);
+    assert!(!h.released(ms(400)), "output just arrived");
+    dv.store(5, std::sync::atomic::Ordering::Relaxed);
+    assert!(!h.released(ms(500)), "still writing");
+    assert!(!h.released(ms(500) + crate::types::WARM_READY_QUIET - std::time::Duration::from_millis(1)));
+    assert!(h.released(ms(500) + crate::types::WARM_READY_QUIET), "written, then quiet: started");
+}
+
+#[test]
+fn boot_hold_has_a_backstop() {
+    // A command that prints nothing, or never stops printing, must not keep
+    // the pool and the standby server away for ever.
+    let t0 = std::time::Instant::now();
+    let (mut silent, _dv) = hold_at(t0, 0);
+    assert!(silent.released(t0 + crate::types::WARM_READY_MAX_WAIT), "silent shell");
+    let (mut chatty, dv) = hold_at(t0, 0);
+    let mut t = t0;
+    let mut n = 0;
+    while t < t0 + crate::types::WARM_READY_MAX_WAIT {
+        n += 1;
+        dv.store(n, std::sync::atomic::Ordering::Relaxed);
+        assert!(!chatty.released(t), "a chatty shell holds until the backstop");
+        t += std::time::Duration::from_millis(50);
+    }
+    assert!(chatty.released(t0 + crate::types::WARM_READY_MAX_WAIT));
+}
+
+#[test]
+fn boot_hold_counts_quiet_from_when_it_began() {
+    // A transplanted spare may already have output on screen. Quiet is
+    // counted from the moment the hold began, not from that older output,
+    // so the hold still lasts at least one quiet window.
+    let t0 = std::time::Instant::now();
+    let (mut h, _dv) = hold_at(t0, 7);
+    assert!(!h.released(t0 + std::time::Duration::from_millis(10)));
+    assert!(h.released(t0 + crate::types::WARM_READY_QUIET));
+}
