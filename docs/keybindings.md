@@ -87,7 +87,7 @@ rebind the prefix, the new key is bound to `send-prefix` for you.
 | `Prefix + w` | Interactive session/window/pane chooser (`choose-tree`) |
 | `Prefix + &` | Kill current window (with confirmation) |
 | `Prefix + ,` | Rename current window |
-| `Prefix + '` | Prompt for window index (jump to any window) |
+| `Prefix + '` | Prompt for a window index or name and select it (`select-window -t ':%%'`, as tmux) |
 | `Prefix + .` | Prompt for an index and move the current window there (`move-window`) |
 | `Prefix + 0-9` | Select window by number |
 

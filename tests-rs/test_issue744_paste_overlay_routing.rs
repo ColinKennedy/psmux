@@ -65,11 +65,19 @@ fn the_other_prompts_take_it_too() {
         false, &mut rename, true, &mut title, false, &mut idx));
     assert_eq!(title, "pane");
 
-    // The window index prompt is digits only, and takes nothing else.
+    // The window index prompt is tmux's plain `command-prompt -pindex`
+    // (key-bindings.c:394): it takes any text, because `select-window -t
+    // ':%%'` resolves a name as well as an index. Only line breaks and other
+    // control characters stay out of the one line target.
     let (mut cmd, mut cur, mut rename, mut title, mut idx) = no_overlay();
     assert!(route_paste_to_overlay("1a2", false, &mut cmd, &mut cur,
         false, &mut rename, false, &mut title, true, &mut idx));
-    assert_eq!(idx, "12");
+    assert_eq!(idx, "1a2");
+
+    let (mut cmd, mut cur, mut rename, mut title, mut idx) = no_overlay();
+    assert!(route_paste_to_overlay("my win\r\n", false, &mut cmd, &mut cur,
+        false, &mut rename, false, &mut title, true, &mut idx));
+    assert_eq!(idx, "my win");
 }
 
 #[test]

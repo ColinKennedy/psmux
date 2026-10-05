@@ -5262,7 +5262,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 }
                                 KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { rename_buf.push(c); paste_gesture.record_char(c); }
                                 KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); paste_gesture.record_char(c); }
-                                KeyCode::Char(c) if window_idx_input && c.is_ascii_digit() && !paste_burst_active => { window_idx_buf.push(c); paste_gesture.record_char(c); }
+                                // tmux binds the window index prompt as a plain
+                                // `command-prompt -pindex` (key-bindings.c:394), so it takes any text and
+                                // `select-window -t ':%%'` resolves an index or a
+                                // name. It used to take digits only and let every
+                                // other character fall through to the pane, so a
+                                // letter typed or pasted here reached the shell.
+                                KeyCode::Char(c) if window_idx_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { window_idx_buf.push(c); paste_gesture.record_char(c); }
                                 KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); paste_gesture.record_char(c); }
                                 KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
@@ -5288,7 +5294,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Enter if pane_renaming => { cmd_batch.push(format!("set-pane-title {}\n", quote_arg(&pane_title_buf))); pane_renaming = false; }
                                 KeyCode::Enter if window_idx_input => {
                                     if !window_idx_buf.is_empty() {
-                                        cmd_batch.push(format!("select-window -t :{}\n", window_idx_buf));
+                                        cmd_batch.push(format!("select-window -t {}\n", crate::util::quote_arg_if_needed(&format!(":{}", window_idx_buf))));
                                     }
                                     window_idx_input = false;
                                 }
@@ -8228,7 +8234,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let inner = overlay.inner(oa);
                 let para = Paragraph::new(format!("index: {}", window_idx_buf));
                 f.render_widget(para, inner);
-                let cx = inner.x + 7 + window_idx_buf.len() as u16;
+                let cx = inner.x + 7 + unicode_width::UnicodeWidthStr::width(window_idx_buf.as_str()) as u16;
                 f.set_cursor_position((cx, inner.y));
             }
             if let Some(ref cmd) = confirm_cmd {
@@ -9197,8 +9203,11 @@ fn route_paste_to_overlay(
         pane_title_buf.push_str(data);
         true
     } else if window_idx_input {
+        // Any text, as tmux's `command-prompt -pindex` takes it
+        // (key-bindings.c:394); only line breaks and other control
+        // characters are left out of a one line target.
         for c in data.chars() {
-            if c.is_ascii_digit() { window_idx_buf.push(c); }
+            if !c.is_control() { window_idx_buf.push(c); }
         }
         true
     } else {
