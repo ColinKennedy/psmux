@@ -197,3 +197,104 @@ fn clear_selection_keeps_the_rectangle_flag() {
     crate::copy_mode::clear_selection(&mut app);
     assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Rect);
 }
+
+// ── 4a and 8. the search prompt ─────────────────────────────────────────────
+//
+// Measured on dd695ea with real keystrokes: typing `row 7 alpha` into `/`
+// showed `(search down) row7alpha`, C-a then Z gave `abcZ`, and Left made the
+// prompt vanish while it stayed open. tmux's prompt is a line editor
+// (prompt.c `prompt_key`).
+
+fn search_input(app: &AppState) -> String {
+    match app.mode {
+        Mode::CopySearch { ref input, .. } => input.clone(),
+        _ => panic!("the search prompt is not open: {:?}", std::mem::discriminant(&app.mode)),
+    }
+}
+
+fn open_search(app: &mut AppState) {
+    app.mode_keys = "vi".to_string();
+    crate::copy_mode::enter_copy_mode(app);
+    crate::input::send_text_to_active(app, "/").unwrap();
+}
+
+#[test]
+fn a_space_is_typed_into_the_search_prompt() {
+    let mut app = app_with_pane();
+    open_search(&mut app);
+    crate::input::send_text_to_active(&mut app, "row").unwrap();
+    crate::input::send_key_to_active(&mut app, "space").unwrap();
+    crate::input::send_text_to_active(&mut app, "7").unwrap();
+    assert_eq!(search_input(&app), "row 7");
+    assert_eq!(app.status_message.as_ref().map(|m| m.0.as_str()), Some("(search down) row 7"));
+}
+
+#[test]
+fn search_prompt_cursor_keys_edit_in_place() {
+    let mut app = app_with_pane();
+    open_search(&mut app);
+    crate::input::send_text_to_active(&mut app, "abc").unwrap();
+    crate::input::send_key_to_active(&mut app, "C-a").unwrap();
+    crate::input::send_text_to_active(&mut app, "Z").unwrap();
+    assert_eq!(search_input(&app), "Zabc", "C-a goes to the start");
+    crate::input::send_key_to_active(&mut app, "C-e").unwrap();
+    crate::input::send_text_to_active(&mut app, "!").unwrap();
+    assert_eq!(search_input(&app), "Zabc!", "C-e goes to the end");
+    crate::input::send_key_to_active(&mut app, "left").unwrap();
+    crate::input::send_key_to_active(&mut app, "left").unwrap();
+    crate::input::send_key_to_active(&mut app, "backspace").unwrap();
+    assert_eq!(search_input(&app), "Zac!", "Backspace deletes before the cursor");
+    crate::input::send_key_to_active(&mut app, "home").unwrap();
+    crate::input::send_key_to_active(&mut app, "delete").unwrap();
+    assert_eq!(search_input(&app), "ac!", "Delete removes the character under the cursor");
+    crate::input::send_key_to_active(&mut app, "right").unwrap();
+    crate::input::send_key_to_active(&mut app, "C-k").unwrap();
+    assert_eq!(search_input(&app), "a", "C-k cuts to the end");
+    assert!(app.status_message.is_some(), "the prompt stays drawn after a cursor key");
+}
+
+#[test]
+fn search_prompt_recalls_earlier_searches() {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row", 0, 30);
+    open_search(&mut app);
+    crate::input::send_text_to_active(&mut app, "first").unwrap();
+    crate::input::send_key_to_active(&mut app, "enter").unwrap();
+    crate::input::send_text_to_active(&mut app, "/second").unwrap();
+    crate::input::send_key_to_active(&mut app, "enter").unwrap();
+    crate::input::send_text_to_active(&mut app, "/").unwrap();
+    crate::input::send_key_to_active(&mut app, "up").unwrap();
+    assert_eq!(search_input(&app), "second");
+    crate::input::send_key_to_active(&mut app, "up").unwrap();
+    assert_eq!(search_input(&app), "first");
+    crate::input::send_key_to_active(&mut app, "up").unwrap();
+    assert_eq!(search_input(&app), "first", "Up stops at the oldest");
+    crate::input::send_key_to_active(&mut app, "down").unwrap();
+    assert_eq!(search_input(&app), "second");
+    crate::input::send_key_to_active(&mut app, "down").unwrap();
+    assert_eq!(search_input(&app), "", "Down past the newest gives an empty line");
+}
+
+#[test]
+fn prompt_edit_word_and_clear() {
+    use crate::copy_mode::{prompt_edit, PromptEdit};
+    let mut s = "foo bar baz".to_string();
+    let mut back = 0;
+    assert_eq!(prompt_edit(&mut s, &mut back, "C-w"), PromptEdit::Edited);
+    assert_eq!(s, "foo bar ");
+    assert_eq!(prompt_edit(&mut s, &mut back, "C-u"), PromptEdit::Edited);
+    assert_eq!(s, "");
+    assert_eq!(prompt_edit(&mut s, &mut back, "x"), PromptEdit::Other);
+}
+
+#[test]
+fn a_new_prompt_starts_with_the_cursor_at_the_end() {
+    let mut app = app_with_pane();
+    open_search(&mut app);
+    crate::input::send_text_to_active(&mut app, "abc").unwrap();
+    crate::input::send_key_to_active(&mut app, "home").unwrap();
+    crate::input::send_key_to_active(&mut app, "esc").unwrap();
+    assert!(matches!(app.mode, Mode::CopyMode));
+    crate::input::send_text_to_active(&mut app, "/xy").unwrap();
+    assert_eq!(search_input(&app), "xy");
+}

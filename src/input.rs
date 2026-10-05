@@ -20,7 +20,12 @@ use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 /// search (#335). Without this the screen looks frozen because the search
 /// input is otherwise invisible.
 fn refresh_search_prompt(app: &mut AppState) {
-    if let Mode::CopySearch { .. } = app.mode {
+    if let Mode::CopySearch { ref input, .. } = app.mode {
+        // A prompt that has just opened is empty: its cursor is at the end
+        // whatever an earlier prompt left behind.
+        if input.is_empty() {
+            app.copy_prompt_back = 0;
+        }
         if let Some(prompt) = crate::copy_mode::copy_prompt_text(&app.mode) {
             // display-time = 0 keeps the message sticky until cleared.
             app.status_message = Some((prompt, Instant::now(), Some(0)));
@@ -34,7 +39,10 @@ fn refresh_search_prompt(app: &mut AppState) {
 /// the server here and the command prompt lives in the client, so the prompt
 /// is the search prompt's twin rather than a command prompt.
 fn refresh_goto_prompt(app: &mut AppState) {
-    if let Mode::CopyGoto { .. } = app.mode {
+    if let Mode::CopyGoto { ref input } = app.mode {
+        if input.is_empty() {
+            app.copy_prompt_back = 0;
+        }
         if let Some(prompt) = crate::copy_mode::copy_prompt_text(&app.mode) {
             // display-time = 0 keeps the message sticky until cleared.
             app.status_message = Some((prompt, Instant::now(), Some(0)));
@@ -52,6 +60,8 @@ fn open_goto_prompt(app: &mut AppState) {
 fn close_copy_prompt(app: &mut AppState) {
     app.mode = Mode::CopyMode;
     app.status_message = None;
+    app.copy_prompt_back = 0;
+    app.copy_search_history_pos = None;
 }
 
 /// Look up a copy-mode key binding for `key`, honouring `mode-keys`.
@@ -3549,10 +3559,9 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     }
     // In copy-search mode, append characters to the search input
     if matches!(app.mode, Mode::CopySearch { .. }) {
+        let back = app.copy_prompt_back;
         if let Mode::CopySearch { ref mut input, .. } = app.mode {
-            for c in text.chars() {
-                input.push(c);
-            }
+            crate::copy_mode::prompt_insert(input, back, text);
         }
         refresh_search_prompt(app);
         return Ok(());
@@ -3560,10 +3569,9 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     // Same for the goto-line prompt: while it is open the copy-mode keys are
     // inactive and every character is part of the line number.
     if matches!(app.mode, Mode::CopyGoto { .. }) {
+        let back = app.copy_prompt_back;
         if let Mode::CopyGoto { ref mut input } = app.mode {
-            for c in text.chars() {
-                input.push(c);
-            }
+            crate::copy_mode::prompt_insert(input, back, text);
         }
         refresh_goto_prompt(app);
         return Ok(());
@@ -3890,25 +3898,45 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // --- Copy-search mode: handle esc/enter/backspace ---
     if matches!(app.mode, Mode::CopySearch { .. }) {
         match k {
-            "esc" => { app.mode = Mode::CopyMode; app.status_message = None; }
+            // tmux's prompt closes on Escape, C-c and C-g (prompt.c).
+            "esc" | "escape" | "C-c" | "c-c" | "C-g" | "c-g" => { close_copy_prompt(app); }
             "enter" => {
                 if let Mode::CopySearch { ref input, forward } = app.mode {
                     let query = input.clone();
                     let fwd = forward;
+                    crate::copy_mode::remember_search(app, &query);
                     app.copy_search_query = query.clone();
                     app.copy_search_forward = fwd;
                     // search_copy_mode parks the cursor on the first match and
                     // scrolls the viewport to it when it is in history (#612).
                     search_copy_mode(app, &query, fwd);
                 }
-                app.mode = Mode::CopyMode;
-                app.status_message = None;
+                close_copy_prompt(app);
             }
-            "backspace" => {
-                if let Mode::CopySearch { ref mut input, .. } = app.mode { input.pop(); }
+            _ => {
+                let mut back = app.copy_prompt_back;
+                let mut recall = None;
+                if let Mode::CopySearch { ref mut input, .. } = app.mode {
+                    match crate::copy_mode::prompt_edit(input, &mut back, k) {
+                        crate::copy_mode::PromptEdit::HistoryUp => recall = Some(true),
+                        crate::copy_mode::PromptEdit::HistoryDown => recall = Some(false),
+                        _ => {}
+                    }
+                }
+                app.copy_prompt_back = back;
+                if let Some(up) = recall {
+                    let mut pos = app.copy_search_history_pos;
+                    if let Some(text) = crate::copy_mode::search_history_step(&app.copy_search_history, &mut pos, up) {
+                        if let Mode::CopySearch { ref mut input, .. } = app.mode { *input = text; }
+                        app.copy_prompt_back = 0;
+                    }
+                    app.copy_search_history_pos = pos;
+                }
+                // Every key redraws the prompt: the SendKey handler clears the
+                // status line before it gets here, so a key the prompt did not
+                // use (an arrow, before this) left it open but invisible.
                 refresh_search_prompt(app);
             }
-            _ => {}
         }
         return Ok(());
     }
@@ -3941,11 +3969,15 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 close_copy_prompt(app);
                 crate::copy_mode::run_goto_line(app, &typed);
             }
-            "backspace" | "bspace" => {
-                if let Mode::CopyGoto { ref mut input } = app.mode { input.pop(); }
+            "C-c" | "c-c" | "C-g" | "c-g" => { close_copy_prompt(app); }
+            _ => {
+                let mut back = app.copy_prompt_back;
+                if let Mode::CopyGoto { ref mut input } = app.mode {
+                    crate::copy_mode::prompt_edit(input, &mut back, k);
+                }
+                app.copy_prompt_back = back;
                 refresh_goto_prompt(app);
             }
-            _ => {}
         }
         return Ok(());
     }

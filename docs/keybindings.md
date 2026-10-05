@@ -544,10 +544,20 @@ Opened by `/`, `?`, `Ctrl+s` or `Ctrl+r`. While it is open the copy mode keys ar
 
 | Key | Action |
 |-----|--------|
-| Any character | Append to the search pattern |
-| `Backspace` | Delete the last character |
+| Any character, `Space` included | Insert at the cursor |
+| `Left` / `Right` | Move the cursor |
+| `Home` / `Ctrl+a` | Move to the start |
+| `End` / `Ctrl+e` | Move to the end |
+| `Backspace` | Delete the character before the cursor |
+| `Delete` / `Ctrl+d` | Delete the character under the cursor |
+| `Ctrl+u` / `Ctrl+k` / `Ctrl+w` | Clear the line / cut to the end / cut the word before the cursor |
+| `Up` / `Down` | Recall earlier searches |
 | `Enter` | Accept the search and jump to the match |
-| `Esc` | Cancel the search |
+| `Esc` / `Ctrl+c` / `Ctrl+g` | Cancel the search |
+
+These are the keys of tmux's prompt editor that apply here. The cursor position is not drawn on the
+status line yet. `Ctrl+b` and `Ctrl+f` also move the cursor, but `Ctrl+b` is the default prefix, which
+the client takes first. The goto line prompt takes the same editing keys.
 
 ### Copy Mode Goto Line Prompt
 

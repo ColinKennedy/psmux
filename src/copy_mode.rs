@@ -1778,6 +1778,110 @@ pub fn tick_auto_refresh(app: &mut AppState) -> bool {
     changed
 }
 
+/// What a key did to the input of a copy-mode prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptEdit {
+    /// The key edited the input or moved the cursor.
+    Edited,
+    /// Up or C-p: the caller recalls an older entry from the history.
+    HistoryUp,
+    /// Down or C-n: a newer entry.
+    HistoryDown,
+    /// Not a line editing key.
+    Other,
+}
+
+/// Apply one line editing key to a copy-mode prompt's `input`, whose cursor
+/// sits `back` characters before the end. The keys are the subset of tmux's
+/// prompt editor (prompt.c `prompt_key`, the `process_key` switch) that has a
+/// meaning here: Left, Right, Home, End and their emacs spellings C-b, C-f,
+/// C-a, C-e, Backspace and Delete at the cursor, C-u clears, C-k cuts to the
+/// end, C-w cuts the word before the cursor, and Space inserts a space, which
+/// arrives as a key of its own and used to be dropped (discussion #694).
+pub fn prompt_edit(input: &mut String, back: &mut usize, key: &str) -> PromptEdit {
+    let mut chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut b = (*back).min(len);
+    let idx = len - b;
+    let result = match key.to_ascii_lowercase().as_str() {
+        "space" => { chars.insert(idx, ' '); PromptEdit::Edited }
+        "left" | "c-b" => { if b < len { b += 1; } PromptEdit::Edited }
+        "right" | "c-f" => { b = b.saturating_sub(1); PromptEdit::Edited }
+        "home" | "c-a" => { b = len; PromptEdit::Edited }
+        "end" | "c-e" => { b = 0; PromptEdit::Edited }
+        "backspace" | "bspace" | "c-h" => {
+            if idx > 0 { chars.remove(idx - 1); }
+            PromptEdit::Edited
+        }
+        "delete" | "dc" | "c-d" => {
+            if b > 0 { chars.remove(idx); b -= 1; }
+            PromptEdit::Edited
+        }
+        "c-u" => { chars.clear(); b = 0; PromptEdit::Edited }
+        "c-k" => { chars.truncate(idx); b = 0; PromptEdit::Edited }
+        "c-w" => {
+            let mut start = idx;
+            while start > 0 && chars[start - 1] == ' ' { start -= 1; }
+            while start > 0 && chars[start - 1] != ' ' { start -= 1; }
+            chars.drain(start..idx);
+            PromptEdit::Edited
+        }
+        "up" | "c-p" => PromptEdit::HistoryUp,
+        "down" | "c-n" => PromptEdit::HistoryDown,
+        _ => PromptEdit::Other,
+    };
+    *input = chars.into_iter().collect();
+    *back = b;
+    result
+}
+
+/// Insert typed text at a copy-mode prompt's cursor.
+pub fn prompt_insert(input: &mut String, back: usize, text: &str) {
+    let len = input.chars().count();
+    let idx = len - back.min(len);
+    let at = input.char_indices().nth(idx).map_or(input.len(), |(i, _)| i);
+    input.insert_str(at, text);
+}
+
+/// Step through the search history the way tmux's prompt does: Up goes to
+/// older entries and stops at the oldest, Down goes back towards the newest
+/// and then to an empty line. Returns the text to show, or None when there is
+/// nothing to move to.
+pub fn search_history_step(history: &[String], pos: &mut Option<usize>, up: bool) -> Option<String> {
+    if history.is_empty() {
+        return None;
+    }
+    if up {
+        let next = match *pos { None => history.len() - 1, Some(p) => p.saturating_sub(1) };
+        *pos = Some(next);
+        Some(history[next].clone())
+    } else {
+        match *pos {
+            None => None,
+            Some(p) if p + 1 < history.len() => {
+                *pos = Some(p + 1);
+                Some(history[p + 1].clone())
+            }
+            Some(_) => {
+                *pos = None;
+                Some(String::new())
+            }
+        }
+    }
+}
+
+/// Remember an accepted search for the prompt history, skipping a repeat of
+/// the newest entry, as tmux's `prompt_add_history` does.
+pub fn remember_search(app: &mut AppState, query: &str) {
+    if query.is_empty() || app.copy_search_history.last().map(|s| s.as_str()) == Some(query) {
+        return;
+    }
+    app.copy_search_history.push(query.to_string());
+    if app.copy_search_history.len() > 100 {
+        app.copy_search_history.remove(0);
+    }
+}
+
 /// The Escape key in copy mode. tmux binds it to `clear-selection` in
 /// `copy-mode-vi` and to `cancel` in `copy-mode` (key-bindings.c:654 and
 /// :577), so with `mode-keys vi` it drops the selection and stays in copy

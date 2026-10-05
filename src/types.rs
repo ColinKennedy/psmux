@@ -1564,6 +1564,16 @@ pub struct AppState {
     /// When the automatic refresh last re-cloned, to space rebuilds the way
     /// tmux's 50 ms `WINDOW_COPY_REFRESH_INTERVAL` timer does.
     pub copy_refresh_at: Option<Instant>,
+    /// Where the cursor sits in the copy-mode search or goto-line prompt,
+    /// counted in characters back from the end of the input, so text typed
+    /// at the end (the common case) needs no bookkeeping. tmux keeps it as
+    /// `prompt_index` (prompt.c) (discussion #694).
+    pub copy_prompt_back: usize,
+    /// Earlier copy-mode searches, oldest first, for Up and Down in the search
+    /// prompt (tmux's per type prompt history, prompt.c `prompt_up_history`).
+    pub copy_search_history: Vec<String>,
+    /// The history entry Up and Down are on while the prompt is open.
+    pub copy_search_history_pos: Option<usize>,
     /// When true the copy-mode position indicator is not drawn. Toggled by `P`
     /// (`toggle-position`) and set on entry by `copy-mode -H` (#704). It lives
     /// on the mode the way tmux's `hide_position` does, so leaving copy mode
@@ -2680,6 +2690,9 @@ impl AppState {
             copy_refresh_live: false,
             copy_refresh_version: 0,
             copy_refresh_at: None,
+            copy_prompt_back: 0,
+            copy_search_history: Vec::new(),
+            copy_search_history_pos: None,
             copy_hide_position: false,
             copy_needs_redraw: false,
             named_registers: std::collections::HashMap::new(),
