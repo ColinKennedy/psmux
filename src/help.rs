@@ -137,8 +137,8 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
 /// takes them away. psmux runs these keys through its built-in handlers
 /// (`input.rs`), so these lists record what those handlers do, each written as
 /// the `send-keys -X` command that does the same thing. They describe PSMUX,
-/// not tmux: where the built-in handler differs from tmux's default (vi `v`
-/// begins a selection here, `y` copies) the psmux behaviour is what is listed,
+/// not tmux: where the built-in handler differs from tmux's default (`y`
+/// copies, emacs `v` begins a selection) the psmux behaviour is what is listed,
 /// and keys the handlers do not treat (BSpace, the tmux `command-prompt -N`
 /// digit bindings) are left out. Digits still work as a repeat count, and
 /// `i`/`a` still start a text object; neither has a `send-keys -X` spelling,
@@ -199,7 +199,7 @@ pub const COPY_MODE_VI_DEFAULTS: &[(&str, &str)] = &[
     ("q", "send-keys -X cancel"),
     ("r", "send-keys -X refresh-from-pane"),
     ("t", "send-keys -X jump-to-forward"),
-    ("v", "send-keys -X begin-selection"),
+    ("v", "send-keys -X rectangle-toggle"),
     ("w", "send-keys -X next-word"),
     ("y", "send-keys -X copy-selection-and-cancel"),
     ("z", "send-keys -X scroll-middle"),

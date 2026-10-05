@@ -1128,12 +1128,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 // Space = begin selection (vi mode), Enter = copy-selection-and-cancel
                 KeyCode::Char(' ') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                        app.copy_anchor = Some((r,c));
-                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                        app.copy_pos = Some((r,c));
-                        app.copy_selection_mode = crate::types::SelectionMode::Char;
-                    }
+                    crate::copy_mode::begin_selection(app);
                 }
                 KeyCode::Enter => {
                     // Copy selection and exit copy mode (vi Enter)
@@ -3751,22 +3746,14 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         '0' => { crate::copy_mode::move_to_line_start(app); }
         '$' => { crate::copy_mode::move_to_line_end(app); }
         '^' => { crate::copy_mode::move_to_first_nonblank(app); }
-        ' ' => {
-            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r, c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r, c));
-                app.copy_selection_mode = crate::types::SelectionMode::Char;
-            }
-        }
-        'v' => {
-            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r, c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r, c));
-                app.copy_selection_mode = crate::types::SelectionMode::Char;
-            }
-        }
+        ' ' => { crate::copy_mode::begin_selection(app); }
+        // tmux binds v to rectangle-toggle in copy-mode-vi (key-bindings.c:705)
+        // and Space to begin-selection (:656); the legacy dispatcher and the
+        // docs already said so, but this path, the one the client uses, began
+        // a selection (discussion #694). The emacs table has no v in tmux, and
+        // psmux keeps its old begin-selection there.
+        'v' if app.mode_keys == "vi" => { crate::copy_mode::toggle_rectangle(app); }
+        'v' => { crate::copy_mode::begin_selection(app); }
         'V' => {
             if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
                 app.copy_anchor = Some((r, c));
@@ -4022,15 +4009,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 }
                 exit_copy_mode(app);
             }
-            "space" => {
-                // Begin selection (like v in vi mode)
-                if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                    app.copy_anchor = Some((r, c));
-                    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                    app.copy_pos = Some((r, c));
-                    app.copy_selection_mode = crate::types::SelectionMode::Char;
-                }
-            }
+            "space" => { crate::copy_mode::begin_selection(app); }
             "up" => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, -1); } }
             "down" => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, 1); } }
             "pageup" => { for _ in 0..copy_repeat { crate::copy_mode::page_scroll(app, true, false); } }

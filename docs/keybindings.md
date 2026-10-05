@@ -476,16 +476,16 @@ bind-key -T copy-mode-vi r send-keys -X refresh-toggle
 | `Space` | Begin character selection at the cursor |
 | `V` | Begin line selection at the cursor |
 | `Ctrl+Space` | Set the selection anchor at the cursor |
-| `v` | Toggle rectangle mode on the selection (does not start one) |
-| `Ctrl+v` | Force rectangle mode on the selection |
+| `v` / `Ctrl+v` | Toggle rectangle mode (does not start a selection) |
 | `o` | Swap cursor/anchor ends |
 | `Esc` | Clear the selection and stay in copy mode (`mode-keys vi`) |
 
 **psmux follows tmux here, not vi.** In vi, `v` starts a character selection. In tmux and in psmux,
 `v` is `rectangle-toggle`: it flips the selection between character mode and block mode and does not
 set an anchor, so pressing `v` on its own selects nothing. Use `Space` (or `Ctrl+Space`) to start a
-selection and `V` to start a line selection. `Ctrl+v` differs from `v` in that it always switches to
-rectangle mode rather than toggling out of it. If you want vi muscle memory, rebind it:
+selection and `V` to start a line selection. Pressed before `Space`, `v` makes the selection a
+rectangle from the start, as in tmux. Builds before discussion #694 began a character selection on
+`v` despite this table; if you got used to that, rebind it:
 
 ```tmux
 bind-key -T copy-mode-vi v send-keys -X begin-selection

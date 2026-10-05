@@ -1882,6 +1882,23 @@ pub fn remember_search(app: &mut AppState, query: &str) {
     }
 }
 
+/// `begin-selection`, the Space key: start a selection at the copy cursor.
+///
+/// tmux's `window_copy_start_selection` leaves `rectflag` alone, so a
+/// rectangle toggled on with `v` before the selection starts is the shape the
+/// selection takes. A line selection (`V`) is a different command and does
+/// not carry over.
+pub fn begin_selection(app: &mut AppState) {
+    if let Some((r, c)) = get_copy_pos(app) {
+        app.copy_anchor = Some((r, c));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+        app.copy_pos = Some((r, c));
+        if app.copy_selection_mode == crate::types::SelectionMode::Line {
+            app.copy_selection_mode = crate::types::SelectionMode::Char;
+        }
+    }
+}
+
 /// The Escape key in copy mode. tmux binds it to `clear-selection` in
 /// `copy-mode-vi` and to `cancel` in `copy-mode` (key-bindings.c:654 and
 /// :577), so with `mode-keys vi` it drops the selection and stays in copy

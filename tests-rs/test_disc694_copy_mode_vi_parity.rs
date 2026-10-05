@@ -362,3 +362,63 @@ fn the_host_cursor_sits_on_the_copy_cursor_inside_a_selection() {
     let (pos, _) = render_copy_leaf(sel, (4, 3));
     assert_eq!((pos.x, pos.y), (3, 4));
 }
+
+// ── 2. v is rectangle-toggle, Space is begin-selection ──────────────────────
+//
+// Measured on dd695ea with real keystrokes: `v` gave selection_present 1 and
+// a second `v` kept it, so `v` began a character selection. tmux binds `v` to
+// rectangle-toggle and Space to begin-selection in copy-mode-vi
+// (key-bindings.c:705 and :656); measured in tmux 3.4, `v` with no selection
+// gives rectangle_toggle 1 and selection_present 0.
+
+#[test]
+fn v_toggles_the_rectangle_and_starts_nothing_in_vi() {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row", 0, 40);
+    app.mode_keys = "vi".to_string();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    app.copy_pos = Some((5, 1));
+    crate::input::send_text_to_active(&mut app, "v").unwrap();
+    assert!(app.copy_anchor.is_none(), "v selects nothing on its own");
+    assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Rect);
+    // Space then starts a selection in the rectangle shape v chose, as
+    // window_copy_start_selection leaves rectflag alone.
+    crate::input::send_key_to_active(&mut app, "space").unwrap();
+    assert!(app.copy_anchor.is_some());
+    assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Rect);
+    crate::input::send_text_to_active(&mut app, "v").unwrap();
+    assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Char, "a second v toggles back");
+    assert!(app.copy_anchor.is_some(), "and keeps the selection");
+}
+
+#[test]
+fn space_after_a_line_selection_starts_a_character_one() {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row", 0, 40);
+    app.mode_keys = "vi".to_string();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    crate::input::send_text_to_active(&mut app, "V").unwrap();
+    assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Line);
+    crate::input::send_key_to_active(&mut app, "space").unwrap();
+    assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Char);
+}
+
+#[test]
+fn v_keeps_begin_selection_with_emacs_keys() {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row", 0, 40);
+    app.mode_keys = "emacs".to_string();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    crate::input::send_text_to_active(&mut app, "v").unwrap();
+    assert!(app.copy_anchor.is_some());
+}
+
+#[test]
+fn list_keys_shows_v_as_rectangle_toggle_and_escape_as_clear_selection() {
+    let vi = crate::help::COPY_MODE_VI_DEFAULTS;
+    assert!(vi.contains(&("v", "send-keys -X rectangle-toggle")));
+    assert!(vi.contains(&("Space", "send-keys -X begin-selection")));
+    assert!(vi.contains(&("Escape", "send-keys -X clear-selection")));
+    assert!(vi.contains(&("q", "send-keys -X cancel")));
+    assert!(vi.contains(&("r", "send-keys -X refresh-from-pane")));
+}
