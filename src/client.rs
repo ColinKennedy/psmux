@@ -8173,10 +8173,20 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
-                let para = Paragraph::new(format!(": {}", command_buf));
+                // The cursor column is the display WIDTH of the text before
+                // it, not its byte offset: command_cursor counts bytes
+                // (c.len_utf8() above), and eight box drawing characters are
+                // 24 bytes over 8 columns, so adding the offset to a column
+                // drew the cursor 16 past the text and eventually outside the
+                // border (#741). The window scrolls with the cursor as tmux's
+                // does (status.c:937 to :944), so a long input keeps what is
+                // being typed on screen instead of clipping it.
+                let avail = inner.width.saturating_sub(2) as usize; // after ": "
+                let (shown, cur_col) =
+                    crate::util::prompt_window(&command_buf, command_cursor, avail);
+                let para = Paragraph::new(format!(": {}", shown));
                 f.render_widget(para, inner);
-                // Show cursor at the correct position within the prompt
-                let cx = inner.x + 2 + command_cursor as u16; // +2 for ": "
+                let cx = inner.x + 2 + cur_col as u16;
                 f.set_cursor_position((cx, inner.y));
             }
             if window_idx_input {
@@ -8497,6 +8507,19 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 srv_popup_cursor.and_then(|c| {
                     popup_cursor_screen_pos(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c)
                 })
+            } else if command_input || window_idx_input {
+                // An open prompt owns the cursor, and the pane only gets it
+                // when no prompt is up: tmux settles the cursor on
+                // `c->prompt_cursor` first and takes the pane in the else
+                // branch (`server_client_reset_state`, server-client.c:1797
+                // to :1808). None here means "keep what the draw asked for",
+                // which is where the overlay put it. The pane's position used
+                // to win instead, so in a pane that was not in copy mode the
+                // prompt had no cursor at all and there was no way to see
+                // where typing would land (#741). A pane IN copy mode sets
+                // neither of the post draw positions, which is why the prompt
+                // had a cursor there and not here.
+                None
             } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
                 // Content lives inside the border-label reservation; use the render's inner rect.
                 let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
@@ -8511,7 +8534,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             // once it is back where it belongs.  An unchanged frame writes
             // nothing, so the host never sees a ?25l/?25h pair it did not need.
             terminal.backend_mut().request_cursor(cursor_visible);
-            if cursor_visible.is_none() && !(srv_popup_active && srv_popup_has_pty) {
+            // Parking is for a cursor the pane has hidden. With a prompt up the
+            // cursor is shown, in the prompt, so there is nothing to park.
+            if cursor_visible.is_none()
+                && !(srv_popup_active && srv_popup_has_pty)
+                && !command_input
+                && !window_idx_input
+            {
                 if let (Some((cc, cr)), Some(outer)) = (post_draw_park, active_pane_area) {
                     let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
                     let cy = inner.y + cr.min(inner.height.saturating_sub(1));
