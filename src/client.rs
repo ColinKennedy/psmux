@@ -5300,10 +5300,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if confirm_cmd.is_some() => {
                                     confirm_cmd = None;
                                 }
-                                KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { rename_buf.push(c); }
-                                KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); }
-                                KeyCode::Char(c) if window_idx_input && c.is_ascii_digit() && !paste_burst_active => { window_idx_buf.push(c); }
-                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); }
+                                KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { rename_buf.push(c); paste_gesture.record_char(c); }
+                                KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); paste_gesture.record_char(c); }
+                                // tmux binds the window index prompt as a plain
+                                // `command-prompt -pindex` (key-bindings.c:394), so it takes any text and
+                                // `select-window -t ':%%'` resolves an index or a
+                                // name. It used to take digits only and let every
+                                // other character fall through to the pane, so a
+                                // letter typed or pasted here reached the shell.
+                                KeyCode::Char(c) if window_idx_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { window_idx_buf.push(c); paste_gesture.record_char(c); }
+                                KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); paste_gesture.record_char(c); }
                                 KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
                                 KeyCode::Backspace if window_idx_input => { let _ = window_idx_buf.pop(); }
@@ -5328,7 +5334,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Enter if pane_renaming => { cmd_batch.push(format!("set-pane-title {}\n", quote_arg(&pane_title_buf))); pane_renaming = false; }
                                 KeyCode::Enter if window_idx_input => {
                                     if !window_idx_buf.is_empty() {
-                                        cmd_batch.push(format!("select-window -t :{}\n", window_idx_buf));
+                                        cmd_batch.push(format!("select-window -t {}\n", crate::util::quote_arg_if_needed(&format!(":{}", window_idx_buf))));
                                     }
                                     window_idx_input = false;
                                 }
@@ -5490,8 +5496,22 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // `vk=0x20 ch=0x0020 ctrl=0x0000`.  That also
                                 // contradicted the fold's own promise of NUL, which is
                                 // what tmux sends (input-keys.c `standard_map`).
+                                // `paste_burst_active` is load bearing too, for the
+                                // same reason the arms above carry it. Without it a
+                                // space was the one character that neither asked
+                                // whether an overlay had it nor whether the paste
+                                // suppress window was open: the generic Char arm
+                                // below checks the window and drops the character,
+                                // and this arm pushed it to the pane regardless.
+                                // Measured by pasting " abcdef" into the command
+                                // prompt several times a second: the letters went to
+                                // the prompt and a few of the spaces landed on the
+                                // shell's command line behind it (#744). With the
+                                // guard a space falls through to the generic arm and
+                                // is treated like every other character.
                                 KeyCode::Char(' ')
-                                    if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !paste_burst_active => {
                                     #[cfg(windows)]
                                     {
                                         paste_pend.push(' ');
@@ -6651,8 +6671,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                 }
                 paste_gesture.record(&paste_pend);
-                let encoded = base64_encode(&paste_pend);
-                cmd_batch.push(format!("send-paste {}\n", encoded));
+                // A prompt the client draws itself keeps the paste, the way an
+                // Event::Paste already does (#290). Sending it to the pane as
+                // well is #744: the text showed up on the shell's command line
+                // behind the prompt.
+                let consumed = route_paste_to_overlay(
+                    &paste_pend,
+                    command_input, &mut command_buf, &mut command_cursor,
+                    renaming, &mut rename_buf,
+                    pane_renaming, &mut pane_title_buf,
+                    window_idx_input, &mut window_idx_buf,
+                );
+                if !consumed {
+                    let encoded = base64_encode(&paste_pend);
+                    cmd_batch.push(format!("send-paste {}\n", encoded));
+                }
                 paste_pend.clear();
                 paste_pend_start = None;
                 paste_stage2 = false;
@@ -6687,8 +6720,22 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             if input_log_enabled() {
                                 input_log("paste", &format!("paste CONFIRMED (no buffer), clipboard read len={}", text.len()));
                             }
-                            let encoded = base64_encode(&text);
-                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                            // Same rule as the branch above: an open prompt
+                            // keeps it, and only a pane gets send-paste
+                            // (#744). This is the path that reaches a prompt
+                            // when the characters never arrived as key events
+                            // at all.
+                            let consumed = route_paste_to_overlay(
+                                &text,
+                                command_input, &mut command_buf, &mut command_cursor,
+                                renaming, &mut rename_buf,
+                                pane_renaming, &mut pane_title_buf,
+                                window_idx_input, &mut window_idx_buf,
+                            );
+                            if !consumed {
+                                let encoded = base64_encode(&text);
+                                cmd_batch.push(format!("send-paste {}\n", encoded));
+                            }
                             // Suppress subsequent char accumulation — the
                             // clipboard chars may arrive later (async inject)
                             // and would cause a duplicate paste via stage2.
@@ -8228,7 +8275,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let inner = overlay.inner(oa);
                 let para = Paragraph::new(format!("index: {}", window_idx_buf));
                 f.render_widget(para, inner);
-                let cx = inner.x + 7 + window_idx_buf.len() as u16;
+                let cx = inner.x + 7 + unicode_width::UnicodeWidthStr::width(window_idx_buf.as_str()) as u16;
                 f.set_cursor_position((cx, inner.y));
             }
             if let Some(ref cmd) = confirm_cmd {
@@ -9083,6 +9130,21 @@ impl PasteGesture {
         }
     }
 
+    /// Remember one character handed to a client overlay (the command prompt,
+    /// the rename prompts, the window index prompt).
+    ///
+    /// The pane path records whole bursts, because that is how it forwards
+    /// them. An overlay consumes the characters one at a time, so nothing was
+    /// recorded for it at all, and the clipboard read-back of the same Ctrl+V
+    /// did not recognise the text as already delivered: it read the clipboard
+    /// and sent it to the pane, which is #744. Recording them here is what
+    /// lets `blocks` answer the same question for an overlay that it already
+    /// answered for a pane.
+    fn record_char(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        self.record(c.encode_utf8(&mut buf));
+    }
+
     /// True when a bracketed paste event carrying `text` repeats characters
     /// this client has just forwarded: the host delivered the same paste as
     /// key events first, so sending the event too would paste it twice.
@@ -9195,8 +9257,11 @@ fn route_paste_to_overlay(
         pane_title_buf.push_str(data);
         true
     } else if window_idx_input {
+        // Any text, as tmux's `command-prompt -pindex` takes it
+        // (key-bindings.c:394); only line breaks and other control
+        // characters are left out of a one line target.
         for c in data.chars() {
-            if c.is_ascii_digit() { window_idx_buf.push(c); }
+            if !c.is_control() { window_idx_buf.push(c); }
         }
         true
     } else {
@@ -9211,6 +9276,10 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_zoom_bleed.rs"]
 mod test_zoom_bleed;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue744_paste_overlay_routing.rs"]
+mod test_issue744_paste_overlay_routing;
 
 /// How long the client keeps polling console input at 1ms after sending a key,
 /// waiting for that key's echo to come back and be drawn.
