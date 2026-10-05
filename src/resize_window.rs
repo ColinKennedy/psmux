@@ -573,3 +573,7 @@ pub fn set_active_window_size_mode(
 #[cfg(test)]
 #[path = "../tests-rs/test_resize_window_compat.rs"]
 mod test_resize_window_compat;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_client_size_after_reconnect.rs"]
+mod test_client_size_after_reconnect;
