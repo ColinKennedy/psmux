@@ -1741,10 +1741,7 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
                 app.copy_pos = Some(a);
             }
         }
-        "clear-selection" => {
-            app.copy_anchor = None;
-            app.copy_selection_mode = crate::types::SelectionMode::Char;
-        }
+        "clear-selection" => { crate::copy_mode::clear_selection(app); }
         "append-selection" => {
             // Append to existing buffer instead of replacing
             let _ = yank_selection(app);

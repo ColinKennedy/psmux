@@ -479,6 +479,7 @@ bind-key -T copy-mode-vi r send-keys -X refresh-toggle
 | `v` | Toggle rectangle mode on the selection (does not start one) |
 | `Ctrl+v` | Force rectangle mode on the selection |
 | `o` | Swap cursor/anchor ends |
+| `Esc` | Clear the selection and stay in copy mode (`mode-keys vi`) |
 
 **psmux follows tmux here, not vi.** In vi, `v` starts a character selection. In tmux and in psmux,
 `v` is `rectangle-toggle`: it flips the selection between character mode and block mode and does not
@@ -533,7 +534,8 @@ See [Copy Mode Goto Line Prompt](#copy-mode-goto-line-prompt) for what the numbe
 
 | Key | Action |
 |-----|--------|
-| `Esc` / `q` / `]` | Exit copy mode |
+| `q` / `]` | Exit copy mode |
+| `Esc` | Clear the selection and stay in copy mode with `mode-keys vi`; exit with `mode-keys emacs` |
 | `Ctrl+C` / `Ctrl+G` | Exit copy mode |
 
 ### Copy Mode Search Prompt

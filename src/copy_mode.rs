@@ -1778,6 +1778,19 @@ pub fn tick_auto_refresh(app: &mut AppState) -> bool {
     changed
 }
 
+/// The Escape key in copy mode. tmux binds it to `clear-selection` in
+/// `copy-mode-vi` and to `cancel` in `copy-mode` (key-bindings.c:654 and
+/// :577), so with `mode-keys vi` it drops the selection and stays in copy
+/// mode, with nothing to do when there is no selection (measured in tmux 3.4:
+/// `pane_in_mode` stays 1), and `q` is the key that leaves (discussion #694).
+pub fn escape_key(app: &mut AppState) {
+    if app.mode_keys == "vi" {
+        clear_selection(app);
+    } else {
+        exit_copy_mode(app);
+    }
+}
+
 /// `clear-selection`, tmux's `window_copy_clear_selection`: drop the selection
 /// and stay in copy mode. A line selection goes back to a character one, while
 /// the rectangle flag survives, as tmux keeps `rectflag` across it.

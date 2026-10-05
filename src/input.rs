@@ -940,9 +940,10 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 return Ok(false);
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => {
+                KeyCode::Char('q') | KeyCode::Char(']') => {
                     exit_copy_mode(app);
                 }
+                KeyCode::Esc => { crate::copy_mode::escape_key(app); }
                 // Ctrl+C exits copy mode (tmux parity, fixes #25)
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     exit_copy_mode(app);
@@ -3686,9 +3687,10 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         return Ok(());
     }
     match c {
-        'q' | ']' | '\x1b' => {
+        'q' | ']' => {
             exit_copy_mode(app);
         }
+        '\x1b' => { crate::copy_mode::escape_key(app); }
         'h' => { for _ in 0..n { move_copy_cursor(app, -1, 0); } }
         'l' => { for _ in 0..n { move_copy_cursor(app, 1, 0); } }
         'k' => { for _ in 0..n { move_copy_cursor(app, 0, -1); } }
@@ -3976,9 +3978,11 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             }
         }
         match k {
-            "esc" | "q" => {
+            "q" => {
                 exit_copy_mode(app);
             }
+            // vi: clear-selection, emacs: cancel (key-bindings.c:654, :577).
+            "esc" | "escape" => { crate::copy_mode::escape_key(app); }
             "enter" => {
                 // Copy selection and exit copy mode (vi Enter)
                 if app.copy_anchor.is_some() {

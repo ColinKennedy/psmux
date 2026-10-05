@@ -157,7 +157,7 @@ pub const COPY_MODE_VI_DEFAULTS: &[(&str, &str)] = &[
     ("C-v", "send-keys -X rectangle-toggle"),
     ("C-y", "send-keys -X scroll-up"),
     ("Enter", "send-keys -X copy-pipe-and-cancel"),
-    ("Escape", "send-keys -X cancel"),
+    ("Escape", "send-keys -X clear-selection"),
     ("Space", "send-keys -X begin-selection"),
     ("$", "send-keys -X end-of-line"),
     ("%", "send-keys -X next-matching-bracket"),
@@ -342,7 +342,7 @@ pub fn copy_mode_vi_lines() -> Vec<String> {
 
 const COPY_MODE_VI: &[(&str, &str)] = &[
     // Exit
-    ("Escape",    "cancel (exit copy mode)"),
+    ("Escape",    "clear-selection (stay in copy mode)"),
     ("q",         "cancel (exit copy mode)"),
     // Cursor movement
     ("h",         "cursor-left"),

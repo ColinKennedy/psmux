@@ -140,3 +140,60 @@ fn bump_version(app: &AppState) {
         p.data_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+// ── 1. clear-selection on Escape ────────────────────────────────────────────
+//
+// Measured on dd695ea with real keystrokes: Space lll then Escape gave
+// pane_in_mode 0. tmux binds Escape to clear-selection in copy-mode-vi
+// (key-bindings.c:654) and to cancel in copy-mode (:577).
+
+fn vi_app_with_selection() -> AppState {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row", 0, 60);
+    app.mode_keys = "vi".to_string();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    app.copy_pos = Some((10, 2));
+    crate::input::send_key_to_active(&mut app, "space").unwrap();
+    crate::input::send_text_to_active(&mut app, "lll").unwrap();
+    assert!(app.copy_anchor.is_some(), "Space starts a selection");
+    app
+}
+
+#[test]
+fn escape_clears_the_selection_and_stays_in_copy_mode_in_vi() {
+    let mut app = vi_app_with_selection();
+    crate::input::send_key_to_active(&mut app, "esc").unwrap();
+    assert!(app.copy_anchor.is_none(), "Escape drops the selection");
+    assert!(matches!(app.mode, Mode::CopyMode), "and copy mode stays up");
+    // With nothing selected it does nothing: tmux 3.4 keeps pane_in_mode 1.
+    crate::input::send_key_to_active(&mut app, "esc").unwrap();
+    assert!(matches!(app.mode, Mode::CopyMode));
+    // q is the key that leaves.
+    crate::input::send_text_to_active(&mut app, "q").unwrap();
+    assert!(!app.mode.in_copy());
+}
+
+#[test]
+fn escape_as_text_clears_the_selection_in_vi() {
+    let mut app = vi_app_with_selection();
+    crate::input::send_text_to_active(&mut app, "\x1b").unwrap();
+    assert!(app.copy_anchor.is_none());
+    assert!(matches!(app.mode, Mode::CopyMode));
+}
+
+#[test]
+fn escape_still_cancels_with_emacs_keys() {
+    let mut app = vi_app_with_selection();
+    app.mode_keys = "emacs".to_string();
+    crate::input::send_key_to_active(&mut app, "esc").unwrap();
+    assert!(!app.mode.in_copy(), "copy-mode binds Escape to cancel");
+}
+
+#[test]
+fn clear_selection_keeps_the_rectangle_flag() {
+    // tmux's window_copy_clear_selection leaves rectflag alone.
+    let mut app = vi_app_with_selection();
+    crate::copy_mode::toggle_rectangle(&mut app);
+    crate::copy_mode::clear_selection(&mut app);
+    assert_eq!(app.copy_selection_mode, crate::types::SelectionMode::Rect);
+}
