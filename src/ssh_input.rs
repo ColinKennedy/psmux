@@ -889,6 +889,7 @@ pub mod frame_wake {
         fn CreateEventW(attrs: *mut c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void;
         fn SetEvent(h: *mut c_void) -> i32;
         fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32;
+        fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
         // Signature matches the declaration in `platform.rs` exactly. Two
         // `extern` blocks in one crate that name the same symbol with different
         // types is a `clashing_extern_declarations` warning, and the pointer
@@ -948,6 +949,21 @@ pub mod frame_wake {
             if h == INVALID_HANDLE_VALUE { 0 } else { h as usize }
         });
         if h == 0 { None } else { Some(h as *mut c_void) }
+    }
+
+    /// The waitable console input handle, for the #742 record tap
+    /// (`console_tap::take_head`), which peeks the same buffer crossterm reads.
+    pub fn conin() -> Option<*mut c_void> {
+        conin_handle()
+    }
+
+    /// Block until console input is available or `ms` elapses, without
+    /// reading it. `None` when there is no console handle. Used when the frame
+    /// wake is off, so the read after it can still be a one record
+    /// `poll(Duration::ZERO)` that the #742 tap runs in front of.
+    pub fn wait_console(ms: u32) -> Option<bool> {
+        let h = conin_handle()?;
+        Some(unsafe { WaitForSingleObject(h, ms) } == WAIT_OBJECT_0)
     }
 
     /// What ended the wait.
@@ -1080,8 +1096,16 @@ impl InputSource {
                     // Wait on console input AND a pushed frame together, so a
                     // frame that lands mid-wait is picked up on the event
                     // rather than when this interval happens to expire.
+                    //
+                    // Every read on this route is a one record
+                    // `next_queued()`, never a `poll` with a timeout: crossterm
+                    // reads records in a loop until one yields an event, and
+                    // the #742 tap has to see each record at the head of the
+                    // buffer before crossterm does.
                     #[cfg(windows)]
-                    let ready = match frame_wake::wait(wait.as_millis().min(u32::MAX as u128) as u32) {
+                    let wait_ms = wait.as_millis().min(u32::MAX as u128) as u32;
+                    #[cfg(windows)]
+                    let ready = match frame_wake::wait(wait_ms) {
                         // #658: a frame wake returns to the caller without
                         // reading console input, so it jumps over the
                         // `esc.expire()` at the foot of this loop - and that
@@ -1093,19 +1117,30 @@ impl InputSource {
                         frame_wake::Woke::Frame => {
                             return Ok(frame_wake_release(&mut esc, Instant::now()))
                         }
-                        frame_wake::Woke::Console => Some(crossterm::event::poll(Duration::ZERO)?),
-                        frame_wake::Woke::Timeout => Some(false),
-                        // No wake handles: fall back to crossterm's own wait.
-                        frame_wake::Woke::Unavailable => None,
+                        frame_wake::Woke::Console => Some(next_queued()?),
+                        frame_wake::Woke::Timeout => Some(None),
+                        // No frame wake: wait on the console alone, then read
+                        // one record. Only with no console handle at all does
+                        // this fall back to crossterm's own wait.
+                        frame_wake::Woke::Unavailable => match frame_wake::wait_console(wait_ms) {
+                            Some(true) => Some(next_queued()?),
+                            Some(false) => Some(None),
+                            None => None,
+                        },
                     };
                     #[cfg(not(windows))]
-                    let ready: Option<bool> = None;
+                    let ready: Option<Option<Event>> = None;
                     let ready = match ready {
                         Some(r) => r,
-                        None => crossterm::event::poll(wait)?,
+                        None => {
+                            if crossterm::event::poll(wait)? {
+                                Some(crossterm::event::read()?)
+                            } else {
+                                None
+                            }
+                        }
                     };
-                    if ready {
-                        let ev = crossterm::event::read()?;
+                    if let Some(ev) = ready {
                         if let Some(out) = esc.feed_with(ev, Instant::now(), pull_queued) {
                             return Ok(Some(out));
                         }
@@ -1146,8 +1181,7 @@ impl InputSource {
                     return Ok(Some(ev));
                 }
                 loop {
-                    if crossterm::event::poll(Duration::ZERO)? {
-                        let ev = crossterm::event::read()?;
+                    if let Some(ev) = next_queued()? {
                         if let Some(out) = esc.feed_with(ev, Instant::now(), pull_queued) {
                             return Ok(Some(out));
                         }
@@ -1174,9 +1208,28 @@ impl InputSource {
 /// the very next `poll`/`read` in the loop above hits the same broken stdin and
 /// surfaces it as the `io::Error` the caller expects.
 fn pull_queued() -> Option<Event> {
-    match crossterm::event::poll(Duration::ZERO) {
-        Ok(true) => crossterm::event::read().ok(),
-        _ => None,
+    next_queued().ok().flatten()
+}
+
+/// One event if the console has already delivered it, `None` the instant it
+/// has not, reading at most one record.
+///
+/// On Windows the #742 tap goes first: when the record at the head of the
+/// console input buffer is one crossterm 0.29 would lose (a UTF-16 surrogate
+/// half, or a control character with no virtual key), psmux consumes and
+/// decodes it itself. Otherwise `poll(Duration::ZERO)` hands crossterm exactly
+/// that one record, since with a zero timeout crossterm's reader stops after a
+/// single `ReadConsoleInputW` whether or not it produced an event.
+#[inline]
+fn next_queued() -> io::Result<Option<Event>> {
+    #[cfg(windows)]
+    if let Some(ev) = crate::console_tap::take_head() {
+        return Ok(Some(ev));
+    }
+    if crossterm::event::poll(Duration::ZERO)? {
+        Ok(Some(crossterm::event::read()?))
+    } else {
+        Ok(None)
     }
 }
 

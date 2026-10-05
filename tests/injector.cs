@@ -86,7 +86,10 @@ class Injector
         bool ok = WriteConsoleInput(h, recs, 2, out written);
         int err = ok ? 0 : Marshal.GetLastWin32Error();
         log.Add(string.Format("  '{0}' vk=0x{1:X2} ok={2} w={3} e={4}",
-            ch == '\0' ? "NUL" : ch.ToString(), vk, ok, written, err));
+            // A lone surrogate cannot be written to the UTF-8 log file
+            // (EncoderFallbackException), so code units are logged as hex.
+            ch == '\0' ? "NUL" : char.IsSurrogate(ch) ? string.Format("U+{0:X4}", (int)ch) : ch.ToString(),
+            vk, ok, written, err));
         return ok && written == 2;
     }
 
@@ -271,6 +274,37 @@ class Injector
                             if (SendKey(handle, 0, uc, 0, log)) injected++;
                             Thread.Sleep(20);
                         }
+                    }
+                    else if (token.StartsWith("UTF16:"))
+                    {
+                        // {UTF16:XXXX[,XXXX,...]}: raw UTF-16 code units, written
+                        // in ONE WriteConsoleInputW call as a key down and a key
+                        // up record per unit, all with vk=0 and no modifiers.
+                        // That is byte for byte what the console itself produces
+                        // for a paste, an IME commit or a Win+. emoji pick of a
+                        // non BMP character (issue #742): for U+1F60A it is
+                        //   down D83D, up D83D, down DE0A, up DE0A.
+                        // {U:} cannot express that: it writes each unit in its
+                        // own call with a sleep between, so the two halves of a
+                        // surrogate pair arrive in two separate reads.
+                        var hexes = token.Substring(6).Split(',');
+                        var urecs = new List<INPUT_RECORD>();
+                        foreach (var hex in hexes)
+                        {
+                            char uc = (char)Convert.ToUInt16(hex, 16);
+                            var down = MakeKey(true, 0, uc, 0);
+                            var up = MakeKey(false, 0, uc, 0);
+                            down.KeyEvent.wVirtualScanCode = 0;
+                            up.KeyEvent.wVirtualScanCode = 0;
+                            urecs.Add(down);
+                            urecs.Add(up);
+                        }
+                        var uarr = urecs.ToArray();
+                        uint uw; bool uok = WriteConsoleInput(handle, uarr, (uint)uarr.Length, out uw);
+                        int ue = uok ? 0 : Marshal.GetLastWin32Error();
+                        log.Add(string.Format("  UTF16 {0} n={1} ok={2} w={3} e={4}",
+                            token.Substring(6), uarr.Length, uok, uw, ue));
+                        if (uok && uw == uarr.Length) injected++;
                     }
                     else if (token.StartsWith("MOD:"))
                     {

@@ -34,6 +34,7 @@ mod server;
 mod preview;
 mod client;
 mod ssh_input;
+mod console_tap;
 mod debug_log;
 mod control;
 mod resize_window;
