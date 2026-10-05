@@ -168,11 +168,11 @@ fn list_keys_prints_the_built_in_copy_mode_vi_keys() {
     // tmux lists 87; psmux lists the keys its built-in copy mode handles.
     assert!(vi.len() >= 50, "copy-mode-vi lists {} lines", vi.len());
     for want in [
-        "bind-key -T copy-mode-vi v send-keys -X begin-selection",
+        "bind-key -T copy-mode-vi v send-keys -X rectangle-toggle",
         "bind-key -T copy-mode-vi g send-keys -X history-top",
         "bind-key -T copy-mode-vi C-v send-keys -X rectangle-toggle",
         "bind-key -T copy-mode-vi C-e send-keys -X scroll-down",
-        "bind-key -T copy-mode-vi Escape send-keys -X cancel",
+        "bind-key -T copy-mode-vi Escape send-keys -X clear-selection",
     ] {
         assert!(lines.iter().any(|l| l == want), "missing: {want}");
     }
@@ -221,8 +221,8 @@ fn an_unbound_built_in_character_key_does_nothing() {
     handle_copy_mode_char(&mut app, 'V').unwrap();
     assert!(app.copy_anchor.is_none(), "unbound V still began a selection (tmux: no binding, no action)");
     // A key that is still bound keeps working.
-    handle_copy_mode_char(&mut app, 'v').unwrap();
-    assert!(app.copy_anchor.is_some(), "v is still bound and must select");
+    handle_copy_mode_char(&mut app, ' ').unwrap();
+    assert!(app.copy_anchor.is_some(), "Space is still bound and must select");
 }
 
 #[test]
