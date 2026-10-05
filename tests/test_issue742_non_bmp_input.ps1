@@ -53,7 +53,7 @@ function Inject($keys) {
 $env:PSMUX_NO_WARM = "1"
 P new-session -d -s $SESS -x 100 -y 30 | Out-Null
 $up = $false
-for ($i = 0; $i -lt 40; $i++) {
+for ($i = 0; $i -lt 80; $i++) {
     if ((P list-sessions | Out-String) -match $SESS) { $up = $true; break }
     Start-Sleep -Milliseconds 250
 }
