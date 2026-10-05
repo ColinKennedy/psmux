@@ -207,6 +207,21 @@ public static class I719Ui {
                         Start-Sleep -Milliseconds 1500
                         $all = Read-ProbeText $p.Log
                         $got = if ($all.Length -ge $pre) { $all.Substring($pre) } else { $all }
+                        if ($got -eq '') {
+                            # Nothing at all arrived: not wrong bytes, no bytes. That is
+                            # the chord landing before the window really had the
+                            # foreground (sweep 2026-10-05_19-58-06 saw it on the first
+                            # paste of two cells, overnight, with the same binary passing
+                            # 18 of 18 standalone and in the sweep before it). A psmux
+                            # defect shows up as wrong bytes, so one retry of the
+                            # delivery is the honest move; a second empty result counts.
+                            Start-Sleep -Milliseconds 500
+                            $pre = (Read-ProbeText $p.Log).Length
+                            if (-not ([I719Ui]::Focus($hwnd) -and [I719Ui]::CtrlV($hwnd))) { $nofocus++; continue }
+                            Start-Sleep -Milliseconds 1500
+                            $all = Read-ProbeText $p.Log
+                            $got = if ($all.Length -ge $pre) { $all.Substring($pre) } else { $all }
+                        }
                         $want = if ($pd -eq 'on') { "<ESC>[200~$($c.plain)<ESC>[201~" } else { $c.plain }
                         if ($got -match '(^|[^>])\[A') { $strayA++ }
                         if ($got -eq $want) { $ok++ } else { $bad += $got }

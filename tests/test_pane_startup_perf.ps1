@@ -353,11 +353,27 @@ if ($windowTimes.Count -gt 0) {
     # exactly what it should at depth two, so the budget here is two slow
     # creations. The depth five contract below (every creation fast, p90 150
     # ms) is the real guarantee and stays strict.
-    $slowWindows = @($windowTimes | Where-Object { $_ -gt 300 }).Count
+    #
+    # Since b117e745 (2026-10-04) the FIRST creation after a cold launch is a
+    # shell booting alone by design: the server holds its pool refill until the
+    # first pane's shell has started and then trickles the spares one at a
+    # time, so a new-window that arrives before the first spare is ready boots
+    # its own shell (611 to 701 ms) instead of racing three pwsh starts. That
+    # creation is judged by test_launch_to_prompt_gate and by the cold creation
+    # check below, not here. Counting it against this budget made the gate flip
+    # on whether the run happened to find a parked standby (first creation 35
+    # ms) or launched cold (first creation 650 ms): sweep 2026-10-05_19-58-06
+    # failed on [652, 34, 28, 2239, 172] and an A/B of eight runs per binary
+    # on 2026-10-06 reproduced the shape on the pre batch binary as well
+    # ([686, 29, 27, 1800, 311]), so the count is taken over creations two to
+    # five, where the budget of two slow creations is the refill race the
+    # paragraph above measured.
+    $afterFirst = @($windowTimes | Select-Object -Skip 1)
+    $slowWindows = @($afterFirst | Where-Object { $_ -gt 300 }).Count
     if ($slowWindows -le 2) {
-        Write-Pass "new-window: $slowWindows of $($windowTimes.Count) creations over 300ms (at most 2 allowed at the default pool depth)"
+        Write-Pass "new-window: $slowWindows of $($afterFirst.Count) creations after the first over 300ms (at most 2 allowed at the default pool depth)"
     } else {
-        Write-Fail "new-window: $slowWindows of $($windowTimes.Count) creations over 300ms - the spare pool is not being refilled ahead of demand  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]"
+        Write-Fail "new-window: $slowWindows of $($afterFirst.Count) creations after the first over 300ms - the spare pool is not being refilled ahead of demand  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]"
     }
     # The mean used to be gated at 300 ms as well. That double counted the one
     # cold creation the budget above already allows: with the cold one at 770
@@ -386,11 +402,15 @@ if ($windowTimes.Count -gt 0) {
     #            envelope, not a target: the target is the ratio written to
     #            the metrics JSON as cold_creation_ratio trending back toward
     #            the 1.5x to 2x this suite recorded in September 2026.
-    $winMedian = Get-Median $windowTimes
+    # The median is taken over the same creations as the count gate, for the
+    # same reason: with the lone first boot counted, a cold launch plus the
+    # refill race put three slow samples in five and the median became the
+    # refill wait itself (313 ms on [658, 29, 24, 1931, 312]).
+    $winMedian = Get-Median $afterFirst
     if ($winMedian -le 300) {
-        Write-Pass ("new-window median {0:N0}ms is within budget (300ms)" -f $winMedian)
+        Write-Pass ("new-window median {0:N0}ms over creations two to five is within budget (300ms)" -f $winMedian)
     } else {
-        Write-Fail ("new-window median {0:N0}ms exceeds 300ms  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]" -f $winMedian)
+        Write-Fail ("new-window median {0:N0}ms over creations two to five exceeds 300ms  [$(($windowTimes | ForEach-Object { [int]$_ }) -join ', ')]" -f $winMedian)
     }
     $winMax = ($windowTimes | Measure-Object -Maximum).Maximum
     $coldLimit = [math]::Round(5 * $baselineAvg)
