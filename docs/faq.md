@@ -68,7 +68,7 @@ A: Add `set -g bell-action none` to your `~/.psmux.conf`. This silences both the
 A: Yes, first-class support. Start psmux, run `claude` inside a pane, and ask Claude to create a team. psmux automatically sets the required environment variables and injects `--teammate-mode tmux`. Each teammate agent gets its own visible pane. See [claude-code.md](claude-code.md) for details.
 
 **Q: Do CJK characters (Chinese/Japanese/Korean) and IME input work?**
-A: Yes. CJK character input, IME composition, and pasting CJK text all work correctly. The paste detection heuristic is tuned to avoid misidentifying rapid IME bursts as clipboard pastes, keeping IME input latency minimal.
+A: Yes. CJK character input, IME composition, and pasting CJK text all work correctly. The paste detection heuristic is tuned to avoid misidentifying rapid IME bursts as clipboard pastes, keeping IME input latency minimal. Emoji and other characters outside the Basic Multilingual Plane (such as the JIS X 0213 kanji `𠮟`) work too, pasted, typed through the IME or picked from the Win+. emoji panel.
 
 **Q: Can I save and restore sessions across reboots?**
 A: Yes, using the [psmux-resurrect](https://github.com/psmux/psmux-plugins/tree/main/psmux-resurrect) plugin. For automatic periodic save/restore, pair it with [psmux-continuum](https://github.com/psmux/psmux-plugins/tree/main/psmux-continuum). See [plugins.md](plugins.md) for setup.

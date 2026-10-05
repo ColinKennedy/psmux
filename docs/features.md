@@ -163,6 +163,10 @@ See [claude-code.md](claude-code.md) for detailed setup and troubleshooting.
 - Korean IME input correctly handled without bracketed paste sequence injection
 - CJK text pasting works reliably for any length
 - UTF-8 multi-byte characters (box-drawing, emoji, CJK) render correctly in ConPTY panes
+- Characters outside the Basic Multilingual Plane (emoji, JIS X 0213 kanji such as `𠮟`) arrive whole
+  whether pasted, committed by the IME or picked from the Win+. emoji panel, in panes and in psmux's
+  own prompts, on every host. The console hands such a character over as one key record per UTF-16
+  half; psmux pairs the halves itself because crossterm 0.29 drops them (#742)
 
 ## Interactive Choosers
 
