@@ -848,13 +848,10 @@ pub(crate) fn readonly_client_may_run(cmd: &str) -> bool {
     )
 }
 
-/// Handle a single TCP connection from a client.
-/// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
-/// to the main server event loop via the `tx` channel.
 /// Merge a run-shell child's stdout and stderr the way both the persistent and
 /// the one-shot path render it: stdout first, a newline between the two when
 /// neither already provides one.
-fn run_shell_output_text(out: &std::process::Output) -> String {
+pub(crate) fn run_shell_output_text(out: &std::process::Output) -> String {
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr_text = String::from_utf8_lossy(&out.stderr);
     if !stderr_text.is_empty() {
@@ -866,6 +863,9 @@ fn run_shell_output_text(out: &std::process::Output) -> String {
     text
 }
 
+/// Handle a single TCP connection from a client.
+/// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
+/// to the main server event loop via the `tx` channel.
 pub(crate) fn handle_connection(
     stream: TcpStream,
     tx: mpsc::Sender<CtrlReq>,
@@ -1573,7 +1573,22 @@ let mut attached_sent = false;
 // `attach -r` (issue #724): set by the client's `client-flags read-only`.
 let mut client_readonly = false;
 let mut pending_chain: Vec<String> = Vec::new();
+// The rest of a command list that follows a foreground run-shell, held until
+// that shell exits (PR #740). tmux runs `run-shell X \; cmd` in that order: the
+// run-shell item waits in the client's queue (cmd-run-shell.c returns
+// CMD_RETURN_WAIT, cmd-queue.c marks it CMDQ_WAITING) and `cmd` runs only once
+// the job's callback continues the queue. The shell itself runs on its own
+// thread so this reader keeps reading; the receiver disconnects when it ends.
+// The 10 ms read timeout above brings the loop back here to release it.
+let mut deferred_chains: Vec<(mpsc::Receiver<()>, Vec<String>)> = Vec::new();
 loop {
+    if pending_chain.is_empty() && line.trim().is_empty() && !deferred_chains.is_empty() {
+        if let Some(i) = deferred_chains.iter().position(|(done, _)| {
+            matches!(done.try_recv(), Err(mpsc::TryRecvError::Disconnected))
+        }) {
+            pending_chain = deferred_chains.remove(i).1;
+        }
+    }
     // Check pending chained commands before reading from socket
     if !pending_chain.is_empty() {
         line = pending_chain.remove(0);
@@ -4564,7 +4579,15 @@ match cmd {
                 // command loop.
                 let inner = tx.inner.clone();
                 let target = tx.target.clone();
+                // Whatever follows in this command list waits for the shell,
+                // as in tmux. `done` is dropped when the thread ends, which
+                // is what releases it at the top of the loop.
+                let (done, done_rx) = mpsc::channel::<()>();
+                if !pending_chain.is_empty() {
+                    deferred_chains.push((done_rx, std::mem::take(&mut pending_chain)));
+                }
                 std::thread::spawn(move || {
+                    let _done = done;
                     let tx = TargetedSender::new(&inner, target);
                     match c.output() {
                         Ok(out) => {
@@ -6350,6 +6373,10 @@ mod tests_send_keys_literal_byte;
 #[cfg(test)]
 #[path = "../../tests-rs/test_refresh_client_flags.rs"]
 mod tests_refresh_client_flags;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_pr740_run_shell_reader.rs"]
+mod tests_pr740_run_shell_reader;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_set_option_control.rs"]
