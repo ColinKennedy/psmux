@@ -1820,9 +1820,13 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
         "jump-reverse" => { crate::copy_mode::jump_reverse(app); }
         "set-mark" => { crate::copy_mode::set_mark(app); }
         "jump-to-mark" => { crate::copy_mode::jump_to_mark(app); }
-        // tmux 3.3 calls this refresh-toggle; older tables and
-        // the #498 report use refresh-from-pane for the same key.
-        "refresh-from-pane" | "refresh-toggle" => { crate::copy_mode::toggle_refresh(app); }
+        // tmux 3.4 to 3.7c bind `r` to the one shot refresh-from-pane;
+        // OpenBSD-current names it refresh-now. tmux after 3.7c adds an
+        // automatic refresh behind refresh-on/off/toggle (discussion #694).
+        "refresh-from-pane" | "refresh-now" => { crate::copy_mode::refresh_from_pane(app); }
+        "refresh-toggle" => { crate::copy_mode::toggle_refresh(app); }
+        "refresh-on" => { crate::copy_mode::refresh_on(app); }
+        "refresh-off" => { crate::copy_mode::refresh_off(app); }
         "toggle-position" => { crate::copy_mode::toggle_position(app); }
         "next-paragraph" => {
             crate::copy_mode::move_next_paragraph(app);
@@ -3564,6 +3568,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // still hold one.  Cheap, idempotent, and the place where
                     // every frame passes through.
                     crate::copy_mode::sync_copy_snapshot(&mut app);
+                    // `refresh-on` / `refresh-toggle`: rebuild the snapshot when
+                    // the pane printed (tmux's 50 ms refresh timer).
+                    if crate::copy_mode::tick_auto_refresh(&mut app) {
+                        state_dirty = true;
+                    }
                     // Fast-path: nothing changed at all → 2-byte "NC" marker
                     // instead of cloning 50-100KB of JSON.
                     // Only allowed for persistent connections that already have

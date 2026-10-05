@@ -410,16 +410,29 @@ stays put, use the scrolling keys below.
 | `g` | Top of scrollback |
 | `G` | Bottom (live output) |
 | `z` | Centre the cursor line in the pane (scroll-middle) |
-| `r` | Toggle following live output (see below) |
+| `r` | Copy the pane's current output into copy mode once (refresh-from-pane, see below) |
 
 A full page is the pane height minus two lines and a half page is half the pane height, the same
 amounts tmux uses (`window_copy_pageup1` in `window-copy.c`). A pane two rows tall or shorter moves
 one line. The view moves and the cursor stays on its row, except at the top or bottom of the
 history, where the cursor is pulled along so repeated presses reach the first or last line.
 
-`r` is a psmux extension with no tmux equivalent. Copy mode normally anchors the view so new output
-cannot shift the text under your cursor. `r` releases that anchor, so the pane follows live output
-again and jumps to the bottom of the history. Press `r` again to re-anchor.
+Copy mode reads a copy of the pane taken when it opened, so new output cannot shift the text under
+your cursor. `r` is tmux's `refresh-from-pane`: it takes that copy again once, so everything the
+pane printed since becomes reachable, and it keeps the line at the top of the view where it was, the
+way tmux 3.7 does (`window_copy_cmd_refresh_from_pane` in `window-copy.c`). The new lines land
+below the view; `G` goes to them. Like tmux it clears the selection and stays in copy mode.
+`send-keys -X refresh-now` is the same command under the name OpenBSD's current manual uses.
+
+To follow output continuously instead, tmux after 3.7c has an automatic refresh, and psmux has it too:
+`send-keys -X refresh-on`, `refresh-off` and `refresh-toggle`. While it is on, copy mode takes a
+new copy whenever the pane prints. It follows the output while the cursor sits on the last row at the
+live bottom, keeps your place anywhere else, and pauses while a selection is being made. To get the
+newer tmux binding:
+
+```tmux
+bind-key -T copy-mode-vi r send-keys -X refresh-toggle
+```
 
 ### Screen Position
 

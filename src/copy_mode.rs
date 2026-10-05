@@ -66,6 +66,8 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_mark = None;
     app.copy_last_jump = None;
     app.copy_refresh_live = false;
+    app.copy_refresh_version = 0;
+    app.copy_refresh_at = None;
     // tmux sets `hide_position` from the `-H` flag every time the mode is
     // created (`window-copy.c` `window_copy_init`), so a plain entry always
     // shows the indicator. `enter_copy_mode_hidden` is the `-H` path.
@@ -1639,18 +1641,150 @@ pub fn jump_to_mark(app: &mut AppState) {
     app.copy_mark = Some(here);
 }
 
-/// Toggle whether the pane keeps following live output while in copy mode —
-/// r key (refresh-from-pane / refresh-toggle).
+/// Where the view lands after the snapshot is rebuilt with `new_filled` lines
+/// of history, given the old history size and scroll offset: the same line
+/// stays at the top of the screen, counted from the top of the history, as
+/// tmux's `window_copy_cmd_refresh_from_pane` keeps `oy_from_top`
+/// (window-copy.c at tag 3.7c). The second value is true when that line is no
+/// longer retained, in which case tmux parks the view on the oldest line with
+/// the cursor on the top row.
+pub fn refreshed_offset(old_filled: usize, old_offset: usize, new_filled: usize) -> (usize, bool) {
+    let from_top = old_filled - old_offset.min(old_filled);
+    if from_top <= new_filled {
+        (new_filled - from_top, false)
+    } else {
+        (new_filled, true)
+    }
+}
+
+/// Rebuild the focused pane's copy-mode snapshot from its live screen.
 ///
-/// psmux anchors the active pane while in copy mode (#494) so the view does
-/// not shift under the cursor. This releases that anchor so the pane tracks
-/// new output, and re-applies it on the next press.
+/// With `follow` the view goes to the live bottom with the cursor on the last
+/// row, which is what tmux's automatic refresh does while the cursor sits
+/// there (`window_copy_do_refresh`). Without it the reader keeps their place.
+/// Either way the selection is cleared, as `window_copy_size_changed` does
+/// after every re-clone. Returns false when the pane has no snapshot to
+/// rebuild.
+fn reclone_copy_snapshot(app: &mut AppState, follow: bool) -> bool {
+    let (old_filled, old_offset, new_filled, rows, cols) = {
+        let win = &mut app.windows[app.active_idx];
+        let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return false };
+        if p.live_term.is_none() {
+            return false;
+        }
+        let (old_filled, old_offset) = match p.term.lock() {
+            Ok(t) => (t.screen().scrollback_filled(), t.screen().scrollback()),
+            Err(_) => return false,
+        };
+        p.leave_copy_snapshot();
+        p.enter_copy_snapshot();
+        let new_filled = p.term.lock().map(|t| t.screen().scrollback_filled()).unwrap_or(0);
+        (old_filled, old_offset, new_filled, p.last_rows, p.last_cols)
+    };
+    let (want, clamped) = if follow { (0, false) } else { refreshed_offset(old_filled, old_offset, new_filled) };
+    let actual = {
+        let win = &mut app.windows[app.active_idx];
+        match active_pane_mut(&mut win.root, &win.active_path).and_then(|p| p.term.lock().ok()) {
+            Some(mut t) => {
+                t.screen_mut().set_scrollback(want);
+                t.screen().scrollback()
+            }
+            None => want,
+        }
+    };
+    app.copy_scroll_offset = actual;
+    app.copy_pos_scroll_offset = None;
+    let last_row = rows.saturating_sub(1);
+    let (r, c) = app.copy_pos.unwrap_or((last_row, 0));
+    let c = c.min(cols.saturating_sub(1));
+    app.copy_pos = Some(if follow {
+        (last_row, c)
+    } else if clamped {
+        (0, c)
+    } else {
+        (r.min(last_row), c)
+    });
+    // The mark is kept as an offset from the bottom: move it by the lines
+    // that were added underneath so it stays on its own line.
+    if let Some((so, mr, mc)) = app.copy_mark {
+        let grown = new_filled.saturating_sub(old_filled);
+        app.copy_mark = Some((so + grown, mr, mc));
+    }
+    clear_selection(app);
+    app.copy_needs_redraw = true;
+    true
+}
+
+/// `refresh-from-pane`, the `r` key: copy the pane's current screen into copy
+/// mode once, keeping the line at the top of the view where it was.
+///
+/// tmux 3.4 to 3.7c bind `r` to this one shot command
+/// (`window_copy_cmd_refresh_from_pane`, window-copy.c at tag 3.7c). It used to
+/// flip the #494 freeze off here, which stopped doing anything once copy mode
+/// moved onto a snapshot (d74f52a): a snapshot receives no output, so `r` left
+/// the view on the old screen and only reset the scroll position (discussion
+/// #694).
+pub fn refresh_from_pane(app: &mut AppState) {
+    reclone_copy_snapshot(app, false);
+}
+
+/// `refresh-on`: rebuild the snapshot automatically while the pane prints,
+/// tmux's `window_copy_refresh_start` (the `r` binding after tmux 3.7c).
+pub fn refresh_on(app: &mut AppState) {
+    if !app.copy_refresh_live {
+        app.copy_refresh_live = true;
+        app.copy_refresh_version = 0;
+        app.copy_refresh_at = None;
+    }
+}
+
+/// `refresh-off`: stop the automatic refresh.
+pub fn refresh_off(app: &mut AppState) {
+    app.copy_refresh_live = false;
+}
+
+/// `refresh-toggle`.
 pub fn toggle_refresh(app: &mut AppState) {
-    app.copy_refresh_live = !app.copy_refresh_live;
-    if app.copy_refresh_live {
-        // Following live output means sitting at the bottom of the history,
-        // which is where that output lands.
-        scroll_to_bottom(app);
+    if app.copy_refresh_live { refresh_off(app) } else { refresh_on(app) }
+}
+
+/// The automatic refresh's timer, run once per frame by the server: when the
+/// pane printed since the last rebuild, rebuild the snapshot, following the
+/// output only while the cursor is on the last row at the live bottom, and
+/// never while a selection is being made (tmux `window_copy_refresh_timer`).
+/// Returns true when the view changed.
+pub fn tick_auto_refresh(app: &mut AppState) -> bool {
+    if !app.copy_refresh_live || !matches!(app.mode, Mode::CopyMode) || app.copy_anchor.is_some() {
+        return false;
+    }
+    let (version, rows) = {
+        let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return false };
+        match active_pane(&win.root, &win.active_path) {
+            Some(p) => (p.data_version.load(std::sync::atomic::Ordering::Relaxed), p.last_rows),
+            None => return false,
+        }
+    };
+    if version == app.copy_refresh_version {
+        return false;
+    }
+    if app.copy_refresh_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(50)) {
+        return false;
+    }
+    let follow = app.copy_scroll_offset == 0
+        && app.copy_pos.map_or(true, |(r, _)| r + 1 >= rows);
+    let changed = reclone_copy_snapshot(app, follow);
+    app.copy_refresh_version = version;
+    app.copy_refresh_at = Some(std::time::Instant::now());
+    changed
+}
+
+/// `clear-selection`, tmux's `window_copy_clear_selection`: drop the selection
+/// and stay in copy mode. A line selection goes back to a character one, while
+/// the rectangle flag survives, as tmux keeps `rectflag` across it.
+pub fn clear_selection(app: &mut AppState) {
+    app.copy_anchor = None;
+    if app.copy_selection_mode == crate::types::SelectionMode::Line {
+        app.copy_selection_mode = crate::types::SelectionMode::Char;
     }
 }
 
@@ -2481,3 +2615,8 @@ mod test_issue704_toggle_position;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_copy_search_utf8.rs"]
 mod tests_issue712_copy_search_utf8;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_disc694_copy_mode_vi_parity.rs"]
+mod test_disc694_copy_mode_vi_parity;
+

@@ -1553,9 +1553,17 @@ pub struct AppState {
     /// Last f/F/t/T jump as (kind, char), so `;` (jump-again) and `,`
     /// (jump-reverse) can repeat it (#498).
     pub copy_last_jump: Option<(u8, char)>,
-    /// When true the pane keeps following live output while in copy mode
-    /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
+    /// Automatic refresh of the copy-mode snapshot from the live pane, tmux's
+    /// `refresh-on` / `refresh-off` / `refresh-toggle` (window-copy.c
+    /// `refresh_active`). Off by default. The one shot `refresh-from-pane`,
+    /// which `r` runs, does not touch it (#498, discussion #694).
     pub copy_refresh_live: bool,
+    /// The pane `data_version` the snapshot was last re-cloned at, so the
+    /// automatic refresh only rebuilds it when the pane printed something.
+    pub copy_refresh_version: u64,
+    /// When the automatic refresh last re-cloned, to space rebuilds the way
+    /// tmux's 50 ms `WINDOW_COPY_REFRESH_INTERVAL` timer does.
+    pub copy_refresh_at: Option<Instant>,
     /// When true the copy-mode position indicator is not drawn. Toggled by `P`
     /// (`toggle-position`) and set on entry by `copy-mode -H` (#704). It lives
     /// on the mode the way tmux's `hide_position` does, so leaving copy mode
@@ -2670,6 +2678,8 @@ impl AppState {
             copy_mark: None,
             copy_last_jump: None,
             copy_refresh_live: false,
+            copy_refresh_version: 0,
+            copy_refresh_at: None,
             copy_hide_position: false,
             copy_needs_redraw: false,
             named_registers: std::collections::HashMap::new(),

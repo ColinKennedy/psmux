@@ -1054,14 +1054,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('}') => { for _ in 0..copy_repeat { crate::copy_mode::move_next_paragraph(app); } }
                 // Centre the cursor line in the pane: z = scroll-middle
                 KeyCode::Char('z') => { crate::copy_mode::scroll_middle(app); }
-                // Mark, jump repeat and live-refresh toggle (#498).
+                // Mark, jump repeat (#498) and the one shot refresh-from-pane (#694).
                 // M-x must stay above the bare Char('x') matches, like the
                 // other ALT-qualified arms in this table.
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::jump_to_mark(app); }
                 KeyCode::Char('X') => { crate::copy_mode::set_mark(app); }
                 KeyCode::Char(';') => { for _ in 0..copy_repeat { crate::copy_mode::jump_again(app); } }
                 KeyCode::Char(',') => { for _ in 0..copy_repeat { crate::copy_mode::jump_reverse(app); } }
-                KeyCode::Char('r') => { crate::copy_mode::toggle_refresh(app); }
+                KeyCode::Char('r') => { crate::copy_mode::refresh_from_pane(app); }
                 KeyCode::Char('P') => { crate::copy_mode::toggle_position(app); }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
                 KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
@@ -3724,11 +3724,11 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         '}' => { for _ in 0..n { crate::copy_mode::move_next_paragraph(app); } }
         '%' => { crate::copy_mode::move_matching_bracket(app); }
         'z' => { crate::copy_mode::scroll_middle(app); }
-        // Mark, jump repeat and live-refresh toggle (#498)
+        // Mark, jump repeat (#498) and the one shot refresh-from-pane (#694)
         'X' => { crate::copy_mode::set_mark(app); }
         ';' => { for _ in 0..n { crate::copy_mode::jump_again(app); } }
         ',' => { for _ in 0..n { crate::copy_mode::jump_reverse(app); } }
-        'r' => { crate::copy_mode::toggle_refresh(app); }
+        'r' => { crate::copy_mode::refresh_from_pane(app); }
         // tmux binds P to toggle-position in BOTH default copy-mode tables
         // (`key-bindings.c`), so it is not gated on mode-keys here either.
         'P' => { crate::copy_mode::toggle_position(app); }

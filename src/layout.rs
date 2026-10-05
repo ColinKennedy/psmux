@@ -295,9 +295,6 @@ fn sync_copy_freeze(app: &mut AppState, in_copy_mode: bool) {
     // publishes `None`, so a stale endpoint cannot be picked up by the next
     // gesture.
     app.copy_pos_published = if in_copy_mode { app.copy_anchor.and(app.copy_pos) } else { None };
-    // `r` (refresh-from-pane, #498) releases the anchor so the pane tracks
-    // live output while copy mode stays open.
-    let in_copy_mode = in_copy_mode && !app.copy_refresh_live;
     fn walk(node: &mut Node, path: &mut Vec<usize>, target: Option<&[usize]>) -> Option<usize> {
         let mut synced = None;
         match node {
