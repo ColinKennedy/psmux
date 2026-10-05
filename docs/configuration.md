@@ -1087,7 +1087,15 @@ set -g exit-empty on
 
 With `destroy-unattached on`, the server process terminates as soon as the last client detaches. This is useful for single-use sessions.
 
-With `exit-empty off`, the server stays alive even after all sessions are closed, allowing new sessions to be created without restarting.
+With `exit-empty off`, an empty server stays alive. The tmux idiom for holding a private server before it has a session works as it does in tmux:
+
+```powershell
+psmux -S $sock start-server ';' set-option -g exit-empty off
+psmux -S $sock display-message -p "#{socket_path}`t#{pid}"   # answers before any session exists
+psmux -S $sock new-session -d -s work                        # lands in that same server process
+```
+
+psmux keeps one process per session, so its empty server is the namespace's standby server, made visible while it is unclaimed with `exit-empty off`. The first `new-session` in that namespace becomes that process, whatever flags it carries (`-f` is ignored, as tmux ignores it for a running server). With `exit-empty on` (the default), a plain `start-server` leaves nothing to query, as in tmux, where the server exits at once. Unlike tmux, killing the last session of a namespace still ends that session's process even with `exit-empty off`.
 
 ## Dead Panes and Respawn
 

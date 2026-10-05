@@ -931,7 +931,10 @@ pub(crate) fn apply_set_option(
         "renumber-windows" => { app.renumber_windows = matches!(value, "on" | "true" | "1" | "yes"); }
         "remain-on-exit" => { app.remain_on_exit = matches!(value, "on" | "true" | "1" | "yes"); }
         "destroy-unattached" => { app.destroy_unattached = matches!(value, "on" | "true" | "1" | "yes"); }
-        "exit-empty" => { app.exit_empty = matches!(value, "on" | "true" | "1" | "yes"); }
+        "exit-empty" => {
+            app.exit_empty = matches!(value, "on" | "true" | "1" | "yes");
+            crate::server::sync_held_marker(app);
+        }
         "set-titles" => { app.set_titles = matches!(value, "on" | "true" | "1" | "yes"); }
         "set-titles-string" => { app.set_titles_string = value.to_string(); }
         "default-command" | "default-shell" => {

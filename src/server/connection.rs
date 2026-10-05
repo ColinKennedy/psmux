@@ -24,6 +24,39 @@ fn clear_inherit(s: &TcpStream) {
 #[cfg(not(windows))]
 fn clear_inherit(_s: &TcpStream) {}
 
+/// Run `psmux [-L <this server's namespace>] new-session <args>` and return
+/// what it printed, with a failure turned into an `ERROR:` line (#734 follow
+/// up). The routing variables this server carries are removed so the child
+/// decides everything from the namespace alone.
+fn run_cli_new_session(args: &[&str]) -> String {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
+    let mut cmd = std::process::Command::new(&exe);
+    if let Some(ns) = crate::server::server_namespace() {
+        cmd.arg("-L").arg(ns);
+    }
+    cmd.arg("new-session").args(args);
+    for var in ["PSMUX_TARGET_SESSION", "PSMUX_TARGET_FULL", crate::session::ROUTE_WARM_ENV] {
+        cmd.env_remove(var);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    { use crate::platform::HideWindowCommandExt; cmd.hide_window(); }
+    match cmd.output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let err = err.trim().trim_start_matches("psmux:").trim();
+                let err = if err.is_empty() { "new-session failed" } else { err };
+                text.push_str(&format!("ERROR: {}\n", err));
+            }
+            text
+        }
+        Err(e) => format!("ERROR: new-session: {}\n", e),
+    }
+}
+
 /// The write side of a client connection: one logical reply, one send.
 ///
 /// The default `Write::write_fmt` hands every piece of a format string to
@@ -4722,13 +4755,27 @@ match cmd {
                     let _ = write_stream.flush();
                 }
                 if !persistent { break; }
+            } else if detached && !persistent {
+                // A one-shot detached new-session (typically the chosen branch
+                // of a CLI `if-shell`, which forwards it here) runs the real
+                // CLI new-session in this server's namespace, so it gets
+                // everything the CLI does: the namespace prefix (this handler
+                // used to create the session in the DEFAULT namespace whatever
+                // server it reached), the warm claim, a held server's claim
+                // (#734: the session lands in the empty server the caller
+                // already identified), and the `-P`/`-F` report.
+                let out = run_cli_new_session(&args);
+                let _ = write!(write_stream, "{}", out);
+                let _ = write_stream.flush();
+                break;
             } else {
 
-            // Note: socket_name (from -L flag) is not directly available here;
-            // the client-side handler in commands.rs has it via app.socket_name.
-            let name = sess_name.unwrap_or_else(|| crate::session::next_session_name(None));
+            let ns = crate::server::server_namespace();
+            let name = sess_name.unwrap_or_else(|| crate::session::next_session_name(ns.as_deref()));
 
-            let port_file_base = name.clone();
+            // The session belongs to this server's namespace (#734 follow
+            // up): the bare name used to put it in the default namespace.
+            let port_file_base = crate::session::namespaced_session_base(ns.as_deref(), &name);
 
             let port_path = crate::paths::port_file(&port_file_base);
 
@@ -4754,6 +4801,10 @@ match cmd {
                 // Spawn new server
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
                 let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), name.clone()];
+                if let Some(ref n) = ns {
+                    server_args.push("-L".into());
+                    server_args.push(n.clone());
+                }
 
                 if let Some(ref dir) = start_dir {
                     server_args.push("-d".into());

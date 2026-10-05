@@ -906,6 +906,97 @@ fn surface_config_warnings(since_epoch: u64, detached: bool) {
         eprintln!("psmux:   {}", w);
     }
 }
+/// Make sure namespace `ns` has its `__warm__` standby (`warm_base`) running,
+/// spawning one if not. With `wait`, return only once it answers commands,
+/// because `start-server` is about to hand it its queued commands (#734).
+fn ensure_standby_server(ns: Option<&str>, warm_base: &str, wait: bool) -> io::Result<()> {
+    let warm_port_path = crate::paths::port_file(warm_base);
+    let answering = || -> bool {
+        let Some(port) = std::fs::read_to_string(&warm_port_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+        else {
+            return false;
+        };
+        let Some(key) = crate::session::read_session_key(warm_base).ok().filter(|k| !k.is_empty()) else {
+            return false;
+        };
+        let addr = format!("127.0.0.1:{}", port);
+        matches!(
+            crate::session::send_auth_cmd_response(&addr, &key, b"display-message -p '#{pid}'\n"),
+            Ok(ref r) if r.trim().parse::<u32>().is_ok()
+        )
+    };
+    let reachable = std::fs::read_to_string(&warm_port_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .map(|port| {
+            std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", port).parse().unwrap(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+        })
+        .unwrap_or(false);
+    let mut spawned_pid: Option<u32> = None;
+    if !reachable {
+        // Clean up a stale port file if any, then spawn the standby.
+        let _ = std::fs::remove_file(&warm_port_path);
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
+        let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
+        if let Some(l) = ns {
+            server_args.push("-L".into());
+            server_args.push(l.to_string());
+        }
+        // Detect terminal size for the warm server
+        if let Ok((tw, th)) = crossterm::terminal::size() {
+            let h = th.saturating_sub(1);
+            if tw > 0 && h > 0 {
+                server_args.push("-x".into());
+                server_args.push(tw.to_string());
+                server_args.push("-y".into());
+                server_args.push(h.to_string());
+            }
+        }
+        #[cfg(windows)]
+        {
+            spawned_pid = Some(crate::platform::spawn_server_hidden(&exe, &server_args)?);
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = std::process::Command::new(&exe);
+            for a in &server_args { cmd.arg(a); }
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            let child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn warm server: {e}")))?;
+            spawned_pid = Some(child.id());
+        }
+    }
+    if !wait {
+        return Ok(());
+    }
+    // Same bound as new-session's readiness wait: a healthy server answers in
+    // well under a second, and a dead one is caught by the pid check.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if answering() {
+            return Ok(());
+        }
+        if let Some(pid) = spawned_pid {
+            if !crate::platform::process_is_alive(pid) {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("psmux: server failed to start");
+    std::process::exit(1);
+}
+
 fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
@@ -1126,10 +1217,15 @@ fn run_main() -> io::Result<()> {
         // most-recent-session fallback are applied inside resolve_routing_target.
         let psmux_dir = std::path::PathBuf::from(crate::paths::psmux_dir());
         let tmux_env = env::var("TMUX").ok();
-        if let Some(name) = crate::session::resolve_routing_target(
+        // A command queued after `start-server` (issue #734) carries the
+        // standby that start-server brought up, so it reaches that server
+        // even before anything has made it the namespace's held one.
+        let route_warm = env::var(crate::session::ROUTE_WARM_ENV).ok();
+        if let Some(name) = crate::session::resolve_routing_target_with(
             l_socket_name.as_deref(),
             tmux_env.as_deref(),
             &psmux_dir,
+            route_warm.as_deref(),
         ) {
             env::set_var("PSMUX_TARGET_SESSION", &name);
         }
@@ -1305,12 +1401,20 @@ fn run_main() -> io::Result<()> {
             } else {
                 crate::session::KillScope::Namespace(l_socket_name.as_deref())
             };
+            // A held standby (#734) is the namespace's live, empty server:
+            // killing it is a kill, as tmux's kill-server of an empty server
+            // exits 0.
+            let held_before = crate::session::held_warm_base_in(
+                std::path::Path::new(&psmux_dir),
+                l_socket_name.as_deref(),
+            )
+            .is_some();
             let killed = crate::session::kill_servers_in_scope(
                 std::path::Path::new(&psmux_dir),
                 scope,
                 None,
             );
-            if killed == 0 && !kill_all {
+            if killed == 0 && !kill_all && !held_before {
                 // tmux's client cannot connect and prints `no server running on
                 // <socket>` at exit 1; scripts (`tmux kill-server 2>/dev/null ||
                 // true`) lean on that code, and an exit 0 here used to claim a
@@ -1497,7 +1601,14 @@ fn run_main() -> io::Result<()> {
                         }
                     }
                 }
-                if live_servers == 0 {
+                // A held standby (#734) is a live server with no session:
+                // tmux lists nothing and exits 0 for it.
+                let held_server = crate::session::held_warm_base_in(
+                    std::path::Path::new(&dir),
+                    l_socket_name.as_deref(),
+                )
+                .is_some();
+                if live_servers == 0 && !held_server {
                     // Nothing answered: no user session in this namespace (a
                     // `__warm__` standby is not a session). tmux prints
                     // `no server running on <socket>` and exits 1 here, and
@@ -1826,6 +1937,8 @@ fn run_main() -> io::Result<()> {
                 // a warm server or attach to a remote one). The readiness gate
                 // below uses it to fail fast if the freshly spawned server dies.
                 let mut server_pid: Option<u32> = None;
+                // Set when a held standby (#734) was claimed for this session.
+                let mut held_claim_taken = false;
                 if std::path::Path::new(&port_path).exists() {
                     // Verify server is actually running
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
@@ -1872,7 +1985,24 @@ fn run_main() -> io::Result<()> {
                 let warm_disabled = std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false)
                     || crate::config::is_warm_disabled_by_config();
                 let has_custom_config = f_config_file.is_some() || std::env::var("PSMUX_CONFIG_FILE").is_ok();
-                let claimed_warm = if !warm_disabled && !has_custom_config && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() && env_vars.is_empty() && init_width.is_none() && init_height.is_none() {
+                // Issue #734: when the namespace's standby is its live EMPTY
+                // server (held by `start-server` + `exit-empty off`, or just
+                // started by the `start-server` this command is queued
+                // behind), it is the server tmux would create this session
+                // in, so the session must land in it whatever the flags are:
+                // a caller that captured the server's pid relies on it. The
+                // eligibility rules below exist because a pool spare must be
+                // indistinguishable from a cold spawn; here the opposite is
+                // asked for, and the flags a claim cannot carry are applied
+                // to the claimed session afterwards. `-f` is ignored exactly
+                // as tmux ignores it for a server that is already running.
+                let held_claim = group_target.is_none()
+                    && crate::session::cli_must_claim_standby(
+                        &std::path::PathBuf::from(&psmux_dir),
+                        l_socket_name.as_deref(),
+                        env::var(crate::session::ROUTE_WARM_ENV).ok().as_deref(),
+                    );
+                let claimed_warm = if held_claim || (!warm_disabled && !has_custom_config && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() && env_vars.is_empty() && init_width.is_none() && init_height.is_none()) {
                     let warm_base = if let Some(ref l) = l_socket_name {
                         format!("{}____warm__", l)
                     } else {
@@ -1899,9 +2029,14 @@ fn run_main() -> io::Result<()> {
                             ).is_ok() {
                                 let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
                                 if !warm_key.is_empty() {
-                                    let client_cwd = std::env::current_dir()
-                                        .ok()
-                                        .and_then(|p| p.to_str().map(|s| s.to_string()));
+                                    // A held claim (#734) may carry `-c`: the
+                                    // standby re-homes to it as it would to the
+                                    // client's directory.
+                                    let client_cwd = start_dir.clone().or_else(|| {
+                                        std::env::current_dir()
+                                            .ok()
+                                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                                    });
                                     // -p carries this shell's PSMUX_PRIORITY (or the
                                     // config value) onto the standby, which set its
                                     // own class before this shell existed (#608).
@@ -2008,6 +2143,7 @@ fn run_main() -> io::Result<()> {
                     } else { false }
                 } else { false };
 
+                held_claim_taken = held_claim && claimed_warm;
                 if !claimed_warm {
                 // Cold path: spawn a background server from scratch
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
@@ -2225,6 +2361,31 @@ fn run_main() -> io::Result<()> {
                 // is visible in the terminal / scrollback.
                 surface_config_warnings(attempt_start_epoch, detached);
 
+                // A held claim (#734) took the standby whatever the flags were;
+                // what the claim itself could not carry is applied now, so the
+                // session matches what a cold spawn with these flags creates.
+                if held_claim_taken {
+                    for line in crate::session::held_claim_followups(
+                        initial_cmd.as_deref(),
+                        raw_cmd_args.as_deref(),
+                        start_dir.as_deref(),
+                        init_width,
+                        init_height,
+                    ) {
+                        match send_control_with_response(line) {
+                            Ok(resp) if resp.trim_start().starts_with("ERROR") => {
+                                eprintln!("psmux: {}", resp.trim_start().trim_start_matches("ERROR:").trim());
+                                std::process::exit(1);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("psmux: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+
                 if detached {
                     // The readiness wait above already confirmed the initial
                     // window exists. If -P, print the pane info before returning.
@@ -2236,7 +2397,10 @@ fn run_main() -> io::Result<()> {
                             // tmux default: new-session -P prints "session_name:"
                             "#{session_name}:".to_string()
                         };
-                        match send_control_with_response(format!("display-message -p {}\n", fmt)) {
+                        // Quoted, so the server's tokenizer does not re-split
+                        // the format: tabs and runs of spaces in a `-F` record
+                        // used to come back as single spaces (#734 follow up).
+                        match send_control_with_response(format!("display-message -p {}\n", crate::util::quote_arg(&fmt))) {
                             Ok(resp) => { let trimmed = resp.trim(); if !trimmed.is_empty() { println!("{}", trimmed); } }
                             Err(_) => {}
                         }
@@ -4971,60 +5135,55 @@ fn run_main() -> io::Result<()> {
                 send_control(format!("{}\n", parts.join(" ")))?;
                 return Ok(());
             }
-            // start-server / warmup - Pre-spawn a warm server
+            // start-server / warmup - start the namespace's server
             "start-server" | "start" | "warmup" => {
-                // Pre-spawn a warm __warm__ server so the next new-session is
-                // instant.  Also triggers Windows Defender's scan cache on the
-                // binary, eliminating the ~200-400ms first-run penalty.
-                let warm_base = if let Some(ref l) = l_socket_name {
-                    format!("{}____warm__", l)
-                } else {
-                    "__warm__".to_string()
-                };
-                let warm_port_path = crate::paths::port_file(&warm_base);
-                // Check if warm server is already running
-                let already_running = if std::path::Path::new(&warm_port_path).exists() {
-                    if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            std::net::TcpStream::connect_timeout(
-                                &format!("127.0.0.1:{}", port).parse().unwrap(),
-                                Duration::from_millis(100),
-                            ).is_ok()
-                        } else { false }
-                    } else { false }
-                } else { false };
-                if already_running {
+                // psmux's form of a running server with no session is the
+                // namespace's __warm__ standby, so start-server makes sure one
+                // is up. That also pre-warms the next new-session and Windows
+                // Defender's scan cache on the binary (~200-400ms first run).
+                //
+                // Issue #734: tmux runs the commands queued after start-server
+                // (`start-server \; set -g exit-empty off`) on the server it
+                // just started (client.c sets CLIENT_STARTSERVER when any
+                // command in the list carries CMD_STARTSERVER, then sends the
+                // whole list). psmux used to return here and drop the queue,
+                // so exit-empty never changed and the empty server stayed
+                // invisible. The queue now runs, one command per invocation
+                // of this binary with the same global flags, against the
+                // standby, which is therefore waited for first.
+                let warm_base = crate::session::warm_base_for(l_socket_name.as_deref());
+                let tail_start = command_index.map(|i| i + 1).unwrap_or(args.len());
+                let queue = crate::cli::split_command_queue(&args[tail_start..]);
+                // The first group is start-server's own (empty) argument list.
+                let queued: Vec<Vec<String>> = queue.into_iter().skip(1).collect();
+                ensure_standby_server(l_socket_name.as_deref(), &warm_base, !queued.is_empty())?;
+                if queued.is_empty() {
                     return Ok(());
                 }
-                // Clean up stale port file if any
-                let _ = std::fs::remove_file(&warm_port_path);
-                // Spawn the warm server
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
-                let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
-                if let Some(ref l) = l_socket_name {
-                    server_args.push("-L".into());
-                    server_args.push(l.clone());
-                }
-                // Detect terminal size for the warm server
-                if let Ok((tw, th)) = crossterm::terminal::size() {
-                    let h = th.saturating_sub(1);
-                    if tw > 0 && h > 0 {
-                        server_args.push("-x".into());
-                        server_args.push(tw.to_string());
-                        server_args.push("-y".into());
-                        server_args.push(h.to_string());
+                let globals: Vec<String> = command_index
+                    .map(|i| args[1..i].to_vec())
+                    .unwrap_or_default();
+                // Commands before the first new-session address the standby
+                // directly. A new-session claims it, and from then on the
+                // queue follows ordinary routing to the session it became.
+                let mut route_to_standby = true;
+                for command in queued {
+                    let mut child = std::process::Command::new(&exe);
+                    child.args(&globals).args(&command);
+                    if route_to_standby {
+                        child.env(crate::session::ROUTE_WARM_ENV, &warm_base);
+                    } else {
+                        child.env_remove(crate::session::ROUTE_WARM_ENV);
                     }
-                }
-                #[cfg(windows)]
-                crate::platform::spawn_server_hidden(&exe, &server_args)?;
-                #[cfg(not(windows))]
-                {
-                    let mut cmd = std::process::Command::new(&exe);
-                    for a in &server_args { cmd.arg(a); }
-                    cmd.stdin(std::process::Stdio::null());
-                    cmd.stdout(std::process::Stdio::null());
-                    cmd.stderr(std::process::Stdio::null());
-                    let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn warm server: {e}")))?;
+                    let status = child.status()?;
+                    if matches!(command[0].as_str(), "new-session" | "new") {
+                        route_to_standby = false;
+                    }
+                    // tmux stops a command list at the first error.
+                    if !status.success() {
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
                 }
                 return Ok(());
             }

@@ -45,6 +45,31 @@ use crate::control;
 use crate::format::{expand_format, format_list_windows, format_list_panes, set_buffer_idx_override, set_named_buffer_override};
 use crate::help;
 
+/// The `-L` namespace this server process belongs to (`None` = default), set
+/// once at startup. The connection threads, which have no `AppState`, need it
+/// so a command they run on the server's behalf stays in its namespace.
+pub(crate) static SERVER_NAMESPACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// [`SERVER_NAMESPACE`], `None` before startup has set it.
+pub(crate) fn server_namespace() -> Option<String> {
+    SERVER_NAMESPACE.get().cloned().flatten()
+}
+
+/// Keep a standby's `.held` marker in step with its state (issue #734).
+///
+/// tmux's `start-server` followed by `set -g exit-empty off` leaves a live
+/// server with no session (server.c `server_loop`: with exit-empty off the
+/// loop never ends for want of sessions). psmux's nearest equivalent is the
+/// namespace's `__warm__` standby, which is invisible to routing on purpose.
+/// While a standby is unclaimed with exit-empty off it publishes this marker,
+/// and routing then answers from it as the namespace's empty server. Turning
+/// exit-empty back on, being claimed, or shutting down withdraws it.
+pub(crate) fn sync_held_marker(app: &AppState) {
+    if app.is_warm_server() {
+        crate::session::set_held_marker(&app.port_file_base(), !app.exit_empty);
+    }
+}
+
 /// End this server process: tell control clients, drop the registry entry,
 /// detach the clients and kill the pane children. Never returns.
 ///
@@ -76,6 +101,7 @@ fn shutdown_this_server(app: &mut AppState) -> ! {
     let keypath = crate::paths::key_file(&app.port_file_base());
     let _ = std::fs::remove_file(&regpath);
     let _ = std::fs::remove_file(&keypath);
+    let _ = std::fs::remove_file(crate::paths::held_file(app.port_file_base()));
     // Kill all child processes using a single process snapshot
     tree::kill_all_children_batch(&mut app.windows);
     // Kill warm pane's child (process::exit skips Drop)
@@ -1915,6 +1941,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         app.format_job_rx = Some(fjrx);
     }
     app.socket_name = socket_name;
+    let _ = SERVER_NAMESPACE.set(app.socket_name.clone());
     // Pin the `-S` path (#730) now, from the environment this server was
     // started with, before a warm claim or set-environment can touch it.
     let _ = crate::socket_path::server_recorded_path(app.socket_name.as_deref());
@@ -4778,6 +4805,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // so the CLI knows the rename completed before attaching.
                     let old_path = crate::paths::port_file(&app.port_file_base());
                     let old_keypath = crate::paths::key_file(&app.port_file_base());
+                    // A held standby (#734) stops being the namespace's empty
+                    // server the moment it becomes a session.
+                    crate::session::set_held_marker(&app.port_file_base(), false);
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {

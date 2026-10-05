@@ -522,6 +522,53 @@ pub fn outer_target_scan_end<S: AsRef<str>>(command: &str, args: &[S]) -> usize 
         .unwrap_or(args.len())
 }
 
+/// Split a command line that is already in argv form into its commands, the
+/// way tmux's `cmd_parse_from_arguments` does (cmd-parse.y:1063-1130): an
+/// argument ending in `;` ends the current command, the text before the `;`
+/// (if any) staying its last argument, and `\;` at the end of an argument is a
+/// literal `;`. Empty commands are dropped. Used for the queue a
+/// `start-server` carries (issue #734).
+pub fn split_command_queue<S: AsRef<str>>(args: &[S]) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for arg in args {
+        let mut copy = arg.as_ref().to_string();
+        let mut end = false;
+        if copy == "\\;" {
+            // A lone `\;` is the separator a Windows shell passes through
+            // unchanged where a POSIX shell would have removed the
+            // backslash; psmux's own command splitter reads it the same way.
+            commands.push(std::mem::take(&mut current));
+            continue;
+        }
+        if copy.ends_with(';') {
+            copy.pop();
+            if copy.ends_with('\\') {
+                copy.pop();
+                copy.push(';');
+            } else {
+                end = true;
+            }
+        }
+        if !end || !copy.is_empty() {
+            current.push(copy);
+        }
+        if end {
+            commands.push(std::mem::take(&mut current));
+        }
+    }
+    commands.push(current);
+    // The first group is kept even when empty (it belongs to the command
+    // the caller already dispatched on); later empty ones are dropped.
+    let mut out = Vec::with_capacity(commands.len());
+    for (i, c) in commands.into_iter().enumerate() {
+        if i == 0 || !c.is_empty() {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Same as [`normalize_flag_equals`] but operates on `Vec<&str>`, returning
 /// owned strings (needed where the caller already has borrowed slices).
 pub fn normalize_flag_equals_borrowed(args: &[&str]) -> Vec<String> {
@@ -1597,3 +1644,7 @@ mod tests_discussion571_attached_global_args;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue692_select_window_targets.rs"]
 mod tests_issue692_select_window_targets;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_command_queue.rs"]
+mod tests_issue734_command_queue;
