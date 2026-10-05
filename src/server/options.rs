@@ -347,6 +347,10 @@ fn effective_when_unset(name: &str) -> Option<&'static str> {
         "copy-mode-line-numbers" => "off",
         "copy-mode-line-number-style" => "fg=brightblack",
         "copy-mode-current-line-number-style" => "fg=yellow,bold",
+        // tmux's defaults, options-table.c at 3.4 to 3.7b (#694).
+        "copy-mode-match-style" => "bg=cyan,fg=black",
+        "copy-mode-current-match-style" => "bg=magenta,fg=black",
+        "copy-mode-mark-style" => "bg=red,fg=black",
         // TERM handed to panes when default-terminal was never set.
         "default-terminal" => "xterm-256color",
         // The pane borders are the exception to the `default` rule below. tmux

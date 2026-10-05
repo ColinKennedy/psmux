@@ -1553,9 +1553,29 @@ pub struct AppState {
     /// Last f/F/t/T jump as (kind, char), so `;` (jump-again) and `,`
     /// (jump-reverse) can repeat it (#498).
     pub copy_last_jump: Option<(u8, char)>,
-    /// When true the pane keeps following live output while in copy mode
-    /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
+    /// Automatic refresh of the copy-mode snapshot from the live pane, tmux's
+    /// `refresh-on` / `refresh-off` / `refresh-toggle` (window-copy.c
+    /// `refresh_active`). Off by default. The one shot `refresh-from-pane`,
+    /// which `r` runs, does not touch it (#498, discussion #694).
     pub copy_refresh_live: bool,
+    /// The pane `data_version` the snapshot was last re-cloned at, so the
+    /// automatic refresh only rebuilds it when the pane printed something.
+    pub copy_refresh_version: u64,
+    /// Where the cursor sits in the copy-mode search or goto-line prompt,
+    /// counted in characters back from the end of the input, so text typed
+    /// at the end (the common case) needs no bookkeeping. tmux keeps it as
+    /// `prompt_index` (prompt.c) (discussion #694).
+    pub copy_prompt_back: usize,
+    /// Earlier copy-mode searches, oldest first, for Up and Down in the search
+    /// prompt (tmux's per type prompt history, prompt.c `prompt_up_history`).
+    pub copy_search_history: Vec<String>,
+    /// The history entry Up and Down are on while the prompt is open.
+    pub copy_search_history_pos: Option<usize>,
+    /// Whether the search matches are drawn highlighted. tmux keeps them
+    /// (`searchmark`) from a search until a command marked CLEAR_ALWAYS runs,
+    /// such as begin-selection, clear-selection, rectangle-toggle or set-mark
+    /// (window-copy.c `window_copy_command`) (discussion #694).
+    pub copy_search_marks: bool,
     /// When true the copy-mode position indicator is not drawn. Toggled by `P`
     /// (`toggle-position`) and set on entry by `copy-mode -H` (#704). It lives
     /// on the mode the way tmux's `hide_position` does, so leaving copy mode
@@ -2670,6 +2690,11 @@ impl AppState {
             copy_mark: None,
             copy_last_jump: None,
             copy_refresh_live: false,
+            copy_refresh_version: 0,
+            copy_prompt_back: 0,
+            copy_search_history: Vec::new(),
+            copy_search_history_pos: None,
+            copy_search_marks: false,
             copy_hide_position: false,
             copy_needs_redraw: false,
             named_registers: std::collections::HashMap::new(),

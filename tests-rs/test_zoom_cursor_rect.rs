@@ -25,7 +25,7 @@ fn leaf(id: usize, active: bool) -> LayoutJson {
         copy_cursor_col: None,
         content: Vec::new(),
         rows_v2: Vec::new(),
-        title: None,
+        title: None, copy_hl: Vec::new(),
     }
 }
 

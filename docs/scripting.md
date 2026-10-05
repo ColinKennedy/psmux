@@ -1344,7 +1344,7 @@ tmux), and `unbind-key -a -T copy-mode-vi` takes all of them.
 |------|-------------|
 | `begin-selection` | Start a selection at the cursor |
 | `stop-selection` | Stop extending the selection without clearing it |
-| `clear-selection` | Discard the selection |
+| `clear-selection` | Discard the selection and stay in copy mode (Escape with `mode-keys vi`) |
 | `select-line` | Select the whole current line |
 | `select-word` | Select the word under the cursor |
 | `rectangle-toggle` | Toggle block (rectangular) selection |
@@ -1374,11 +1374,10 @@ viewport scrolls to bring an off screen match into view.
 | Name | Description |
 |------|-------------|
 | `cancel` | Leave copy mode |
-| `refresh-from-pane` | Toggle live refresh of the copy mode view from the running pane (psmux extension) |
-| `refresh-toggle` | Synonym of `refresh-from-pane` (psmux extension) |
+| `refresh-from-pane` | Copy the pane's current output into copy mode once, keeping the line at the top of the view (tmux 3.4 to 3.7c, bound to `r`). `refresh-now` is an accepted synonym |
+| `refresh-on` / `refresh-off` / `refresh-toggle` | Turn on, off or toggle automatic refresh: copy mode takes a new copy whenever the pane prints, following the output while the cursor is on the last row at the live bottom, and pausing during a selection (tmux after 3.7c) |
 
-`copy-line`, `refresh-from-pane` and `refresh-toggle` have no tmux equivalent. Everything else in
-these tables is named the same way it is in tmux.
+`copy-line` has no tmux equivalent. Everything else in these tables is named the same way it is in tmux.
 
 ## Session Groups
 

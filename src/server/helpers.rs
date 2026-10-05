@@ -105,6 +105,23 @@ pub(crate) fn append_copy_ln_json(app: &AppState, buf: &mut String) {
     if app.copy_hide_position && in_copy {
         buf.push_str(",\"copy_hide_position\":true");
     }
+    // The highlight styles ride along only when a copy-mode frame has
+    // something to highlight and the user changed them (#694).
+    if in_copy && (app.copy_mark.is_some() || app.copy_search_marks) {
+        for (opt, key) in [
+            ("copy-mode-match-style", "copy_mode_match_style"),
+            ("copy-mode-current-match-style", "copy_mode_current_match_style"),
+            ("copy-mode-mark-style", "copy_mode_mark_style"),
+        ] {
+            if let Some(st) = app.user_options.get(opt) {
+                buf.push_str(",\"");
+                buf.push_str(key);
+                buf.push_str("\":\"");
+                buf.push_str(&json_escape_string(st));
+                buf.push('"');
+            }
+        }
+    }
     let Some(cln) = cln else { buf.push('}'); return; };
     buf.push_str(",\"copy_mode_line_numbers\":\"");
     buf.push_str(&json_escape_string(cln));

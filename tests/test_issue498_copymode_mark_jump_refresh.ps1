@@ -4,7 +4,8 @@
 #   M-x  jump-to-mark        swap cursor and mark (twice returns you)
 #   ;    jump-again          repeat the last f/F/t/T
 #   ,    jump-reverse        repeat the last f/F/t/T the other way
-#   r    refresh-from-pane   toggle following live output while in copy mode
+#   r    refresh-from-pane   copy the pane's current output in once (tmux 3.7,
+#                            discussion #694; it used to toggle a live follow)
 #
 # Before the fix set-mark/jump-to-mark and refresh had no implementation at
 # all, and jump-again/jump-reverse were empty stubs in the server -X match
@@ -148,14 +149,17 @@ if (Park "axbxcxdxe A5") {
     $b = St
     X "refresh-from-pane"
     $a = St
-    if ($a.scroll -eq 0 -and $b.scroll -gt 0) {
-        Write-Pass "-X refresh-from-pane released the copy-mode anchor and followed live output (scroll $($b.scroll) -> $($a.scroll))"
+    # tmux 3.7 keeps the line at the top of the view: with nothing new
+    # printed the offset stays where it was (window_copy_cmd_refresh_from_pane).
+    if ($a.scroll -ge $b.scroll -and $b.scroll -gt 0) {
+        Write-Pass "-X refresh-from-pane kept the reader's place (scroll $($b.scroll) -> $($a.scroll))"
     } else {
-        Write-Fail "-X refresh-from-pane: expected scroll to drop to 0 from $($b.scroll), got $($a.scroll)"
+        Write-Fail "-X refresh-from-pane: expected the scroll offset to stay at or above $($b.scroll), got $($a.scroll)"
     }
     if ((St).inmode -eq "1") { Write-Pass "refresh-from-pane stays in copy mode" }
     else { Write-Fail "refresh-from-pane dropped out of copy mode" }
-    X "refresh-toggle"   # toggle back off, alias name
+    X "refresh-toggle"   # tmux's automatic refresh, on and straight off again
+    X "refresh-toggle"
     if ((St).inmode -eq "1") { Write-Pass "refresh-toggle alias accepted and still in copy mode" }
     else { Write-Fail "refresh-toggle alias dropped out of copy mode" }
 } else { Write-Fail "Could not park on A5 for the refresh test" }

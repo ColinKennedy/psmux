@@ -20,7 +20,12 @@ use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
 /// search (#335). Without this the screen looks frozen because the search
 /// input is otherwise invisible.
 fn refresh_search_prompt(app: &mut AppState) {
-    if let Mode::CopySearch { .. } = app.mode {
+    if let Mode::CopySearch { ref input, .. } = app.mode {
+        // A prompt that has just opened is empty: its cursor is at the end
+        // whatever an earlier prompt left behind.
+        if input.is_empty() {
+            app.copy_prompt_back = 0;
+        }
         if let Some(prompt) = crate::copy_mode::copy_prompt_text(&app.mode) {
             // display-time = 0 keeps the message sticky until cleared.
             app.status_message = Some((prompt, Instant::now(), Some(0)));
@@ -34,7 +39,10 @@ fn refresh_search_prompt(app: &mut AppState) {
 /// the server here and the command prompt lives in the client, so the prompt
 /// is the search prompt's twin rather than a command prompt.
 fn refresh_goto_prompt(app: &mut AppState) {
-    if let Mode::CopyGoto { .. } = app.mode {
+    if let Mode::CopyGoto { ref input } = app.mode {
+        if input.is_empty() {
+            app.copy_prompt_back = 0;
+        }
         if let Some(prompt) = crate::copy_mode::copy_prompt_text(&app.mode) {
             // display-time = 0 keeps the message sticky until cleared.
             app.status_message = Some((prompt, Instant::now(), Some(0)));
@@ -52,6 +60,8 @@ fn open_goto_prompt(app: &mut AppState) {
 fn close_copy_prompt(app: &mut AppState) {
     app.mode = Mode::CopyMode;
     app.status_message = None;
+    app.copy_prompt_back = 0;
+    app.copy_search_history_pos = None;
 }
 
 /// Look up a copy-mode key binding for `key`, honouring `mode-keys`.
@@ -940,9 +950,10 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 return Ok(false);
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(']') => {
+                KeyCode::Char('q') | KeyCode::Char(']') => {
                     exit_copy_mode(app);
                 }
+                KeyCode::Esc => { crate::copy_mode::escape_key(app); }
                 // Ctrl+C exits copy mode (tmux parity, fixes #25)
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     exit_copy_mode(app);
@@ -1054,14 +1065,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 KeyCode::Char('}') => { for _ in 0..copy_repeat { crate::copy_mode::move_next_paragraph(app); } }
                 // Centre the cursor line in the pane: z = scroll-middle
                 KeyCode::Char('z') => { crate::copy_mode::scroll_middle(app); }
-                // Mark, jump repeat and live-refresh toggle (#498).
+                // Mark, jump repeat (#498) and the one shot refresh-from-pane (#694).
                 // M-x must stay above the bare Char('x') matches, like the
                 // other ALT-qualified arms in this table.
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => { crate::copy_mode::jump_to_mark(app); }
                 KeyCode::Char('X') => { crate::copy_mode::set_mark(app); }
                 KeyCode::Char(';') => { for _ in 0..copy_repeat { crate::copy_mode::jump_again(app); } }
                 KeyCode::Char(',') => { for _ in 0..copy_repeat { crate::copy_mode::jump_reverse(app); } }
-                KeyCode::Char('r') => { crate::copy_mode::toggle_refresh(app); }
+                KeyCode::Char('r') => { crate::copy_mode::refresh_from_pane(app); }
                 KeyCode::Char('P') => { crate::copy_mode::toggle_position(app); }
                 // Line motions: 0 = start, $ = end, ^ = first non-blank
                 KeyCode::Char('0') => { crate::copy_mode::move_to_line_start(app); }
@@ -1084,15 +1095,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     // tmux parity #62: rectangle-toggle (not begin-selection)
                     crate::copy_mode::toggle_rectangle(app);
                 }
-                KeyCode::Char('V') => {
-                    // Start line-wise selection (vi visual-line mode)
-                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                        app.copy_anchor = Some((r,c));
-                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                        app.copy_pos = Some((r,c));
-                        app.copy_selection_mode = crate::types::SelectionMode::Line;
-                    }
-                }
+                KeyCode::Char('V') => { crate::copy_mode::select_line(app); }
                 KeyCode::Char('o') => {
                     // Swap cursor and anchor
                     if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
@@ -1117,12 +1120,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                 }
                 // Space = begin selection (vi mode), Enter = copy-selection-and-cancel
                 KeyCode::Char(' ') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                        app.copy_anchor = Some((r,c));
-                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                        app.copy_pos = Some((r,c));
-                        app.copy_selection_mode = crate::types::SelectionMode::Char;
-                    }
+                    crate::copy_mode::begin_selection(app);
                 }
                 KeyCode::Enter => {
                     // Copy selection and exit copy mode (vi Enter)
@@ -3548,10 +3546,9 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     }
     // In copy-search mode, append characters to the search input
     if matches!(app.mode, Mode::CopySearch { .. }) {
+        let back = app.copy_prompt_back;
         if let Mode::CopySearch { ref mut input, .. } = app.mode {
-            for c in text.chars() {
-                input.push(c);
-            }
+            crate::copy_mode::prompt_insert(input, back, text);
         }
         refresh_search_prompt(app);
         return Ok(());
@@ -3559,10 +3556,9 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     // Same for the goto-line prompt: while it is open the copy-mode keys are
     // inactive and every character is part of the line number.
     if matches!(app.mode, Mode::CopyGoto { .. }) {
+        let back = app.copy_prompt_back;
         if let Mode::CopyGoto { ref mut input } = app.mode {
-            for c in text.chars() {
-                input.push(c);
-            }
+            crate::copy_mode::prompt_insert(input, back, text);
         }
         refresh_goto_prompt(app);
         return Ok(());
@@ -3686,9 +3682,10 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         return Ok(());
     }
     match c {
-        'q' | ']' | '\x1b' => {
+        'q' | ']' => {
             exit_copy_mode(app);
         }
+        '\x1b' => { crate::copy_mode::escape_key(app); }
         'h' => { for _ in 0..n { move_copy_cursor(app, -1, 0); } }
         'l' => { for _ in 0..n { move_copy_cursor(app, 1, 0); } }
         'k' => { for _ in 0..n { move_copy_cursor(app, 0, -1); } }
@@ -3724,11 +3721,11 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         '}' => { for _ in 0..n { crate::copy_mode::move_next_paragraph(app); } }
         '%' => { crate::copy_mode::move_matching_bracket(app); }
         'z' => { crate::copy_mode::scroll_middle(app); }
-        // Mark, jump repeat and live-refresh toggle (#498)
+        // Mark, jump repeat (#498) and the one shot refresh-from-pane (#694)
         'X' => { crate::copy_mode::set_mark(app); }
         ';' => { for _ in 0..n { crate::copy_mode::jump_again(app); } }
         ',' => { for _ in 0..n { crate::copy_mode::jump_reverse(app); } }
-        'r' => { crate::copy_mode::toggle_refresh(app); }
+        'r' => { crate::copy_mode::refresh_from_pane(app); }
         // tmux binds P to toggle-position in BOTH default copy-mode tables
         // (`key-bindings.c`), so it is not gated on mode-keys here either.
         'P' => { crate::copy_mode::toggle_position(app); }
@@ -3741,30 +3738,15 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         '0' => { crate::copy_mode::move_to_line_start(app); }
         '$' => { crate::copy_mode::move_to_line_end(app); }
         '^' => { crate::copy_mode::move_to_first_nonblank(app); }
-        ' ' => {
-            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r, c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r, c));
-                app.copy_selection_mode = crate::types::SelectionMode::Char;
-            }
-        }
-        'v' => {
-            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r, c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r, c));
-                app.copy_selection_mode = crate::types::SelectionMode::Char;
-            }
-        }
-        'V' => {
-            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r, c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r, c));
-                app.copy_selection_mode = crate::types::SelectionMode::Line;
-            }
-        }
+        ' ' => { crate::copy_mode::begin_selection(app); }
+        // tmux binds v to rectangle-toggle in copy-mode-vi (key-bindings.c:705)
+        // and Space to begin-selection (:656); the legacy dispatcher and the
+        // docs already said so, but this path, the one the client uses, began
+        // a selection (discussion #694). The emacs table has no v in tmux, and
+        // psmux keeps its old begin-selection there.
+        'v' if app.mode_keys == "vi" => { crate::copy_mode::toggle_rectangle(app); }
+        'v' => { crate::copy_mode::begin_selection(app); }
+        'V' => { crate::copy_mode::select_line(app); }
         'o' => {
             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
                 app.copy_anchor = Some(p);
@@ -3888,25 +3870,45 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // --- Copy-search mode: handle esc/enter/backspace ---
     if matches!(app.mode, Mode::CopySearch { .. }) {
         match k {
-            "esc" => { app.mode = Mode::CopyMode; app.status_message = None; }
+            // tmux's prompt closes on Escape, C-c and C-g (prompt.c).
+            "esc" | "escape" | "C-c" | "c-c" | "C-g" | "c-g" => { close_copy_prompt(app); }
             "enter" => {
                 if let Mode::CopySearch { ref input, forward } = app.mode {
                     let query = input.clone();
                     let fwd = forward;
+                    crate::copy_mode::remember_search(app, &query);
                     app.copy_search_query = query.clone();
                     app.copy_search_forward = fwd;
                     // search_copy_mode parks the cursor on the first match and
                     // scrolls the viewport to it when it is in history (#612).
                     search_copy_mode(app, &query, fwd);
                 }
-                app.mode = Mode::CopyMode;
-                app.status_message = None;
+                close_copy_prompt(app);
             }
-            "backspace" => {
-                if let Mode::CopySearch { ref mut input, .. } = app.mode { input.pop(); }
+            _ => {
+                let mut back = app.copy_prompt_back;
+                let mut recall = None;
+                if let Mode::CopySearch { ref mut input, .. } = app.mode {
+                    match crate::copy_mode::prompt_edit(input, &mut back, k) {
+                        crate::copy_mode::PromptEdit::HistoryUp => recall = Some(true),
+                        crate::copy_mode::PromptEdit::HistoryDown => recall = Some(false),
+                        _ => {}
+                    }
+                }
+                app.copy_prompt_back = back;
+                if let Some(up) = recall {
+                    let mut pos = app.copy_search_history_pos;
+                    if let Some(text) = crate::copy_mode::search_history_step(&app.copy_search_history, &mut pos, up) {
+                        if let Mode::CopySearch { ref mut input, .. } = app.mode { *input = text; }
+                        app.copy_prompt_back = 0;
+                    }
+                    app.copy_search_history_pos = pos;
+                }
+                // Every key redraws the prompt: the SendKey handler clears the
+                // status line before it gets here, so a key the prompt did not
+                // use (an arrow, before this) left it open but invisible.
                 refresh_search_prompt(app);
             }
-            _ => {}
         }
         return Ok(());
     }
@@ -3939,11 +3941,15 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 close_copy_prompt(app);
                 crate::copy_mode::run_goto_line(app, &typed);
             }
-            "backspace" | "bspace" => {
-                if let Mode::CopyGoto { ref mut input } = app.mode { input.pop(); }
+            "C-c" | "c-c" | "C-g" | "c-g" => { close_copy_prompt(app); }
+            _ => {
+                let mut back = app.copy_prompt_back;
+                if let Mode::CopyGoto { ref mut input } = app.mode {
+                    crate::copy_mode::prompt_edit(input, &mut back, k);
+                }
+                app.copy_prompt_back = back;
                 refresh_goto_prompt(app);
             }
-            _ => {}
         }
         return Ok(());
     }
@@ -3976,9 +3982,11 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             }
         }
         match k {
-            "esc" | "q" => {
+            "q" => {
                 exit_copy_mode(app);
             }
+            // vi: clear-selection, emacs: cancel (key-bindings.c:654, :577).
+            "esc" | "escape" => { crate::copy_mode::escape_key(app); }
             "enter" => {
                 // Copy selection and exit copy mode (vi Enter)
                 if app.copy_anchor.is_some() {
@@ -3986,15 +3994,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 }
                 exit_copy_mode(app);
             }
-            "space" => {
-                // Begin selection (like v in vi mode)
-                if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                    app.copy_anchor = Some((r, c));
-                    app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                    app.copy_pos = Some((r, c));
-                    app.copy_selection_mode = crate::types::SelectionMode::Char;
-                }
-            }
+            "space" => { crate::copy_mode::begin_selection(app); }
             "up" => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, -1); } }
             "down" => { for _ in 0..copy_repeat { move_copy_cursor(app, 0, 1); } }
             "pageup" => { for _ in 0..copy_repeat { crate::copy_mode::page_scroll(app, true, false); } }

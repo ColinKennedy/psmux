@@ -27,7 +27,7 @@ fn copy_leaf(w: u16, h: u16, cy: u16, oy: usize) -> LayoutJson {
         active: true, copy_mode: true, scroll_offset: oy, view_offset: oy,
         sel_start_row: None, sel_start_col: None, sel_end_row: None, sel_end_col: None,
         sel_mode: None, copy_cursor_row: Some(cy), copy_cursor_col: Some(0),
-        content, rows_v2: Vec::new(), title: None,
+        content, rows_v2: Vec::new(), title: None, copy_hl: Vec::new(),
     }
 }
 
@@ -43,7 +43,7 @@ fn render_gutters(leaf: &LayoutJson, mode: CopyLnMode, hsize: usize, w: u16, h: 
     let copy_ln = Some(CopyLnRender {
         mode, hsize, hide_position: false,
         num_style: Style::default().fg(Color::DarkGray),
-        cur_style: Style::default().fg(Color::Yellow),
+        cur_style: Style::default().fg(Color::Yellow), hl: Default::default(),
     });
     term.draw(|f| {
         let area = Rect::new(0, 0, w, h);
@@ -150,7 +150,7 @@ fn gutter_shifts_content_right() {
         let copy_ln = Some(CopyLnRender {
             mode: CopyLnMode::Relative, hsize: 0, hide_position: false,
             num_style: Style::default().fg(Color::DarkGray),
-            cur_style: Style::default().fg(Color::Yellow),
+            cur_style: Style::default().fg(Color::Yellow), hl: Default::default(),
         });
         term.draw(|f| {
             let area = Rect::new(0, 0, 40, h);

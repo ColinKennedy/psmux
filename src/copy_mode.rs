@@ -66,6 +66,8 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_mark = None;
     app.copy_last_jump = None;
     app.copy_refresh_live = false;
+    app.copy_refresh_version = 0;
+    app.copy_search_marks = false;
     // tmux sets `hide_position` from the `-H` flag every time the mode is
     // created (`window-copy.c` `window_copy_init`), so a plain entry always
     // shows the indicator. `enter_copy_mode_hidden` is the `-H` path.
@@ -536,6 +538,7 @@ pub fn move_to_line_end(app: &mut AppState) {
 
 /// Move cursor to first non-blank character (^ key in vi copy mode).
 pub fn move_to_first_nonblank(app: &mut AppState) {
+    app.copy_search_marks = false;
     if let Some((r, _)) = get_copy_pos(app) {
         if let Some((text, _)) = read_row_text(app, r) {
             let col = text.find(|c: char| !c.is_whitespace()).unwrap_or(0) as u16;
@@ -787,6 +790,7 @@ pub fn page_scroll(app: &mut AppState, up: bool, half_page: bool) {
 /// pre-server dispatcher only ever switched block selection ON, so a second
 /// press could not switch it back off.
 pub fn toggle_rectangle(app: &mut AppState) {
+    app.copy_search_marks = false;
     app.copy_selection_mode = match app.copy_selection_mode {
         crate::types::SelectionMode::Rect => crate::types::SelectionMode::Char,
         _ => crate::types::SelectionMode::Rect,
@@ -1403,6 +1407,7 @@ pub fn search_copy_mode(app: &mut AppState, query: &str, forward: bool) {
     }
 
     if let Some(&(abs, col, _)) = app.copy_search_matches.first() {
+        app.copy_search_marks = true;
         scroll_to_abs_line(app, abs, col);
     }
 }
@@ -1618,6 +1623,7 @@ fn set_scroll_offset(app: &mut AppState, offset: usize) {
 
 /// Record the cursor position as the mark — X key (set-mark).
 pub fn set_mark(app: &mut AppState) {
+    app.copy_search_marks = false;
     if let Some((r, c)) = get_copy_pos(app) {
         app.copy_mark = Some((app.copy_scroll_offset, r, c));
     }
@@ -1629,6 +1635,7 @@ pub fn set_mark(app: &mut AppState) {
 /// just moving to the mark, so pressing it twice brings you back to where you
 /// jumped from.
 pub fn jump_to_mark(app: &mut AppState) {
+    app.copy_search_marks = false;
     let (mark_scroll, mark_row, mark_col) = match app.copy_mark { Some(m) => m, None => return };
     let here = match get_copy_pos(app) {
         Some((r, c)) => (app.copy_scroll_offset, r, c),
@@ -1639,18 +1646,345 @@ pub fn jump_to_mark(app: &mut AppState) {
     app.copy_mark = Some(here);
 }
 
-/// Toggle whether the pane keeps following live output while in copy mode —
-/// r key (refresh-from-pane / refresh-toggle).
+/// Where the view lands after the snapshot is rebuilt with `new_filled` lines
+/// of history, given the old history size and scroll offset: the same line
+/// stays at the top of the screen, counted from the top of the history, as
+/// tmux's `window_copy_cmd_refresh_from_pane` keeps `oy_from_top`
+/// (window-copy.c at tag 3.7c). The second value is true when that line is no
+/// longer retained, in which case tmux parks the view on the oldest line with
+/// the cursor on the top row.
+pub fn refreshed_offset(old_filled: usize, old_offset: usize, new_filled: usize) -> (usize, bool) {
+    let from_top = old_filled - old_offset.min(old_filled);
+    if from_top <= new_filled {
+        (new_filled - from_top, false)
+    } else {
+        (new_filled, true)
+    }
+}
+
+/// Rebuild the focused pane's copy-mode snapshot from its live screen.
 ///
-/// psmux anchors the active pane while in copy mode (#494) so the view does
-/// not shift under the cursor. This releases that anchor so the pane tracks
-/// new output, and re-applies it on the next press.
+/// With `follow` the view goes to the live bottom with the cursor on the last
+/// row, which is what tmux's automatic refresh does while the cursor sits
+/// there (`window_copy_do_refresh`). Without it the reader keeps their place.
+/// Either way the selection is cleared, as `window_copy_size_changed` does
+/// after every re-clone. Returns false when the pane has no snapshot to
+/// rebuild.
+fn reclone_copy_snapshot(app: &mut AppState, follow: bool) -> bool {
+    let (old_filled, old_offset, new_filled, rows, cols) = {
+        let win = &mut app.windows[app.active_idx];
+        let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return false };
+        if p.live_term.is_none() {
+            return false;
+        }
+        let (old_filled, old_offset) = match p.term.lock() {
+            Ok(t) => (t.screen().scrollback_filled(), t.screen().scrollback()),
+            Err(_) => return false,
+        };
+        p.leave_copy_snapshot();
+        p.enter_copy_snapshot();
+        let new_filled = p.term.lock().map(|t| t.screen().scrollback_filled()).unwrap_or(0);
+        (old_filled, old_offset, new_filled, p.last_rows, p.last_cols)
+    };
+    let (want, clamped) = if follow { (0, false) } else { refreshed_offset(old_filled, old_offset, new_filled) };
+    let actual = {
+        let win = &mut app.windows[app.active_idx];
+        match active_pane_mut(&mut win.root, &win.active_path).and_then(|p| p.term.lock().ok()) {
+            Some(mut t) => {
+                t.screen_mut().set_scrollback(want);
+                t.screen().scrollback()
+            }
+            None => want,
+        }
+    };
+    app.copy_scroll_offset = actual;
+    app.copy_pos_scroll_offset = None;
+    let last_row = rows.saturating_sub(1);
+    let (r, c) = app.copy_pos.unwrap_or((last_row, 0));
+    let c = c.min(cols.saturating_sub(1));
+    app.copy_pos = Some(if follow {
+        (last_row, c)
+    } else if clamped {
+        (0, c)
+    } else {
+        (r.min(last_row), c)
+    });
+    // The mark is kept as an offset from the bottom: move it by the lines
+    // that were added underneath so it stays on its own line.
+    if let Some((so, mr, mc)) = app.copy_mark {
+        let grown = new_filled.saturating_sub(old_filled);
+        app.copy_mark = Some((so + grown, mr, mc));
+    }
+    clear_selection(app);
+    app.copy_needs_redraw = true;
+    true
+}
+
+/// `refresh-from-pane`, the `r` key: copy the pane's current screen into copy
+/// mode once, keeping the line at the top of the view where it was.
+///
+/// tmux 3.4 to 3.7c bind `r` to this one shot command
+/// (`window_copy_cmd_refresh_from_pane`, window-copy.c at tag 3.7c). It used to
+/// flip the #494 freeze off here, which stopped doing anything once copy mode
+/// moved onto a snapshot (d74f52a): a snapshot receives no output, so `r` left
+/// the view on the old screen and only reset the scroll position (discussion
+/// #694).
+pub fn refresh_from_pane(app: &mut AppState) {
+    reclone_copy_snapshot(app, false);
+}
+
+/// `refresh-on`: rebuild the snapshot automatically while the pane prints,
+/// tmux's `window_copy_refresh_start` (the `r` binding after tmux 3.7c).
+pub fn refresh_on(app: &mut AppState) {
+    if !app.copy_refresh_live {
+        app.copy_refresh_live = true;
+        app.copy_refresh_version = 0;
+    }
+}
+
+/// `refresh-off`: stop the automatic refresh.
+pub fn refresh_off(app: &mut AppState) {
+    app.copy_refresh_live = false;
+}
+
+/// `refresh-toggle`.
 pub fn toggle_refresh(app: &mut AppState) {
-    app.copy_refresh_live = !app.copy_refresh_live;
-    if app.copy_refresh_live {
-        // Following live output means sitting at the bottom of the history,
-        // which is where that output lands.
-        scroll_to_bottom(app);
+    if app.copy_refresh_live { refresh_off(app) } else { refresh_on(app) }
+}
+
+/// The automatic refresh, run for every frame the server builds: when the
+/// pane printed since the last rebuild, rebuild the snapshot, following the
+/// output only while the cursor is on the last row at the live bottom, and
+/// never while a selection is being made (tmux `window_copy_refresh_timer`).
+/// Returns true when the view changed.
+pub fn tick_auto_refresh(app: &mut AppState) -> bool {
+    if !app.copy_refresh_live || !matches!(app.mode, Mode::CopyMode) || app.copy_anchor.is_some() {
+        return false;
+    }
+    let (version, rows) = {
+        let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return false };
+        match active_pane(&win.root, &win.active_path) {
+            Some(p) => (p.data_version.load(std::sync::atomic::Ordering::Relaxed), p.last_rows),
+            None => return false,
+        }
+    };
+    // tmux polls on a 50 ms timer; psmux runs this once per frame, and frames
+    // are already coalesced, so a rebuild is due whenever the pane printed.
+    if version == app.copy_refresh_version {
+        return false;
+    }
+    let follow = app.copy_scroll_offset == 0
+        && app.copy_pos.map_or(true, |(r, _)| r + 1 >= rows);
+    let changed = reclone_copy_snapshot(app, follow);
+    app.copy_refresh_version = version;
+    changed
+}
+
+/// What a key did to the input of a copy-mode prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptEdit {
+    /// The key edited the input or moved the cursor.
+    Edited,
+    /// Up or C-p: the caller recalls an older entry from the history.
+    HistoryUp,
+    /// Down or C-n: a newer entry.
+    HistoryDown,
+    /// Not a line editing key.
+    Other,
+}
+
+/// Apply one line editing key to a copy-mode prompt's `input`, whose cursor
+/// sits `back` characters before the end. The keys are the subset of tmux's
+/// prompt editor (prompt.c `prompt_key`, the `process_key` switch) that has a
+/// meaning here: Left, Right, Home, End and their emacs spellings C-b, C-f,
+/// C-a, C-e, Backspace and Delete at the cursor, C-u clears, C-k cuts to the
+/// end, C-w cuts the word before the cursor, and Space inserts a space, which
+/// arrives as a key of its own and used to be dropped (discussion #694).
+pub fn prompt_edit(input: &mut String, back: &mut usize, key: &str) -> PromptEdit {
+    let mut chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut b = (*back).min(len);
+    let idx = len - b;
+    let result = match key.to_ascii_lowercase().as_str() {
+        "space" => { chars.insert(idx, ' '); PromptEdit::Edited }
+        "left" | "c-b" => { if b < len { b += 1; } PromptEdit::Edited }
+        "right" | "c-f" => { b = b.saturating_sub(1); PromptEdit::Edited }
+        "home" | "c-a" => { b = len; PromptEdit::Edited }
+        "end" | "c-e" => { b = 0; PromptEdit::Edited }
+        "backspace" | "bspace" | "c-h" => {
+            if idx > 0 { chars.remove(idx - 1); }
+            PromptEdit::Edited
+        }
+        "delete" | "dc" | "c-d" => {
+            if b > 0 { chars.remove(idx); b -= 1; }
+            PromptEdit::Edited
+        }
+        "c-u" => { chars.clear(); b = 0; PromptEdit::Edited }
+        "c-k" => { chars.truncate(idx); b = 0; PromptEdit::Edited }
+        "c-w" => {
+            let mut start = idx;
+            while start > 0 && chars[start - 1] == ' ' { start -= 1; }
+            while start > 0 && chars[start - 1] != ' ' { start -= 1; }
+            chars.drain(start..idx);
+            PromptEdit::Edited
+        }
+        "up" | "c-p" => PromptEdit::HistoryUp,
+        "down" | "c-n" => PromptEdit::HistoryDown,
+        _ => PromptEdit::Other,
+    };
+    *input = chars.into_iter().collect();
+    *back = b;
+    result
+}
+
+/// Insert typed text at a copy-mode prompt's cursor.
+pub fn prompt_insert(input: &mut String, back: usize, text: &str) {
+    let len = input.chars().count();
+    let idx = len - back.min(len);
+    let at = input.char_indices().nth(idx).map_or(input.len(), |(i, _)| i);
+    input.insert_str(at, text);
+}
+
+/// Step through the search history the way tmux's prompt does: Up goes to
+/// older entries and stops at the oldest, Down goes back towards the newest
+/// and then to an empty line. Returns the text to show, or None when there is
+/// nothing to move to.
+pub fn search_history_step(history: &[String], pos: &mut Option<usize>, up: bool) -> Option<String> {
+    if history.is_empty() {
+        return None;
+    }
+    if up {
+        let next = match *pos { None => history.len() - 1, Some(p) => p.saturating_sub(1) };
+        *pos = Some(next);
+        Some(history[next].clone())
+    } else {
+        match *pos {
+            None => None,
+            Some(p) if p + 1 < history.len() => {
+                *pos = Some(p + 1);
+                Some(history[p + 1].clone())
+            }
+            Some(_) => {
+                *pos = None;
+                Some(String::new())
+            }
+        }
+    }
+}
+
+/// Remember an accepted search for the prompt history, skipping a repeat of
+/// the newest entry, as tmux's `prompt_add_history` does.
+pub fn remember_search(app: &mut AppState, query: &str) {
+    if query.is_empty() || app.copy_search_history.last().map(|s| s.as_str()) == Some(query) {
+        return;
+    }
+    app.copy_search_history.push(query.to_string());
+    if app.copy_search_history.len() > 100 {
+        app.copy_search_history.remove(0);
+    }
+}
+
+/// `begin-selection`, the Space key: start a selection at the copy cursor.
+///
+/// tmux's `window_copy_start_selection` leaves `rectflag` alone, so a
+/// rectangle toggled on with `v` before the selection starts is the shape the
+/// selection takes. A line selection (`V`) is a different command and does
+/// not carry over.
+pub fn begin_selection(app: &mut AppState) {
+    app.copy_search_marks = false;
+    if let Some((r, c)) = get_copy_pos(app) {
+        app.copy_anchor = Some((r, c));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+        app.copy_pos = Some((r, c));
+        if app.copy_selection_mode == crate::types::SelectionMode::Line {
+            app.copy_selection_mode = crate::types::SelectionMode::Char;
+        }
+    }
+}
+
+/// `select-line`, the `V` key: select the cursor's line.
+pub fn select_line(app: &mut AppState) {
+    app.copy_search_marks = false;
+    if let Some((r, c)) = get_copy_pos(app) {
+        app.copy_anchor = Some((r, c));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+        app.copy_pos = Some((r, c));
+        app.copy_selection_mode = crate::types::SelectionMode::Line;
+    }
+}
+
+/// Highlight kinds in [`copy_highlights`]: a search match, the match under
+/// the cursor, the marked line, and the marked cell itself.
+pub const HL_MATCH: u16 = 0;
+pub const HL_CURRENT_MATCH: u16 = 1;
+pub const HL_MARK_LINE: u16 = 2;
+pub const HL_MARK_CELL: u16 = 3;
+
+/// The highlighted spans on the focused pane's copy-mode screen, as
+/// `[row, first column, last column, kind]` in screen cells, for the client to
+/// paint with `copy-mode-match-style`, `copy-mode-current-match-style` and
+/// `copy-mode-mark-style`.
+///
+/// This is what tmux's `window_copy_update_style` (window-copy.c) does per
+/// cell: the marked line takes the mark style with the marked cell's colours
+/// swapped, every search match on screen takes the match style, and the match
+/// the cursor is on takes the current match style. Matches are only drawn
+/// while `copy_search_marks` says the last search still owns the screen
+/// (discussion #694).
+pub fn copy_highlights(app: &AppState) -> Vec<[u16; 4]> {
+    let mut out = Vec::new();
+    let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return out };
+    let p = match active_pane(&win.root, &win.active_path) { Some(p) => p, None => return out };
+    let (rows, cols) = (p.last_rows, p.last_cols);
+    if rows == 0 || cols == 0 {
+        return out;
+    }
+    let hist = p.term.lock().map(|t| t.screen().scrollback_filled()).unwrap_or(0);
+    let so = app.copy_scroll_offset.min(hist);
+    if let Some((mark_so, mr, mc)) = app.copy_mark {
+        let row = mr as i64 + so as i64 - mark_so as i64;
+        if row >= 0 && row < rows as i64 {
+            out.push([row as u16, 0, cols - 1, HL_MARK_LINE]);
+            out.push([row as u16, mc.min(cols - 1), mc.min(cols - 1), HL_MARK_CELL]);
+        }
+    }
+    if app.copy_search_marks {
+        let top = hist - so;
+        let (cr, cc) = app.copy_pos.unwrap_or((u16::MAX, 0));
+        for &(abs, c0, c1) in &app.copy_search_matches {
+            if abs < top || abs >= top + rows as usize || c1 <= c0 || c0 >= cols {
+                continue;
+            }
+            let row = (abs - top) as u16;
+            let last = (c1 - 1).min(cols - 1);
+            let kind = if row == cr && cc >= c0 && cc <= last { HL_CURRENT_MATCH } else { HL_MATCH };
+            out.push([row, c0, last, kind]);
+        }
+    }
+    out
+}
+
+/// The Escape key in copy mode. tmux binds it to `clear-selection` in
+/// `copy-mode-vi` and to `cancel` in `copy-mode` (key-bindings.c:654 and
+/// :577), so with `mode-keys vi` it drops the selection and stays in copy
+/// mode, with nothing to do when there is no selection (measured in tmux 3.4:
+/// `pane_in_mode` stays 1), and `q` is the key that leaves (discussion #694).
+pub fn escape_key(app: &mut AppState) {
+    if app.mode_keys == "vi" {
+        clear_selection(app);
+    } else {
+        exit_copy_mode(app);
+    }
+}
+
+/// `clear-selection`, tmux's `window_copy_clear_selection`: drop the selection
+/// and stay in copy mode. A line selection goes back to a character one, while
+/// the rectangle flag survives, as tmux keeps `rectflag` across it.
+pub fn clear_selection(app: &mut AppState) {
+    app.copy_search_marks = false;
+    app.copy_anchor = None;
+    if app.copy_selection_mode == crate::types::SelectionMode::Line {
+        app.copy_selection_mode = crate::types::SelectionMode::Char;
     }
 }
 
@@ -2251,6 +2585,7 @@ pub fn move_prev_paragraph(app: &mut AppState) {
 /// same buffer line and the view moves under it, clamped by how much
 /// scrollback is actually available in that direction.
 pub fn scroll_middle(app: &mut AppState) {
+    app.copy_search_marks = false;
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
@@ -2279,6 +2614,7 @@ pub fn scroll_middle(app: &mut AppState) {
 
 /// Move to matching bracket — % key
 pub fn move_matching_bracket(app: &mut AppState) {
+    app.copy_search_marks = false;
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
     let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return };
     let p = match active_pane(&win.root, &win.active_path) { Some(p) => p, None => return };
@@ -2481,3 +2817,8 @@ mod test_issue704_toggle_position;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_copy_search_utf8.rs"]
 mod tests_issue712_copy_search_utf8;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_disc694_copy_mode_vi_parity.rs"]
+mod test_disc694_copy_mode_vi_parity;
+

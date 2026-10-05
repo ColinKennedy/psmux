@@ -145,14 +145,14 @@ fn indicator_row(hide_position: bool) -> String {
         active: true, copy_mode: true, scroll_offset: 68, view_offset: 68,
         sel_start_row: None, sel_start_col: None, sel_end_row: None, sel_end_col: None,
         sel_mode: None, copy_cursor_row: Some(0), copy_cursor_col: Some(0),
-        content, rows_v2: Vec::new(), title: None,
+        content, rows_v2: Vec::new(), title: None, copy_hl: Vec::new(),
     };
     let copy_ln = Some(CopyLnRender {
         mode: crate::copy_line_numbers::CopyLnMode::Off,
         hsize: 173,
         hide_position,
         num_style: Style::default().fg(Color::DarkGray),
-        cur_style: Style::default().fg(Color::Yellow),
+        cur_style: Style::default().fg(Color::Yellow), hl: Default::default(),
     });
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend).unwrap();

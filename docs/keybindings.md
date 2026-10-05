@@ -410,16 +410,29 @@ stays put, use the scrolling keys below.
 | `g` | Top of scrollback |
 | `G` | Bottom (live output) |
 | `z` | Centre the cursor line in the pane (scroll-middle) |
-| `r` | Toggle following live output (see below) |
+| `r` | Copy the pane's current output into copy mode once (refresh-from-pane, see below) |
 
 A full page is the pane height minus two lines and a half page is half the pane height, the same
 amounts tmux uses (`window_copy_pageup1` in `window-copy.c`). A pane two rows tall or shorter moves
 one line. The view moves and the cursor stays on its row, except at the top or bottom of the
 history, where the cursor is pulled along so repeated presses reach the first or last line.
 
-`r` is a psmux extension with no tmux equivalent. Copy mode normally anchors the view so new output
-cannot shift the text under your cursor. `r` releases that anchor, so the pane follows live output
-again and jumps to the bottom of the history. Press `r` again to re-anchor.
+Copy mode reads a copy of the pane taken when it opened, so new output cannot shift the text under
+your cursor. `r` is tmux's `refresh-from-pane`: it takes that copy again once, so everything the
+pane printed since becomes reachable, and it keeps the line at the top of the view where it was, the
+way tmux 3.7 does (`window_copy_cmd_refresh_from_pane` in `window-copy.c`). The new lines land
+below the view; `G` goes to them. Like tmux it clears the selection and stays in copy mode.
+`send-keys -X refresh-now` is the same command under the name OpenBSD's current manual uses.
+
+To follow output continuously instead, tmux after 3.7c has an automatic refresh, and psmux has it too:
+`send-keys -X refresh-on`, `refresh-off` and `refresh-toggle`. While it is on, copy mode takes a
+new copy whenever the pane prints. It follows the output while the cursor sits on the last row at the
+live bottom, keeps your place anywhere else, and pauses while a selection is being made. To get the
+newer tmux binding:
+
+```tmux
+bind-key -T copy-mode-vi r send-keys -X refresh-toggle
+```
 
 ### Screen Position
 
@@ -446,7 +459,8 @@ again and jumps to the bottom of the history. Press `r` again to re-anchor.
 | `X` | Set the mark at the cursor |
 | `Alt+x` | Exchange the cursor and the mark |
 
-`Alt+x` swaps rather than jumps, matching tmux. Pressing it twice returns you to where you started.
+`Alt+x` swaps rather than jumps, matching tmux. Pressing it twice returns you to where you started. The marked line is drawn in
+`copy-mode-mark-style` (`bg=red,fg=black`) with the marked cell's colours swapped, as tmux draws it.
 
 ### Bracket / Paragraph
 
@@ -463,15 +477,16 @@ again and jumps to the bottom of the history. Press `r` again to re-anchor.
 | `Space` | Begin character selection at the cursor |
 | `V` | Begin line selection at the cursor |
 | `Ctrl+Space` | Set the selection anchor at the cursor |
-| `v` | Toggle rectangle mode on the selection (does not start one) |
-| `Ctrl+v` | Force rectangle mode on the selection |
+| `v` / `Ctrl+v` | Toggle rectangle mode (does not start a selection) |
 | `o` | Swap cursor/anchor ends |
+| `Esc` | Clear the selection and stay in copy mode (`mode-keys vi`) |
 
 **psmux follows tmux here, not vi.** In vi, `v` starts a character selection. In tmux and in psmux,
 `v` is `rectangle-toggle`: it flips the selection between character mode and block mode and does not
 set an anchor, so pressing `v` on its own selects nothing. Use `Space` (or `Ctrl+Space`) to start a
-selection and `V` to start a line selection. `Ctrl+v` differs from `v` in that it always switches to
-rectangle mode rather than toggling out of it. If you want vi muscle memory, rebind it:
+selection and `V` to start a line selection. Pressed before `Space`, `v` makes the selection a
+rectangle from the start, as in tmux. Builds before discussion #694 began a character selection on
+`v` despite this table; if you got used to that, rebind it:
 
 ```tmux
 bind-key -T copy-mode-vi v send-keys -X begin-selection
@@ -499,6 +514,11 @@ Search covers the whole scrollback, not just the rows on screen. A match that is
 scrolls the view to it, parked a quarter of a screen from the bottom the way tmux does, and
 `?` stops at the nearest match above the cursor.
 
+Every match on screen is drawn in `copy-mode-match-style` (`bg=cyan,fg=black`) and the one under the
+cursor in `copy-mode-current-match-style` (`bg=magenta,fg=black`), tmux's defaults. As in tmux the
+highlight stays while you move with `n`, `N` and the cursor keys, and goes when a command that
+changes the selection or the mark runs (`Space`, `Esc`, `V`, `v`, `X`, `z`, `%`, `^`).
+
 ### Goto Line
 
 | Key | Action |
@@ -520,7 +540,8 @@ See [Copy Mode Goto Line Prompt](#copy-mode-goto-line-prompt) for what the numbe
 
 | Key | Action |
 |-----|--------|
-| `Esc` / `q` / `]` | Exit copy mode |
+| `q` / `]` | Exit copy mode |
+| `Esc` | Clear the selection and stay in copy mode with `mode-keys vi`; exit with `mode-keys emacs` |
 | `Ctrl+C` / `Ctrl+G` | Exit copy mode |
 
 ### Copy Mode Search Prompt
@@ -529,10 +550,20 @@ Opened by `/`, `?`, `Ctrl+s` or `Ctrl+r`. While it is open the copy mode keys ar
 
 | Key | Action |
 |-----|--------|
-| Any character | Append to the search pattern |
-| `Backspace` | Delete the last character |
+| Any character, `Space` included | Insert at the cursor |
+| `Left` / `Right` | Move the cursor |
+| `Home` / `Ctrl+a` | Move to the start |
+| `End` / `Ctrl+e` | Move to the end |
+| `Backspace` | Delete the character before the cursor |
+| `Delete` / `Ctrl+d` | Delete the character under the cursor |
+| `Ctrl+u` / `Ctrl+k` / `Ctrl+w` | Clear the line / cut to the end / cut the word before the cursor |
+| `Up` / `Down` | Recall earlier searches |
 | `Enter` | Accept the search and jump to the match |
-| `Esc` | Cancel the search |
+| `Esc` / `Ctrl+c` / `Ctrl+g` | Cancel the search |
+
+These are the keys of tmux's prompt editor that apply here. The cursor position is not drawn on the
+status line yet. `Ctrl+b` and `Ctrl+f` also move the cursor, but `Ctrl+b` is the default prefix, which
+the client takes first. The goto line prompt takes the same editing keys.
 
 ### Copy Mode Goto Line Prompt
 

@@ -1625,22 +1625,8 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
             crate::copy_mode::exit_copy_mode(app);
             if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
         }
-        "begin-selection" => {
-            if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r,c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r,c));
-                app.copy_selection_mode = crate::types::SelectionMode::Char;
-            }
-        }
-        "select-line" => {
-            if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r,c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r,c));
-                app.copy_selection_mode = crate::types::SelectionMode::Line;
-            }
-        }
+        "begin-selection" => { crate::copy_mode::begin_selection(app); }
+        "select-line" => { crate::copy_mode::select_line(app); }
         "rectangle-toggle" => {
             crate::copy_mode::toggle_rectangle(app);
         }
@@ -1767,10 +1753,7 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
                 app.copy_pos = Some(a);
             }
         }
-        "clear-selection" => {
-            app.copy_anchor = None;
-            app.copy_selection_mode = crate::types::SelectionMode::Char;
-        }
+        "clear-selection" => { crate::copy_mode::clear_selection(app); }
         "append-selection" => {
             // Append to existing buffer instead of replacing
             let _ = yank_selection(app);
@@ -1846,9 +1829,13 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
         "jump-reverse" => { crate::copy_mode::jump_reverse(app); }
         "set-mark" => { crate::copy_mode::set_mark(app); }
         "jump-to-mark" => { crate::copy_mode::jump_to_mark(app); }
-        // tmux 3.3 calls this refresh-toggle; older tables and
-        // the #498 report use refresh-from-pane for the same key.
-        "refresh-from-pane" | "refresh-toggle" => { crate::copy_mode::toggle_refresh(app); }
+        // tmux 3.4 to 3.7c bind `r` to the one shot refresh-from-pane;
+        // OpenBSD-current names it refresh-now. tmux after 3.7c adds an
+        // automatic refresh behind refresh-on/off/toggle (discussion #694).
+        "refresh-from-pane" | "refresh-now" => { crate::copy_mode::refresh_from_pane(app); }
+        "refresh-toggle" => { crate::copy_mode::toggle_refresh(app); }
+        "refresh-on" => { crate::copy_mode::refresh_on(app); }
+        "refresh-off" => { crate::copy_mode::refresh_off(app); }
         "toggle-position" => { crate::copy_mode::toggle_position(app); }
         "next-paragraph" => {
             crate::copy_mode::move_next_paragraph(app);
@@ -3591,6 +3578,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // still hold one.  Cheap, idempotent, and the place where
                     // every frame passes through.
                     crate::copy_mode::sync_copy_snapshot(&mut app);
+                    // `refresh-on` / `refresh-toggle`: rebuild the snapshot when
+                    // the pane printed (tmux runs it on a 50 ms timer).
+                    if crate::copy_mode::tick_auto_refresh(&mut app) {
+                        state_dirty = true;
+                    }
                     // Fast-path: nothing changed at all → 2-byte "NC" marker
                     // instead of cloning 50-100KB of JSON.
                     // Only allowed for persistent connections that already have
@@ -8054,6 +8046,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // this push is reached again. It costs one loop iteration and no wait at
         // all, because `push_deferred` makes the next recv_timeout zero, and it
         // halves the frames a keystroke produces.
+        // `refresh-on`: a pushed frame rebuilds the copy-mode snapshot too,
+        // or the output that caused it never reaches the view.
+        if state_dirty {
+            crate::copy_mode::tick_auto_refresh(&mut app);
+        }
         let owe_push = (state_dirty || meta_dirty) && crate::types::has_frame_receivers();
         push_deferred = owe_push && pty_batch_pending;
         if owe_push && !pty_batch_pending {

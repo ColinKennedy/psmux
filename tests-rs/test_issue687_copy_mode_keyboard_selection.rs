@@ -234,7 +234,8 @@ fn a_character_selection_after_scrolling_yanks_what_it_painted() {
     let mut app = copy_app();
     scroll_copy_up(&mut app, 4);
     let start = app.copy_pos.expect("a cursor").0;
-    crate::input::send_text_to_active(&mut app, "v").unwrap();
+    // Space is begin-selection in copy-mode-vi; v is rectangle-toggle (#694).
+    crate::input::send_text_to_active(&mut app, " ").unwrap();
     crate::input::send_text_to_active(&mut app, "j").unwrap();
     let end = app.copy_pos.expect("a cursor").0;
 
