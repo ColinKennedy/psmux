@@ -362,7 +362,9 @@ else {
     & $PSMUX copy-mode -t $S 2>&1 | Out-Null
     Start-Sleep -Milliseconds 500
     if ((Fmt $S '#{pane_in_mode}') -eq "1") { Write-Pass "entered copy mode" } else { Write-Fail "copy-mode did not enter" }
-    & $PSMUX send-keys -t $S k 0 v '$' 2>&1 | Out-Null
+    # Space is begin-selection in tmux's copy-mode-vi table (key-bindings.c:656);
+    # v is rectangle-toggle since the #694 parity merge, so it no longer starts one.
+    & $PSMUX send-keys -t $S k 0 Space '$' 2>&1 | Out-Null
     Start-Sleep -Milliseconds 400
     & $PSMUX send-keys -t $S Y 2>&1 | Out-Null
     $piped = Wait-Cond { (Test-Path $pipeOut) -and ((Get-Content $pipeOut -Raw) -match "P595_PIPE_TOKEN") } 8
