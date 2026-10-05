@@ -28,6 +28,119 @@ pub fn is_warm_session(base: &str) -> bool {
     base == "__warm__" || base.ends_with("____warm__")
 }
 
+/// Registry base of namespace `ns`'s warm standby: `__warm__` for the default
+/// namespace, `<ns>____warm__` for a named one.
+pub fn warm_base_for(ns: Option<&str>) -> String {
+    match ns {
+        Some(n) => format!("{}____warm__", n),
+        None => "__warm__".to_string(),
+    }
+}
+
+/// The warm standby of namespace `ns` when it is HELD (issue #734): unclaimed,
+/// `exit-empty` off, still registered. That is psmux's form of the empty
+/// server `tmux start-server \; set -g exit-empty off` leaves running, so
+/// untargeted commands must reach it while the namespace has no session.
+///
+/// Both files are required: the `.held` marker says the standby is holding,
+/// the `.port` file says it is still registered (a claim or a shutdown removes
+/// it first). A marker left behind by a crash is therefore inert.
+pub fn held_warm_base_in(dir: &std::path::Path, ns: Option<&str>) -> Option<String> {
+    let base = warm_base_for(ns);
+    let held = dir.join(format!("{}.held", base)).is_file();
+    let registered = dir.join(format!("{}.port", base)).is_file();
+    (held && registered).then_some(base)
+}
+
+/// Write or remove a standby's `.held` marker (issue #734). `held` is true
+/// while the server is an unclaimed standby with `exit-empty` off.
+pub fn set_held_marker(base: &str, held: bool) {
+    let path = crate::paths::held_file(base);
+    if held {
+        let _ = std::fs::write(&path, std::process::id().to_string());
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Environment variable through which `start-server` hands the standby it just
+/// started to the commands queued after it (issue #734). Set only on those
+/// child invocations, never in a server's environment.
+pub const ROUTE_WARM_ENV: &str = "PSMUX_ROUTE_WARM";
+
+/// Whether `new-session` must claim the namespace's standby whatever its flags
+/// (issue #734). True when the namespace has no session and its standby is the
+/// empty server a client may already have identified: held, or named by the
+/// `start-server` this command is queued behind (`route_warm`).
+pub fn cli_must_claim_standby(dir: &std::path::Path, ns: Option<&str>, route_warm: Option<&str>) -> bool {
+    if resolve_last_session_name_ns_in(dir, ns).is_some() {
+        return false;
+    }
+    let warm = warm_base_for(ns);
+    let named = route_warm == Some(warm.as_str()) && dir.join(format!("{}.port", warm)).is_file();
+    named || held_warm_base_in(dir, ns).is_some()
+}
+
+/// Commands that finish a held claim (issue #734): the claim renames the
+/// standby and re-homes it to `-c`, but cannot replace the shell it is
+/// already running or change its size. A command (`initial_cmd`, the shell
+/// form, or `raw_cmd`, the argv after `--`) replaces the pane in place, which
+/// keeps the server, the only identity a held claim promises, unchanged.
+pub fn held_claim_followups(
+    initial_cmd: Option<&str>,
+    raw_cmd: Option<&[String]>,
+    start_dir: Option<&str>,
+    width: Option<u16>,
+    height: Option<u16>,
+) -> Vec<String> {
+    use crate::util::quote_arg;
+    let mut lines = Vec::new();
+    let command: Option<String> = match (raw_cmd, initial_cmd) {
+        (Some(argv), _) if !argv.is_empty() => {
+            Some(argv.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" "))
+        }
+        (_, Some(cmd)) if !cmd.trim().is_empty() => Some(quote_arg(cmd)),
+        _ => None,
+    };
+    if let Some(command) = command {
+        let mut line = String::from("respawn-pane -k");
+        if let Some(dir) = start_dir {
+            line.push_str(" -c ");
+            line.push_str(&quote_arg(dir));
+        }
+        line.push_str(" -- ");
+        line.push_str(&command);
+        line.push('\n');
+        lines.push(line);
+    }
+    if width.is_some() || height.is_some() {
+        let mut line = String::from("resize-window");
+        if let Some(w) = width {
+            line.push_str(&format!(" -x {}", w));
+        }
+        if let Some(h) = height {
+            line.push_str(&format!(" -y {}", h));
+        }
+        line.push('\n');
+        lines.push(line);
+    }
+    lines
+}
+
+/// Whether a CLI may address the standby `target` directly: it is held, or the
+/// `start-server` that owns this command queue named it.
+pub fn warm_target_addressable(target: &str) -> bool {
+    if !is_warm_session(target) {
+        return false;
+    }
+    if env::var(ROUTE_WARM_ENV).ok().as_deref() == Some(target) {
+        return true;
+    }
+    let dir = std::path::PathBuf::from(crate::paths::psmux_dir());
+    let ns = target.strip_suffix("____warm__");
+    held_warm_base_in(&dir, ns).as_deref() == Some(target)
+}
+
 /// The `-L` socket namespace a registry base name belongs to.
 ///
 /// A namespaced session is stored as `<ns>__<name>`, so the namespace is the
@@ -431,7 +544,7 @@ fn cleanup_stale_port_files_in(psmux_dir: &Path) {
 /// Registry file extensions that only ever exist as satellites of a `.port`
 /// entry. Anything else in the data dir (`next_session_id`, its `.lock`, debug
 /// logs, the `instances/` and `servers/` subdirectories) is never touched.
-const ORPHAN_REGISTRY_EXTS: &[&str] = &["sid", "key", "pid", "spawnlock", "act"];
+const ORPHAN_REGISTRY_EXTS: &[&str] = &["sid", "key", "pid", "spawnlock", "act", "held"];
 
 /// How long a `.port`-less registry file must sit untouched before it is
 /// considered abandoned (issue #530).
@@ -616,7 +729,7 @@ where
 /// teardown that already removed the `.pid` have no anchor at all, which is
 /// precisely the abandoned case.
 fn orphan_anchor_pid(path: &Path, ext: &str) -> Option<u32> {
-    let body = if ext == "spawnlock" {
+    let body = if ext == "spawnlock" || ext == "held" {
         std::fs::read_to_string(path).ok()?
     } else {
         std::fs::read_to_string(path.with_extension("pid")).ok()?
@@ -1846,6 +1959,9 @@ pub(crate) fn remove_session_registry_files(port_path: &Path) {
     // keep ranking in bare CLI routing.
     let act_path = port_path.with_extension("act");
     let _ = std::fs::remove_file(&act_path);
+    // And a standby's `.held` marker (issue #734).
+    let held_path = port_path.with_extension("held");
+    let _ = std::fs::remove_file(&held_path);
 }
 
 /// Outcome of a single AUTH handshake against the listener on a port.
@@ -2396,8 +2512,9 @@ pub fn send_control(line: String) -> io::Result<()> {
             target, env::var("PSMUX_TARGET_FULL").ok(),
             env::args().collect::<Vec<_>>(), line.trim());
     }
-    // Never target a warm (standby) session — resolve to a real session instead
-    if is_warm_session(&target) {
+    // Never target a warm (standby) session, resolve to a real session instead,
+    // unless it is the namespace's held empty server (issue #734).
+    if is_warm_session(&target) && !warm_target_addressable(&target) {
         // Extract namespace from warm session name (e.g. "foo____warm__" -> Some("foo"))
         let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
@@ -2454,8 +2571,9 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
             target, env::var("PSMUX_TARGET_FULL").ok(),
             env::args().collect::<Vec<_>>(), line.trim());
     }
-    // Never target a warm (standby) session — resolve to a real session instead
-    if is_warm_session(&target) {
+    // Never target a warm (standby) session, resolve to a real session instead,
+    // unless it is the namespace's held empty server (issue #734).
+    if is_warm_session(&target) && !warm_target_addressable(&target) {
         let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
@@ -2759,6 +2877,22 @@ pub fn resolve_routing_target(
     tmux_env: Option<&str>,
     psmux_dir: &std::path::Path,
 ) -> Option<String> {
+    resolve_routing_target_with(l_socket_name, tmux_env, psmux_dir, None)
+}
+
+/// [`resolve_routing_target`] for a command that may also land on a standby.
+///
+/// With no real session in the namespace, a namespace whose standby is HELD
+/// (`start-server` + `exit-empty off`, issue #734) routes to that standby,
+/// which is the empty server tmux would answer from. `route_warm` is the
+/// standby a `start-server` invocation named for the commands queued after it
+/// (`ROUTE_WARM_ENV`); it is honoured only when it is this namespace's.
+pub fn resolve_routing_target_with(
+    l_socket_name: Option<&str>,
+    tmux_env: Option<&str>,
+    psmux_dir: &std::path::Path,
+    route_warm: Option<&str>,
+) -> Option<String> {
     // Adopt the current server (named by `$TMUX`) only when it is in-namespace.
     if let Some(tmux_val) = tmux_env {
         if let Some(base) = session_base_owning_tmux_port(tmux_val, psmux_dir) {
@@ -2774,6 +2908,14 @@ pub fn resolve_routing_target(
     // Otherwise the most recent real session in the namespace,
     if let Some(name) = resolve_last_session_name_ns_in(psmux_dir, l_socket_name) {
         return Some(name);
+    }
+    // else the namespace's empty server, when there is one (issue #734),
+    let warm = warm_base_for(l_socket_name);
+    if route_warm == Some(warm.as_str()) {
+        return Some(warm);
+    }
+    if let Some(held) = held_warm_base_in(psmux_dir, l_socket_name) {
+        return Some(held);
     }
     // else a namespaced `X__default` so `-L X` never leaks to the un-namespaced
     // `default` server. With no `-L`, stay unresolved (the caller keeps "default").
@@ -3024,6 +3166,10 @@ mod tests_issue530_registry_pruning;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue603_bare_routing.rs"]
 mod tests_issue603_bare_routing;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue734_held_standby.rs"]
+mod tests_issue734_held_standby;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_picker_namespace_filter.rs"]

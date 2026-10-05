@@ -1503,6 +1503,7 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         }
         "exit-empty" => {
             app.exit_empty = matches!(value, "on" | "true" | "1" | "yes");
+            crate::server::sync_held_marker(app);
         }
         "aggressive-resize" => {
             app.aggressive_resize = matches!(value, "on" | "true" | "1" | "yes");

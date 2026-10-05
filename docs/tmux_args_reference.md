@@ -194,7 +194,8 @@ Five mouse wire commands are an exception and are genuinely usable for scripting
 - See [compatibility.md](compatibility.md#kill-server-with-multiple-sockets).
 
 **start-server** (`start`, `warmup`)
-- No flags. Pre-spawns a warm server so the next `new-session` is instant.
+- No flags. Starts the namespace's server (a warm standby, so the next `new-session` is also instant).
+- Commands queued after it (`start-server ; set-option -g exit-empty off`) run against that server, in order, stopping at the first error, as in tmux. With `exit-empty off` the empty server answers untargeted commands (`display-message -p '#{pid}'`, `show-options`, `list-sessions`) before any session exists, and the next `new-session` lands in it (issue #734).
 
 **server-info** (`info`)
 - No flags.

@@ -221,6 +221,18 @@ pub fn host_colors_file() -> String {
     format!("{}\\host_colors", psmux_dir())
 }
 
+/// Path to a standby's `.held` marker (issue #734).
+///
+/// A `__warm__` standby is internal: CLI routing never picks it. tmux has no
+/// standby, but it does have the empty server that `start-server` plus
+/// `set -g exit-empty off` leaves behind, and a client may query that server
+/// before it has any session. The standby writes this file while it is
+/// unclaimed with `exit-empty` off, which is exactly that state, and routing
+/// then treats it as the namespace's live, empty server.
+pub fn held_file(session: impl AsRef<str>) -> String {
+    format!("{}\\{}.held", psmux_dir(), session.as_ref())
+}
+
 /// Path to a session's `.spawnlock` file (the warm-pool spawn lock).
 pub fn spawnlock_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.spawnlock", psmux_dir(), session.as_ref())
