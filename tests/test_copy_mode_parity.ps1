@@ -93,10 +93,10 @@ try {
     if ($em.Count -ge 50) { Write-Pass "copy-mode lists the built-in keys ($($em.Count))" }
     else { Write-Fail "copy-mode lists $($em.Count) lines (tmux: 72)" }
     foreach ($want in @(
-        'bind-key -T copy-mode-vi v send-keys -X begin-selection',
+        'bind-key -T copy-mode-vi v send-keys -X rectangle-toggle',
         'bind-key -T copy-mode-vi g send-keys -X history-top',
         'bind-key -T copy-mode-vi C-v send-keys -X rectangle-toggle',
-        'bind-key -T copy-mode-vi Escape send-keys -X cancel')) {
+        'bind-key -T copy-mode-vi Escape send-keys -X clear-selection')) {
         if ($vi -contains $want) { Write-Pass "listed: $want" } else { Write-Fail "missing: $want" }
     }
     foreach ($want in @(
@@ -108,7 +108,7 @@ try {
     if (-not ($em | Where-Object { $_ -match '^bind-key -T copy-mode g ' })) { Write-Pass "emacs table has no g (psmux only handles g for vi, like tmux)" }
     else { Write-Fail "emacs table lists g, which the emacs handler ignores" }
     $one = @(P list-keys -T copy-mode-vi v)
-    if ($one.Count -eq 1 -and $one[0] -eq 'bind-key -T copy-mode-vi v send-keys -X begin-selection') { Write-Pass "key filter returns the one line" }
+    if ($one.Count -eq 1 -and $one[0] -eq 'bind-key -T copy-mode-vi v send-keys -X rectangle-toggle') { Write-Pass "key filter returns the one line" }
     else { Write-Fail "key filter returned: $($one -join ' | ')" }
 
     # A rebind replaces the listed default.
