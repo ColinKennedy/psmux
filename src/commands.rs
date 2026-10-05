@@ -2934,7 +2934,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             &addr.parse().unwrap(),
                             std::time::Duration::from_millis(100),
                         ).is_ok() {
-                            app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
+                            // tmux's wording, cmd-new-session.c:138
+                            app.status_message = Some((format!("duplicate session: {}", name), Instant::now(), None));
                             return Ok(());
                         }
                     }

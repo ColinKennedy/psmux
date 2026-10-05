@@ -4864,10 +4864,12 @@ match cmd {
             } else { false };
 
             if already_exists {
+                // tmux's wording (cmd-new-session.c:138), the same string the CLI
+                // path has printed since discussion #210; gastown greps for it.
                 if persistent {
-                    let _ = tx.send(CtrlReq::StatusMessage(format!("session '{}' already exists", name)));
+                    let _ = tx.send(CtrlReq::StatusMessage(format!("duplicate session: {}", name)));
                 } else {
-                    let _ = write!(write_stream, "session '{}' already exists\n", name);
+                    let _ = write!(write_stream, "duplicate session: {}\n", name);
                     let _ = write_stream.flush();
                     break;
                 }
