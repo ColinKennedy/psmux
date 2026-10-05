@@ -67,7 +67,6 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_last_jump = None;
     app.copy_refresh_live = false;
     app.copy_refresh_version = 0;
-    app.copy_refresh_at = None;
     app.copy_search_marks = false;
     // tmux sets `hide_position` from the `-H` flag every time the mode is
     // created (`window-copy.c` `window_copy_init`), so a plain entry always
@@ -1740,7 +1739,6 @@ pub fn refresh_on(app: &mut AppState) {
     if !app.copy_refresh_live {
         app.copy_refresh_live = true;
         app.copy_refresh_version = 0;
-        app.copy_refresh_at = None;
     }
 }
 
@@ -1754,7 +1752,7 @@ pub fn toggle_refresh(app: &mut AppState) {
     if app.copy_refresh_live { refresh_off(app) } else { refresh_on(app) }
 }
 
-/// The automatic refresh's timer, run once per frame by the server: when the
+/// The automatic refresh, run for every frame the server builds: when the
 /// pane printed since the last rebuild, rebuild the snapshot, following the
 /// output only while the cursor is on the last row at the live bottom, and
 /// never while a selection is being made (tmux `window_copy_refresh_timer`).
@@ -1770,17 +1768,15 @@ pub fn tick_auto_refresh(app: &mut AppState) -> bool {
             None => return false,
         }
     };
+    // tmux polls on a 50 ms timer; psmux runs this once per frame, and frames
+    // are already coalesced, so a rebuild is due whenever the pane printed.
     if version == app.copy_refresh_version {
-        return false;
-    }
-    if app.copy_refresh_at.map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(50)) {
         return false;
     }
     let follow = app.copy_scroll_offset == 0
         && app.copy_pos.map_or(true, |(r, _)| r + 1 >= rows);
     let changed = reclone_copy_snapshot(app, follow);
     app.copy_refresh_version = version;
-    app.copy_refresh_at = Some(std::time::Instant::now());
     changed
 }
 

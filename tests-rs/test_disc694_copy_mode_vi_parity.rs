@@ -116,7 +116,6 @@ fn refresh_toggle_follows_output_only_at_the_bottom() {
     crate::copy_mode::scroll_copy_up(&mut app, 10);
     feed(&live, "tick", 6, 9);
     bump_version(&app);
-    app.copy_refresh_at = None;
     assert!(crate::copy_mode::tick_auto_refresh(&mut app));
     assert_eq!(app.copy_scroll_offset, 13);
 
@@ -124,7 +123,6 @@ fn refresh_toggle_follows_output_only_at_the_bottom() {
     app.copy_anchor = Some((0, 0));
     feed(&live, "tick", 9, 12);
     bump_version(&app);
-    app.copy_refresh_at = None;
     assert!(!crate::copy_mode::tick_auto_refresh(&mut app));
 
     crate::copy_mode::toggle_refresh(&mut app);

@@ -3552,7 +3552,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // every frame passes through.
                     crate::copy_mode::sync_copy_snapshot(&mut app);
                     // `refresh-on` / `refresh-toggle`: rebuild the snapshot when
-                    // the pane printed (tmux's 50 ms refresh timer).
+                    // the pane printed (tmux runs it on a 50 ms timer).
                     if crate::copy_mode::tick_auto_refresh(&mut app) {
                         state_dirty = true;
                     }
@@ -8008,6 +8008,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // this push is reached again. It costs one loop iteration and no wait at
         // all, because `push_deferred` makes the next recv_timeout zero, and it
         // halves the frames a keystroke produces.
+        // `refresh-on`: a pushed frame rebuilds the copy-mode snapshot too,
+        // or the output that caused it never reaches the view.
+        if state_dirty {
+            crate::copy_mode::tick_auto_refresh(&mut app);
+        }
         let owe_push = (state_dirty || meta_dirty) && crate::types::has_frame_receivers();
         push_deferred = owe_push && pty_batch_pending;
         if owe_push && !pty_batch_pending {

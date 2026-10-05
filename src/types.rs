@@ -1561,9 +1561,6 @@ pub struct AppState {
     /// The pane `data_version` the snapshot was last re-cloned at, so the
     /// automatic refresh only rebuilds it when the pane printed something.
     pub copy_refresh_version: u64,
-    /// When the automatic refresh last re-cloned, to space rebuilds the way
-    /// tmux's 50 ms `WINDOW_COPY_REFRESH_INTERVAL` timer does.
-    pub copy_refresh_at: Option<Instant>,
     /// Where the cursor sits in the copy-mode search or goto-line prompt,
     /// counted in characters back from the end of the input, so text typed
     /// at the end (the common case) needs no bookkeeping. tmux keeps it as
@@ -2694,7 +2691,6 @@ impl AppState {
             copy_last_jump: None,
             copy_refresh_live: false,
             copy_refresh_version: 0,
-            copy_refresh_at: None,
             copy_prompt_back: 0,
             copy_search_history: Vec::new(),
             copy_search_history_pos: None,

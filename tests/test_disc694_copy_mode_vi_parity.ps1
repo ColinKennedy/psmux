@@ -319,6 +319,41 @@ $pos3 = [int](D '#{scroll_position}')
 Check ($pos3 -eq $pos2 + 10) "scrolling still works after r ($pos2 -> $pos3)" "10 scroll-ups moved $pos2 -> $pos3"
 Leave-Copy
 
+# ── 3b. refresh-on, tmux's newer automatic refresh ──
+
+Write-Head "3b. refresh-on follows output at the bottom and keeps the place above it"
+Start-Sleep -Seconds 6   # let the first printer finish
+P send-keys -t $SESS 'cls; 1..100 | % { "fill$_" }; 0..60 | % { "tock $_"; Start-Sleep -Milliseconds 250 }' Enter | Out-Null
+Start-Sleep -Seconds 3
+function Last-Tock($lines) {
+    $t = $lines | Where-Object { $_ -match 'tock (\d+)' } | Select-Object -Last 1
+    if ($t -match 'tock (\d+)') { return [int]$Matches[1] }
+    return -1
+}
+Enter-Copy
+P send-keys -t $SESS -X bottom-line | Out-Null
+P send-keys -t $SESS -X refresh-on | Out-Null
+$a = Last-Tock (Screen)
+Start-Sleep -Seconds 3
+$b = Last-Tock (Screen)
+$pane = Last-Tock @(P capture-pane -t $SESS -p)
+Write-Info "drawn $a, 3 s later $b, pane $pane"
+Check ($b -gt $a -and $b -ge $pane - 2) "the view follows new output at the bottom" "the view did not follow ($a -> $b, pane $pane)"
+P send-keys -t $SESS -X scroll-up | Out-Null
+P send-keys -t $SESS -X scroll-up | Out-Null
+Start-Sleep -Milliseconds 400
+$p1 = [int](D '#{scroll_position}'); $t1 = (Screen | Select-Object -First 1)
+Start-Sleep -Seconds 2
+$p2 = [int](D '#{scroll_position}'); $t2 = (Screen | Select-Object -First 1)
+Write-Info "scrolled up: $p1 -> $p2"
+Check ($p2 -gt $p1 -and $t1.Trim() -eq $t2.Trim()) "above the bottom it keeps the place ($p1 -> $p2)" "the view moved or did not refresh ($p1 -> $p2)"
+P send-keys -t $SESS -X refresh-off | Out-Null
+Start-Sleep -Milliseconds 400
+$p3 = [int](D '#{scroll_position}')
+Start-Sleep -Seconds 1
+Check ([int](D '#{scroll_position}') -eq $p3) "refresh-off stops it" "the view still refreshes after refresh-off"
+Leave-Copy
+
 # ── Teardown ──
 
 Kill-Rig
