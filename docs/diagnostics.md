@@ -301,6 +301,79 @@ console host that Windows Update does not patch for you.
 
 `PSMUX_NO_PASSTHROUGH=1` is independent of this and does not change either number.
 
+## Measuring the Terminal Around You
+
+The sections above are about what psmux tells you. This one is the other direction: what the
+terminal psmux is running in will tell psmux, which decides what psmux can promise.
+
+### `scripts\probe-terminal-cursor.ps1`
+
+```powershell
+.\scripts\probe-terminal-cursor.ps1 -Eye
+```
+
+Run it in the terminal you want to measure, not inside psmux or tmux. A multiplexer answers
+these queries itself, so the result would describe the multiplexer and not the terminal, and the
+script refuses to run when `TMUX` or `PSMUX_SESSION` is set. Either PowerShell will do.
+
+It asks five questions, one at a time, and reads the replies off the console input buffer:
+
+| Sent | What it asks |
+|---|---|
+| `ESC[>q` | XTVERSION, which terminal is this |
+| `ESC[?12$p` | DECRQM, is the cursor blinking |
+| `ESC[?25$p` | DECRQM, is the cursor visible. A control: every terminal implements mode 25, so a silent 12 beside a spoken 25 means 12 specifically is unsupported |
+| `ESC P$q SP q ESC\` | DECRQSS, what is the cursor style |
+| `ESC[c` | DA1, answered by almost everything, so a silence here means the queries are not getting through at all |
+
+With `-Eye` it then walks mode 12 both ways, a steady bar and the reset, and DECSCUSR 0 through
+8, asking you after each one what you see. That is the part no query can answer: whether what a
+terminal reports is what it draws. Nothing is left changed, whatever state the probe finds is
+written back before it returns. The last thing it prints is a Markdown block to paste into a
+reply on the terminal survey discussion, stamped with the time, the version of the script and
+the shell, so a result can be placed later.
+
+Why any of this matters to psmux. The shape goes out as DECSCUSR, and its reset, `ESC[0 q`,
+means the terminal's default rather than what the user had. The blink is worse: terminals have no
+setting for it, so it is only ever moved by a sequence, and DEC private mode 12 has two states
+and no default to go back to. So the only way to put either back exactly is to read it first,
+and not every terminal answers, which is what there is to measure.
+
+What each answer makes possible, with reading the cursor at attach and restoring only what psmux
+changed being issue #735:
+
+| The terminal | What is possible |
+|---|---|
+| answers DECRQM for mode 12 | the blink is put back exactly on exit |
+| does not | psmux can only undo its own write, by its opposite |
+| answers DECRQSS with a style | the shape is put back exactly on exit |
+| refuses, or says nothing | psmux falls back to `ESC[0 q`, which is where tmux stops |
+| draws mode 12, not just tracks it | `cursor-blink` works on its own |
+| tracks it without drawing it | the blink has to come from the shape, as in `cursor-style blinking-bar` |
+| draws neither | nothing psmux sends moves the blink, the terminal decides it |
+
+Three things measured this way are worth knowing before you read a report:
+
+A terminal can answer a query faithfully and ignore the mode the query describes. WezTerm reports
+mode 12 exactly as it was set and never uses it to decide whether to blink, while conhost, which
+refuses DECRQSS, does act on mode 12. The two halves come apart, so an answer tells you nothing
+about the behaviour.
+
+A report can also be frozen. The VS Code terminal answers DECRQSS with `2`, a steady block, and
+goes on answering `2` after a bar has been asked for and drawn. A restore built on that would
+write `ESC[2 q` on the way out and leave a block behind for someone who had configured an
+underline, which is worse than falling back to the terminal's own default.
+
+And a report can be true about every write and wrong about the state it was found in. Alacritty
+answered that mode 12 was set over a cursor that was not blinking, then tracked both writes
+faithfully afterwards. Reading the report back after a write does not catch that one, which is
+the argument for restoring only what was changed rather than asserting whatever was read.
+
+Eight terminals are measured in the terminal survey discussion, with the raw output of each run:
+Windows Terminal, conhost, Alacritty, WezTerm, mintty, the VS Code terminal, ConEmu and the
+JetBrains terminal. Every shape DECSCUSR names is drawn in all eight. What differs is whether the
+cursor can be read back, and which of the two ways of asking for a blink the terminal acts on.
+
 ## Always On Diagnostic Files
 
 These three are written without any variable being set. They exist because the failures they
@@ -467,6 +540,7 @@ them into a public issue.
 ## See Also
 
 - [configuration.md](configuration.md) for the supported options and user facing environment variables
+- [configuration.md](configuration.md) for `cursor-style` and `cursor-blink`, which the terminal probe is about
 - [warm-sessions.md](warm-sessions.md) for the `__warm__` server and how to disable it
 - [performance.md](performance.md) for what the latency numbers should look like
 - [faq.md](faq.md) for the common questions these logs usually answer
