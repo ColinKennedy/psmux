@@ -1802,8 +1802,8 @@ pub(crate) fn draw_pane_border_arrows(
 /// turns the last selected cell into "text colour on the default background",
 /// which reads as if it were not selected at all -- the copy then looks one
 /// cell longer than the highlight even though the selection is correct.  The
-/// selection style already marks the cell, so the caller skips both when this
-/// returns true.
+/// selection style already marks the cell, so the caller does not reverse it
+/// when this returns true, and only parks the host cursor there.
 pub(crate) fn copy_cursor_in_selection(
     cr: u16,
     cc: u16,
@@ -2151,15 +2151,16 @@ pub fn render_layout_json(
                     let cx = inner.x + crate::copy_line_numbers::cursor_offset(
                         gutter_w as usize, cc as usize, inner.width as usize) as u16;
                     // While a selection is on screen the copy cursor sits on one
-                    // of its endpoints.  Reversing that cell (and parking the
-                    // host terminal's cursor on it) turns a selected cell into
-                    // "text colour on the default background", which reads as if
-                    // the last selected cell were *not* selected: users then
-                    // report the copy as one cell longer than the highlight,
-                    // even though the selection itself is right.  The selection
-                    // style already marks the cell, so leave it alone and keep
-                    // the host cursor off it (skipping set_cursor_position also
-                    // keeps ratatui's ?25l, i.e. hides it for this frame).
+                    // of its endpoints.  Reversing that cell turns a selected
+                    // cell into "text colour on the default background", which
+                    // reads as if the last selected cell were *not* selected:
+                    // users then reported the copy as one cell longer than the
+                    // highlight (4853ddd).  So the cell keeps the selection
+                    // style.  The host terminal's cursor still goes there, which
+                    // is how tmux shows the copy cursor inside a selection (it
+                    // is the terminal's own cursor, window-copy.c moves it to
+                    // cx/cy): hiding it as well left `o` (other-end) with no
+                    // visible effect (discussion #694).
                     let cursor_in_selection = copy_cursor_in_selection(
                         cr,
                         cc,
@@ -2167,8 +2168,8 @@ pub fn render_layout_json(
                         (*sel_end_row).zip(*sel_end_col),
                         sel_mode.as_deref().unwrap_or("char"),
                     );
+                    f.set_cursor_position((cx, cy));
                     if !cursor_in_selection {
-                        f.set_cursor_position((cx, cy));
                         let buf = f.buffer_mut();
                         let buf_area = buf.area;
                         if cy >= buf_area.y && cy < buf_area.y + buf_area.height

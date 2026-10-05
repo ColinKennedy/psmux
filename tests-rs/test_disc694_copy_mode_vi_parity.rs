@@ -298,3 +298,67 @@ fn a_new_prompt_starts_with_the_cursor_at_the_end() {
     crate::input::send_text_to_active(&mut app, "/xy").unwrap();
     assert_eq!(search_input(&app), "xy");
 }
+
+// ── 7. the cursor inside a selection ────────────────────────────────────────
+//
+// Measured on dd695ea with real keystrokes: with a selection the host cursor
+// stayed on the cell after the selection (x 93 for a cursor at 92) and did not
+// move when `o` put the copy cursor on the other end (copy_cursor_x 88, host
+// cursor still 93). tmux shows the copy cursor with the terminal's own cursor
+// whether or not a selection is active.
+
+fn render_copy_leaf(sel: ((u16, u16), (u16, u16)), cursor: (u16, u16)) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    use crate::layout::{CellJson, LayoutJson};
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+    let (w, h) = (40u16, 10u16);
+    let cell = |ch: char| CellJson {
+        text: ch.to_string(), fg: String::new(), bg: String::new(),
+        bold: false, italic: false, underline: false, inverse: false,
+        dim: false, blink: false, hidden: false, strikethrough: false,
+    };
+    let content: Vec<Vec<CellJson>> = (0..h).map(|_| (0..w).map(|_| cell('x')).collect()).collect();
+    let leaf = LayoutJson::Leaf {
+        id: 0, rows: h, cols: w, cursor_row: 0, cursor_col: 0,
+        alternate_screen: false, wants_mouse: false, hide_cursor: true, cursor_shape: 0,
+        active: true, copy_mode: true, scroll_offset: 0, view_offset: 0,
+        sel_start_row: Some(sel.0 .0), sel_start_col: Some(sel.0 .1),
+        sel_end_row: Some(sel.1 .0), sel_end_col: Some(sel.1 .1),
+        sel_mode: Some("char".to_string()),
+        copy_cursor_row: Some(cursor.0), copy_cursor_col: Some(cursor.1),
+        content, rows_v2: Vec::new(), title: None,
+    };
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| {
+        let area = Rect::new(0, 0, w, h);
+        let active_rect = crate::client::compute_active_rect_json(&leaf, area);
+        crate::client::render_layout_json(
+            f, &leaf, area, false,
+            ratatui::style::Style::default().fg(Color::DarkGray),
+            ratatui::style::Style::default().fg(Color::Green),
+            false, Color::Reset, active_rect, "bg=yellow,fg=black", false, "off", "", 1,
+            crate::border_lines::border_chars("single"), None,
+            crate::client::WindowContentStyles::default(),
+            crate::pane_border::PaneBorderIndicators::Colour,
+        );
+    }).unwrap();
+    let pos = term.backend_mut().get_cursor_position().unwrap();
+    (pos, term.backend().buffer().clone())
+}
+
+#[test]
+fn the_host_cursor_sits_on_the_copy_cursor_inside_a_selection() {
+    let sel = ((4, 3), (4, 8));
+    let (pos, buf) = render_copy_leaf(sel, (4, 8));
+    assert_eq!((pos.x, pos.y), (8, 4), "the cursor is shown at the moving end");
+    let cell = &buf[(8u16, 4u16)];
+    assert!(!cell.modifier.contains(ratatui::style::Modifier::REVERSED),
+        "the endpoint keeps the selection style (4853ddd)");
+    assert_eq!(cell.bg, ratatui::style::Color::Yellow);
+
+    // `o` puts the copy cursor on the other end, and the cursor follows.
+    let (pos, _) = render_copy_leaf(sel, (4, 3));
+    assert_eq!((pos.x, pos.y), (3, 4));
+}
