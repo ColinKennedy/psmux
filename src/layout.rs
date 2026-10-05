@@ -241,6 +241,10 @@ pub enum LayoutJson {
         /// Pane title for border label expansion
         #[serde(default)]
         title: Option<String>,
+        /// Copy mode search match and mark highlights of the focused pane, as
+        /// `[row, first col, last col, kind]` (`copy_mode::copy_highlights`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        copy_hl: Vec<[u16; 4]>,
     },
 }
 
@@ -423,7 +427,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
                             copy_cursor_row: None, copy_cursor_col: None,
-                            content: vec![], rows_v2: vec![], title: None,
+                            content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(),
                         };
                     } else {
                         // Safety timeout expired without sentinel; unsquelch anyway.
@@ -445,7 +449,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
                         copy_cursor_row: None, copy_cursor_col: None,
-                        content: vec![], rows_v2: vec![], title: None,
+                        content: vec![], rows_v2: vec![], title: None, copy_hl: Vec::new(),
                     };
                 };
                 let screen = parser.screen();
@@ -640,6 +644,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                     content: lines,
                     rows_v2,
                     title: if p.title.is_empty() { None } else { Some(p.title.clone()) },
+                    copy_hl: Vec::new(),
                 }
             }
         }
@@ -752,6 +757,23 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
         if win_id_override.is_none() { app.copy_anchor_scroll_offset } else { 0 },
         if win_id_override.is_none() { app.copy_pos_scroll_offset } else { None },
     );
+    if in_copy_mode && win_id_override.is_none() {
+        let hl = crate::copy_mode::copy_highlights(app);
+        if !hl.is_empty() {
+            fn set_hl(node: &mut LayoutJson, path: &[usize], hl: Vec<[u16; 4]>) {
+                match node {
+                    LayoutJson::Leaf { copy_hl, .. } => *copy_hl = hl,
+                    LayoutJson::Split { children, .. } => {
+                        if let Some((first, rest)) = path.split_first() {
+                            if let Some(child) = children.get_mut(*first) { set_hl(child, rest, hl); }
+                        }
+                    }
+                }
+            }
+            let path = app.windows[app.active_idx].active_path.clone();
+            set_hl(&mut root, &path, hl);
+        }
+    }
     Ok(root)
 }
 
@@ -768,6 +790,8 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let cpos = app.copy_pos;
     let pos_scroll = app.copy_pos_scroll_offset;
     let sel_mode = app.copy_selection_mode;
+    // Search match and mark highlights of the focused copy-mode pane (#694).
+    let hl = if in_copy { crate::copy_mode::copy_highlights(app) } else { Vec::new() };
 
     // ── tiny helpers (no captures needed, so plain `fn` items) ───────
 
@@ -846,6 +870,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
         cpos: Option<(u16, u16)>,
         pos_scroll: Option<usize>,
         sel_mode: crate::types::SelectionMode,
+        hl: &[[u16; 4]],
         out: &mut String,
     ) {
         match node {
@@ -864,7 +889,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 for (i, c) in children.iter_mut().enumerate() {
                     if i > 0 { out.push(','); }
                     cur_path.push(i);
-                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, out);
+                    write_node(c, cur_path, active_path, in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, hl, out);
                     cur_path.pop();
                 }
                 out.push_str("]}");
@@ -1242,6 +1267,16 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     json_esc(&p.title, out);
                     out.push('"');
                 }
+                // Search match and mark highlights, only on the focused copy
+                // mode pane and only when there are any (#694).
+                if is_active && in_copy && !hl.is_empty() {
+                    out.push_str(",\"copy_hl\":[");
+                    for (i, h) in hl.iter().enumerate() {
+                        if i > 0 { out.push(','); }
+                        let _ = std::fmt::Write::write_fmt(out, format_args!("[{},{},{},{}]", h[0], h[1], h[2], h[3]));
+                    }
+                    out.push(']');
+                }
                 out.push('}');
             }
         }
@@ -1253,7 +1288,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let mut out = String::with_capacity(32768);
     write_node(
         &mut win.root, &mut path, &active_path,
-        in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, &mut out,
+        in_copy, scroll_off, anchor, anchor_scroll, cpos, pos_scroll, sel_mode, &hl, &mut out,
     );
     Ok(out)
 }

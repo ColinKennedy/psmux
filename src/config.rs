@@ -1568,7 +1568,8 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
         // unknown (#706). The value of copy-mode-line-numbers is checked
         // against its choices by the catalog before this match, like tmux.
         "copy-mode-line-numbers" | "copy-mode-line-number-style"
-        | "copy-mode-current-line-number-style" | "pane-border-lines" => {
+        | "copy-mode-current-line-number-style" | "pane-border-lines"
+        | "copy-mode-match-style" | "copy-mode-current-match-style" | "copy-mode-mark-style" => {
             app.user_options.insert(key.to_string(), value.to_string());
         }
         "popup-style" | "popup-border-style" | "popup-border-lines" => { app.user_options.insert(key.to_string(), value.to_string()); }

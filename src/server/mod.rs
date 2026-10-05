@@ -1600,14 +1600,7 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
             if let Some(cmds) = app.hooks.get("pane-mode-changed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
         }
         "begin-selection" => { crate::copy_mode::begin_selection(app); }
-        "select-line" => {
-            if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r,c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r,c));
-                app.copy_selection_mode = crate::types::SelectionMode::Line;
-            }
-        }
+        "select-line" => { crate::copy_mode::select_line(app); }
         "rectangle-toggle" => {
             crate::copy_mode::toggle_rectangle(app);
         }

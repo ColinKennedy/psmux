@@ -68,6 +68,7 @@ pub fn enter_copy_mode(app: &mut AppState) {
     app.copy_refresh_live = false;
     app.copy_refresh_version = 0;
     app.copy_refresh_at = None;
+    app.copy_search_marks = false;
     // tmux sets `hide_position` from the `-H` flag every time the mode is
     // created (`window-copy.c` `window_copy_init`), so a plain entry always
     // shows the indicator. `enter_copy_mode_hidden` is the `-H` path.
@@ -538,6 +539,7 @@ pub fn move_to_line_end(app: &mut AppState) {
 
 /// Move cursor to first non-blank character (^ key in vi copy mode).
 pub fn move_to_first_nonblank(app: &mut AppState) {
+    app.copy_search_marks = false;
     if let Some((r, _)) = get_copy_pos(app) {
         if let Some((text, _)) = read_row_text(app, r) {
             let col = text.find(|c: char| !c.is_whitespace()).unwrap_or(0) as u16;
@@ -789,6 +791,7 @@ pub fn page_scroll(app: &mut AppState, up: bool, half_page: bool) {
 /// pre-server dispatcher only ever switched block selection ON, so a second
 /// press could not switch it back off.
 pub fn toggle_rectangle(app: &mut AppState) {
+    app.copy_search_marks = false;
     app.copy_selection_mode = match app.copy_selection_mode {
         crate::types::SelectionMode::Rect => crate::types::SelectionMode::Char,
         _ => crate::types::SelectionMode::Rect,
@@ -1405,6 +1408,7 @@ pub fn search_copy_mode(app: &mut AppState, query: &str, forward: bool) {
     }
 
     if let Some(&(abs, col, _)) = app.copy_search_matches.first() {
+        app.copy_search_marks = true;
         scroll_to_abs_line(app, abs, col);
     }
 }
@@ -1620,6 +1624,7 @@ fn set_scroll_offset(app: &mut AppState, offset: usize) {
 
 /// Record the cursor position as the mark — X key (set-mark).
 pub fn set_mark(app: &mut AppState) {
+    app.copy_search_marks = false;
     if let Some((r, c)) = get_copy_pos(app) {
         app.copy_mark = Some((app.copy_scroll_offset, r, c));
     }
@@ -1631,6 +1636,7 @@ pub fn set_mark(app: &mut AppState) {
 /// just moving to the mark, so pressing it twice brings you back to where you
 /// jumped from.
 pub fn jump_to_mark(app: &mut AppState) {
+    app.copy_search_marks = false;
     let (mark_scroll, mark_row, mark_col) = match app.copy_mark { Some(m) => m, None => return };
     let here = match get_copy_pos(app) {
         Some((r, c)) => (app.copy_scroll_offset, r, c),
@@ -1889,6 +1895,7 @@ pub fn remember_search(app: &mut AppState, query: &str) {
 /// selection takes. A line selection (`V`) is a different command and does
 /// not carry over.
 pub fn begin_selection(app: &mut AppState) {
+    app.copy_search_marks = false;
     if let Some((r, c)) = get_copy_pos(app) {
         app.copy_anchor = Some((r, c));
         app.copy_anchor_scroll_offset = app.copy_scroll_offset;
@@ -1897,6 +1904,68 @@ pub fn begin_selection(app: &mut AppState) {
             app.copy_selection_mode = crate::types::SelectionMode::Char;
         }
     }
+}
+
+/// `select-line`, the `V` key: select the cursor's line.
+pub fn select_line(app: &mut AppState) {
+    app.copy_search_marks = false;
+    if let Some((r, c)) = get_copy_pos(app) {
+        app.copy_anchor = Some((r, c));
+        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
+        app.copy_pos = Some((r, c));
+        app.copy_selection_mode = crate::types::SelectionMode::Line;
+    }
+}
+
+/// Highlight kinds in [`copy_highlights`]: a search match, the match under
+/// the cursor, the marked line, and the marked cell itself.
+pub const HL_MATCH: u16 = 0;
+pub const HL_CURRENT_MATCH: u16 = 1;
+pub const HL_MARK_LINE: u16 = 2;
+pub const HL_MARK_CELL: u16 = 3;
+
+/// The highlighted spans on the focused pane's copy-mode screen, as
+/// `[row, first column, last column, kind]` in screen cells, for the client to
+/// paint with `copy-mode-match-style`, `copy-mode-current-match-style` and
+/// `copy-mode-mark-style`.
+///
+/// This is what tmux's `window_copy_update_style` (window-copy.c) does per
+/// cell: the marked line takes the mark style with the marked cell's colours
+/// swapped, every search match on screen takes the match style, and the match
+/// the cursor is on takes the current match style. Matches are only drawn
+/// while `copy_search_marks` says the last search still owns the screen
+/// (discussion #694).
+pub fn copy_highlights(app: &AppState) -> Vec<[u16; 4]> {
+    let mut out = Vec::new();
+    let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return out };
+    let p = match active_pane(&win.root, &win.active_path) { Some(p) => p, None => return out };
+    let (rows, cols) = (p.last_rows, p.last_cols);
+    if rows == 0 || cols == 0 {
+        return out;
+    }
+    let hist = p.term.lock().map(|t| t.screen().scrollback_filled()).unwrap_or(0);
+    let so = app.copy_scroll_offset.min(hist);
+    if let Some((mark_so, mr, mc)) = app.copy_mark {
+        let row = mr as i64 + so as i64 - mark_so as i64;
+        if row >= 0 && row < rows as i64 {
+            out.push([row as u16, 0, cols - 1, HL_MARK_LINE]);
+            out.push([row as u16, mc.min(cols - 1), mc.min(cols - 1), HL_MARK_CELL]);
+        }
+    }
+    if app.copy_search_marks {
+        let top = hist - so;
+        let (cr, cc) = app.copy_pos.unwrap_or((u16::MAX, 0));
+        for &(abs, c0, c1) in &app.copy_search_matches {
+            if abs < top || abs >= top + rows as usize || c1 <= c0 || c0 >= cols {
+                continue;
+            }
+            let row = (abs - top) as u16;
+            let last = (c1 - 1).min(cols - 1);
+            let kind = if row == cr && cc >= c0 && cc <= last { HL_CURRENT_MATCH } else { HL_MATCH };
+            out.push([row, c0, last, kind]);
+        }
+    }
+    out
 }
 
 /// The Escape key in copy mode. tmux binds it to `clear-selection` in
@@ -1916,6 +1985,7 @@ pub fn escape_key(app: &mut AppState) {
 /// and stay in copy mode. A line selection goes back to a character one, while
 /// the rectangle flag survives, as tmux keeps `rectflag` across it.
 pub fn clear_selection(app: &mut AppState) {
+    app.copy_search_marks = false;
     app.copy_anchor = None;
     if app.copy_selection_mode == crate::types::SelectionMode::Line {
         app.copy_selection_mode = crate::types::SelectionMode::Char;
@@ -2519,6 +2589,7 @@ pub fn move_prev_paragraph(app: &mut AppState) {
 /// same buffer line and the view moves under it, clamped by how much
 /// scrollback is actually available in that direction.
 pub fn scroll_middle(app: &mut AppState) {
+    app.copy_search_marks = false;
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
@@ -2547,6 +2618,7 @@ pub fn scroll_middle(app: &mut AppState) {
 
 /// Move to matching bracket — % key
 pub fn move_matching_bracket(app: &mut AppState) {
+    app.copy_search_marks = false;
     let (r, c) = match get_copy_pos(app) { Some(p) => p, None => return };
     let win = match app.windows.get(app.active_idx) { Some(w) => w, None => return };
     let p = match active_pane(&win.root, &win.active_path) { Some(p) => p, None => return };

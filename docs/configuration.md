@@ -227,6 +227,9 @@ Details worth knowing:
 | `pane-border-status` | Str | | Pane border status position (`top`/`bottom`/`off`) |
 | `copy-mode-line-number-style` | Str | `fg=brightblack` | Style of the copy-mode line number gutter |
 | `copy-mode-current-line-number-style` | Str | `fg=yellow,bold` | Style of the line number on the copy-mode cursor row |
+| `copy-mode-match-style` | Str | `bg=cyan,fg=black` | Style of search matches in copy mode |
+| `copy-mode-current-match-style` | Str | `bg=magenta,fg=black` | Style of the search match under the copy-mode cursor |
+| `copy-mode-mark-style` | Str | `bg=red,fg=black` | Style of the line marked with `X` (set-mark); the marked cell has its colours swapped |
 | `window-style` | Str | | Style applied to the contents of panes that are not the active pane (tmux `options-table.c` wording), and the fallback for the active pane; fills only cells whose colour is the terminal default. Also accepts `dim=N` (0 to 100 percent) |
 | `window-active-style` | Str | | Style applied to the contents of the active pane; each of `fg` and `bg` falls back to `window-style` when this option does not name it. Explicit application colours always win. Also accepts `dim=N` |
 | `popup-border-style` | Str | `fg=yellow` | Border style of `display-popup` overlays |

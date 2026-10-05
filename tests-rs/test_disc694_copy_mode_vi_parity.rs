@@ -308,6 +308,10 @@ fn a_new_prompt_starts_with_the_cursor_at_the_end() {
 // whether or not a selection is active.
 
 fn render_copy_leaf(sel: ((u16, u16), (u16, u16)), cursor: (u16, u16)) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    render_copy_leaf_hl(Some(sel), cursor, Vec::new())
+}
+
+fn render_copy_leaf_hl(sel: Option<((u16, u16), (u16, u16))>, cursor: (u16, u16), hl: Vec<[u16; 4]>) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
     use crate::layout::{CellJson, LayoutJson};
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::layout::Rect;
@@ -324,11 +328,11 @@ fn render_copy_leaf(sel: ((u16, u16), (u16, u16)), cursor: (u16, u16)) -> (ratat
         id: 0, rows: h, cols: w, cursor_row: 0, cursor_col: 0,
         alternate_screen: false, wants_mouse: false, hide_cursor: true, cursor_shape: 0,
         active: true, copy_mode: true, scroll_offset: 0, view_offset: 0,
-        sel_start_row: Some(sel.0 .0), sel_start_col: Some(sel.0 .1),
-        sel_end_row: Some(sel.1 .0), sel_end_col: Some(sel.1 .1),
-        sel_mode: Some("char".to_string()),
+        sel_start_row: sel.map(|s| s.0 .0), sel_start_col: sel.map(|s| s.0 .1),
+        sel_end_row: sel.map(|s| s.1 .0), sel_end_col: sel.map(|s| s.1 .1),
+        sel_mode: sel.map(|_| "char".to_string()),
         copy_cursor_row: Some(cursor.0), copy_cursor_col: Some(cursor.1),
-        content, rows_v2: Vec::new(), title: None,
+        content, rows_v2: Vec::new(), title: None, copy_hl: hl,
     };
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| {
@@ -421,4 +425,101 @@ fn list_keys_shows_v_as_rectangle_toggle_and_escape_as_clear_selection() {
     assert!(vi.contains(&("Escape", "send-keys -X clear-selection")));
     assert!(vi.contains(&("q", "send-keys -X cancel")));
     assert!(vi.contains(&("r", "send-keys -X refresh-from-pane")));
+}
+
+// ── 4b and 5. match and mark highlighting ───────────────────────────────────
+//
+// Measured on dd695ea with real keystrokes and the client's console
+// attributes: after `?beta` every row read `[attr 7x13,16391x1,7x106]`, only
+// the cursor cell reversed, and after `X` the marked row read `7x120` like its
+// neighbours. tmux paints them with copy-mode-match-style,
+// copy-mode-current-match-style and copy-mode-mark-style
+// (window_copy_update_style).
+
+fn searched_app(query: &str) -> AppState {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row alpha beta", 0, 60);
+    app.mode_keys = "vi".to_string();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    crate::input::send_text_to_active(&mut app, "?").unwrap();
+    crate::input::send_text_to_active(&mut app, query).unwrap();
+    crate::input::send_key_to_active(&mut app, "enter").unwrap();
+    app
+}
+
+#[test]
+fn every_visible_match_is_highlighted_and_the_current_one_differs() {
+    let app = searched_app("beta");
+    let hl = crate::copy_mode::copy_highlights(&app);
+    let (cr, cc) = app.copy_pos.expect("the cursor is on the match");
+    let current: Vec<_> = hl.iter().filter(|h| h[3] == crate::copy_mode::HL_CURRENT_MATCH).collect();
+    assert_eq!(current.len(), 1, "exactly one current match: {hl:?}");
+    assert_eq!((current[0][0], current[0][1]), (cr, cc));
+    assert_eq!(current[0][2] - current[0][1], 3, "beta is four cells");
+    let others = hl.iter().filter(|h| h[3] == crate::copy_mode::HL_MATCH).count();
+    assert!(others >= 20, "the other visible rows are highlighted too, got {others}");
+}
+
+#[test]
+fn n_moves_the_current_match() {
+    let mut app = searched_app("beta");
+    let before = app.copy_pos;
+    crate::input::send_text_to_active(&mut app, "n").unwrap();
+    assert_ne!(app.copy_pos, before);
+    let hl = crate::copy_mode::copy_highlights(&app);
+    let (cr, cc) = app.copy_pos.unwrap();
+    assert!(hl.iter().any(|h| h[3] == crate::copy_mode::HL_CURRENT_MATCH && h[0] == cr && h[1] == cc));
+}
+
+#[test]
+fn begin_selection_clears_the_match_highlight_like_tmux() {
+    // begin-selection is WINDOW_COPY_CMD_CLEAR_ALWAYS in window-copy.c.
+    let mut app = searched_app("beta");
+    crate::input::send_key_to_active(&mut app, "space").unwrap();
+    let hl = crate::copy_mode::copy_highlights(&app);
+    assert!(hl.iter().all(|h| h[3] >= crate::copy_mode::HL_MARK_LINE), "{hl:?}");
+    // A cursor motion does not clear them in vi (CLEAR_EMACS_ONLY).
+    let mut app = searched_app("beta");
+    crate::input::send_text_to_active(&mut app, "j").unwrap();
+    assert!(!crate::copy_mode::copy_highlights(&app).is_empty());
+}
+
+#[test]
+fn the_marked_line_is_highlighted_and_follows_scrolling() {
+    let mut app = app_with_pane();
+    feed(&view_term(&app), "row", 0, 80);
+    app.mode_keys = "vi".to_string();
+    crate::copy_mode::enter_copy_mode(&mut app);
+    app.copy_pos = Some((10, 4));
+    crate::input::send_text_to_active(&mut app, "X").unwrap();
+    let hl = crate::copy_mode::copy_highlights(&app);
+    let cols = super::test_copy_mode_snapshot::pane_of(&app).unwrap().last_cols;
+    assert!(hl.contains(&[10, 0, cols - 1, crate::copy_mode::HL_MARK_LINE]), "{hl:?}");
+    assert!(hl.contains(&[10, 4, 4, crate::copy_mode::HL_MARK_CELL]));
+    crate::copy_mode::scroll_copy_up(&mut app, 3);
+    let hl = crate::copy_mode::copy_highlights(&app);
+    assert!(hl.contains(&[13, 0, cols - 1, crate::copy_mode::HL_MARK_LINE]), "the mark stays on its line: {hl:?}");
+}
+
+#[test]
+fn the_client_paints_matches_and_the_mark_in_tmux_default_styles() {
+    use ratatui::style::Color;
+    let hl = vec![[2, 4, 7, 0], [2, 10, 13, 1], [5, 0, 39, 2], [5, 3, 3, 3]];
+    let (_, buf) = render_copy_leaf_hl(None, (2, 10), hl);
+    assert_eq!(buf[(5u16, 2u16)].bg, Color::Cyan, "a match is bg=cyan");
+    assert_eq!(buf[(5u16, 2u16)].fg, Color::Black);
+    assert_eq!(buf[(11u16, 2u16)].bg, Color::Magenta, "the current match is bg=magenta");
+    assert_eq!(buf[(0u16, 5u16)].bg, Color::Red, "the marked line is bg=red");
+    assert_eq!(buf[(3u16, 5u16)].bg, Color::Black, "the marked cell has its colours swapped");
+    assert_eq!(buf[(3u16, 5u16)].fg, Color::Red);
+    assert_eq!(buf[(0u16, 6u16)].bg, Color::Reset, "other rows are untouched");
+}
+
+#[test]
+fn the_selection_is_drawn_over_a_match() {
+    use ratatui::style::Color;
+    let hl = vec![[2, 4, 7, 0]];
+    let (_, buf) = render_copy_leaf_hl(Some(((2, 0), (2, 5))), (2, 5), hl);
+    assert_eq!(buf[(4u16, 2u16)].bg, Color::Yellow, "mode-style wins over the match");
+    assert_eq!(buf[(6u16, 2u16)].bg, Color::Cyan);
 }

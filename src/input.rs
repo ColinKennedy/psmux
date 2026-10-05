@@ -1095,15 +1095,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     // tmux parity #62: rectangle-toggle (not begin-selection)
                     crate::copy_mode::toggle_rectangle(app);
                 }
-                KeyCode::Char('V') => {
-                    // Start line-wise selection (vi visual-line mode)
-                    if let Some((r,c)) = crate::copy_mode::get_copy_pos(app) {
-                        app.copy_anchor = Some((r,c));
-                        app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                        app.copy_pos = Some((r,c));
-                        app.copy_selection_mode = crate::types::SelectionMode::Line;
-                    }
-                }
+                KeyCode::Char('V') => { crate::copy_mode::select_line(app); }
                 KeyCode::Char('o') => {
                     // Swap cursor and anchor
                     if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
@@ -3754,14 +3746,7 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
         // psmux keeps its old begin-selection there.
         'v' if app.mode_keys == "vi" => { crate::copy_mode::toggle_rectangle(app); }
         'v' => { crate::copy_mode::begin_selection(app); }
-        'V' => {
-            if let Some((r, c)) = crate::copy_mode::get_copy_pos(app) {
-                app.copy_anchor = Some((r, c));
-                app.copy_anchor_scroll_offset = app.copy_scroll_offset;
-                app.copy_pos = Some((r, c));
-                app.copy_selection_mode = crate::types::SelectionMode::Line;
-            }
-        }
+        'V' => { crate::copy_mode::select_line(app); }
         'o' => {
             if let (Some(a), Some(p)) = (app.copy_anchor, app.copy_pos) {
                 app.copy_anchor = Some(p);

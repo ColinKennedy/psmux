@@ -1515,6 +1515,54 @@ pub struct CopyLnRender {
     pub hide_position: bool,
     pub num_style: Style,
     pub cur_style: Style,
+    /// Search match, current match and mark styles for `copy_hl` (#694).
+    pub hl: CopyHighlightStyles,
+}
+
+/// The three copy-mode highlight styles, tmux's `copy-mode-match-style`,
+/// `copy-mode-current-match-style` and `copy-mode-mark-style`.
+#[derive(Clone, Copy)]
+pub struct CopyHighlightStyles {
+    pub match_style: Style,
+    pub current_match_style: Style,
+    pub mark_style: Style,
+}
+
+impl Default for CopyHighlightStyles {
+    /// tmux's defaults (options-table.c, 3.4 to 3.7b).
+    fn default() -> Self {
+        CopyHighlightStyles {
+            match_style: crate::style::parse_tmux_style("bg=cyan,fg=black"),
+            current_match_style: crate::style::parse_tmux_style("bg=magenta,fg=black"),
+            mark_style: crate::style::parse_tmux_style("bg=red,fg=black"),
+        }
+    }
+}
+
+/// The style a copy-mode highlight gives the cell at row `r`, column `c`,
+/// or None. tmux's `window_copy_update_style` applies the mark first and the
+/// search marks over it, and the marked cell itself has its colours swapped.
+pub(crate) fn copy_highlight_style(hl: &[[u16; 4]], r: u16, c: u16, styles: &CopyHighlightStyles) -> Option<Style> {
+    let mut best: Option<u16> = None;
+    // Higher wins: current match 4, match 3, marked cell 2, marked line 1.
+    let rank = |k: u16| match k { 1 => 4, 0 => 3, 3 => 2, _ => 1 };
+    for h in hl {
+        if h[0] == r && c >= h[1] && c <= h[2] {
+            if best.map_or(true, |b| rank(h[3]) > rank(b)) { best = Some(h[3]); }
+        }
+    }
+    match best? {
+        0 => Some(styles.match_style),
+        1 => Some(styles.current_match_style),
+        3 => {
+            let m = styles.mark_style;
+            let mut s = m;
+            s.fg = m.bg;
+            s.bg = m.fg;
+            Some(s)
+        }
+        _ => Some(styles.mark_style),
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1878,8 +1926,10 @@ pub fn render_layout_json(
             content,
             rows_v2,
             title,
+            copy_hl,
         } => {
             let window_style = window_styles.for_pane(*active);
+            let hl_styles = copy_ln.map(|cfg| cfg.hl).unwrap_or_default();
             let window_dim = window_styles.dim_for_pane(*active);
             // Paths that paint straight from the window style take it pre
             // dimmed; `apply_window_content_style` dims the cell colours itself.
@@ -1946,6 +1996,12 @@ pub fn render_layout_json(
                         if in_selection {
                             let ms = crate::style::parse_tmux_style(mode_style_str);
                             style = ms;
+                        } else if *copy_mode && *active && !copy_hl.is_empty() {
+                            // Search matches and the mark (#694); the selection,
+                            // drawn over them in tmux too, wins above.
+                            if let Some(hs) = copy_highlight_style(copy_hl, r, c, &hl_styles) {
+                                style = hs;
+                            }
                         }
                         if cell.inverse { style = style.add_modifier(Modifier::REVERSED); }
                         if cell.dim { style = style.add_modifier(Modifier::DIM); }
@@ -3153,6 +3209,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         copy_mode_line_number_style: Option<String>,
         #[serde(default)]
         copy_mode_current_line_number_style: Option<String>,
+        /// copy-mode-match-style, copy-mode-current-match-style and
+        /// copy-mode-mark-style, sent only when the user set them (#694).
+        #[serde(default)]
+        copy_mode_match_style: Option<String>,
+        #[serde(default)]
+        copy_mode_current_match_style: Option<String>,
+        #[serde(default)]
+        copy_mode_mark_style: Option<String>,
         /// window-status-format (short key to save bandwidth)
         #[serde(default)]
         wsf: Option<String>,
@@ -7181,12 +7245,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                      state.copy_mode_current_line_number_style.as_deref()
                         .map(crate::style::parse_tmux_style).unwrap_or_else(|| Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
                 } else { (Style::default(), Style::default()) };
+                let mut hl = CopyHighlightStyles::default();
+                if let Some(s) = state.copy_mode_match_style.as_deref() { hl.match_style = crate::style::parse_tmux_style(s); }
+                if let Some(s) = state.copy_mode_current_match_style.as_deref() { hl.current_match_style = crate::style::parse_tmux_style(s); }
+                if let Some(s) = state.copy_mode_mark_style.as_deref() { hl.mark_style = crate::style::parse_tmux_style(s); }
                 Some(CopyLnRender {
                     mode,
                     hsize: state.copy_hsize,
                     hide_position: state.copy_hide_position,
                     num_style,
                     cur_style,
+                    hl,
                 })
             };
             let window_styles = WindowContentStyles {

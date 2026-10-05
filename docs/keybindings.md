@@ -459,7 +459,8 @@ bind-key -T copy-mode-vi r send-keys -X refresh-toggle
 | `X` | Set the mark at the cursor |
 | `Alt+x` | Exchange the cursor and the mark |
 
-`Alt+x` swaps rather than jumps, matching tmux. Pressing it twice returns you to where you started.
+`Alt+x` swaps rather than jumps, matching tmux. Pressing it twice returns you to where you started. The marked line is drawn in
+`copy-mode-mark-style` (`bg=red,fg=black`) with the marked cell's colours swapped, as tmux draws it.
 
 ### Bracket / Paragraph
 
@@ -512,6 +513,11 @@ bind-key -T copy-mode-vi v send-keys -X begin-selection
 Search covers the whole scrollback, not just the rows on screen. A match that is off screen
 scrolls the view to it, parked a quarter of a screen from the bottom the way tmux does, and
 `?` stops at the nearest match above the cursor.
+
+Every match on screen is drawn in `copy-mode-match-style` (`bg=cyan,fg=black`) and the one under the
+cursor in `copy-mode-current-match-style` (`bg=magenta,fg=black`), tmux's defaults. As in tmux the
+highlight stays while you move with `n`, `N` and the cursor keys, and goes when a command that
+changes the selection or the mark runs (`Space`, `Esc`, `V`, `v`, `X`, `z`, `%`, `^`).
 
 ### Goto Line
 
