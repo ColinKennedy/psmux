@@ -310,7 +310,24 @@ fn respawn(app: &mut AppState, _pty_system: &dyn portable_pty::PtySystem) {
     // produces a deficit, so an opted-out user's pool stays empty.
     let killed = app.warm_pane.len();
     app.warm_pane.kill_all();
-    crate::warm_trace!("pool: respawn requested, killed {} spare(s), target={}", killed, app.warm_pane.target);
+    // The spares still being spawned are just as stale: a refill issued before
+    // this point captured the old environment block (or shell) the moment its
+    // CreateProcessW began, and it lands in the pool AFTER `kill_all` has run.
+    // A standby trickles its pool one spare at a time, each spawn 75 to 270 ms
+    // inside CreateProcessW, so a claim that adopts the client's environment
+    // (#659) has a real chance of arriving inside that window; the spare then
+    // landed with the standby's environment and `new-window` handed it out
+    // (test_issue659_warm_claim_environment, 3 of 10 runs). Every spare issued
+    // so far has an id below `next_pane_id`, so raising the floor there makes
+    // `WarmPool::push` refuse and kill each one on arrival, the same gate a
+    // cold creation uses against late arrivals (ebce952).
+    let inflight = app.warm_pane.inflight;
+    let floor = app.next_pane_id;
+    let refused_floor = app.warm_pane.set_issued_floor(floor);
+    crate::warm_trace!(
+        "pool: respawn requested, killed {} spare(s), {} in flight refused below floor {} (dropped {}), target={}",
+        killed, inflight, floor, refused_floor, app.warm_pane.target
+    );
 }
 
 /// Helper for warm-pane consume sites in `pane.rs`.  When a warm
@@ -510,3 +527,7 @@ mod test_issue661_warm_pool_depth;
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_id_monotonic_claim.rs"]
 mod test_pane_id_monotonic_claim;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue659_respawn_refuses_inflight.rs"]
+mod test_issue659_respawn_refuses_inflight;
