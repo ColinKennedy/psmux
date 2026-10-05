@@ -561,8 +561,9 @@ Opened by `/`, `?`, `Ctrl+s` or `Ctrl+r`. While it is open the copy mode keys ar
 | `Enter` | Accept the search and jump to the match |
 | `Esc` / `Ctrl+c` / `Ctrl+g` | Cancel the search |
 
-These are the keys of tmux's prompt editor that apply here. The cursor position is not drawn on the
-status line yet. `Ctrl+b` and `Ctrl+f` also move the cursor, but `Ctrl+b` is the default prefix, which
+These are the keys of tmux's prompt editor that apply here. The cursor is drawn on the status line
+where it sits, and the prompt scrolls when the search term is longer than the line, so the cursor
+stays on screen. `Ctrl+b` and `Ctrl+f` also move the cursor, but `Ctrl+b` is the default prefix, which
 the client takes first. The goto line prompt takes the same editing keys.
 
 ### Copy Mode Goto Line Prompt
