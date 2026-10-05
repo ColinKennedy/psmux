@@ -302,6 +302,8 @@ The [Plugin Developer Guide](https://github.com/psmux/psmux-plugins/blob/main/PL
 
 **`run-shell` output pops up over the pane.** That is tmux behaviour for a foreground `run-shell` with output. Use `run-shell -b` for scripts that should stay silent, or send their output to `Out-Null`.
 
+**A key bound to a slow `run-shell`.** The prefix indicator clears as soon as the key is pressed and the client keeps drawing and reading keys while the script runs; the output popup appears when it finishes. As in tmux, the rest of the binding waits for it: in `bind C-s run-shell 'save.ps1' \; display-message saved` the message shows only after `save.ps1` exits. One difference: tmux holds keys typed during a foreground `run-shell` until it ends, while psmux delivers them to the pane straight away.
+
 ## FAQ
 
 **Do psmux plugins require bash, cygwin, or WSL?**
