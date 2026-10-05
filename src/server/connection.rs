@@ -50,6 +50,12 @@ fn run_cli_new_session(args: &[&str]) -> String {
                 let err = err.trim().trim_start_matches("psmux:").trim();
                 let err = if err.is_empty() { "new-session failed" } else { err };
                 text.push_str(&format!("ERROR: {}\n", err));
+            } else if text.trim().is_empty() {
+                // The CLI prints nothing on a plain success; the wire contract
+                // of this handler has always been `OK` (test_issue505 and the
+                // raw socket callers read exactly that). A `-P` report is the
+                // reply when there is one.
+                text = "OK\n".to_string();
             }
             text
         }
