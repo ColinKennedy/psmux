@@ -94,7 +94,11 @@ fn the_window_scrolls_by_characters_not_bytes() {
     let s = "\u{65e5}\u{672c}\u{8a9e}\u{3067}\u{30b3}\u{30de}\u{30f3}\u{30c9}";
     assert_eq!(s.len(), 24);
     let (shown, col) = prompt_window(s, s.len(), 10);
-    assert_eq!(col, 9);
+    // The window starts at column 7, inside the fourth character, which is
+    // dropped whole; the last four (8 columns) are shown and the cursor sits
+    // right after them, not one blank cell further at column 9.
+    assert_eq!(shown, "\u{30b3}\u{30de}\u{30f3}\u{30c9}");
+    assert_eq!(col, 8);
     let width: usize = shown
         .chars()
         .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))

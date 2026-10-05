@@ -965,7 +965,13 @@ pub fn prompt_window(s: &str, cursor: usize, cols: usize) -> (&str, usize) {
         col += ch.width().unwrap_or(0);
     }
     let shown = str_prefix_within_cols(&s[start..], cols);
-    (shown, pcursor.saturating_sub(offset))
+    // `col` is where the shown text really starts. It is `offset` unless a
+    // wide character straddled the edge and was dropped, which starts the
+    // text one column later; the cursor is measured from the same origin as
+    // the text drawn at column 0, so it stays right after what precedes it
+    // instead of one blank cell further (#741 follow up). tmux's
+    // `pcursor - offset` is one column off its own redraw in that case.
+    (shown, pcursor.saturating_sub(col))
 }
 
 /// The longest prefix of `s` whose display width is at most `max_cols`
@@ -1491,6 +1497,10 @@ mod tests_issue712_str_prefix_within;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue741_prompt_cursor_column.rs"]
 mod tests_issue741_prompt_cursor_column;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue741_prompt_window_edges.rs"]
+mod tests_issue741_prompt_window_edges;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_util_audit.rs"]
