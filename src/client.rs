@@ -7124,6 +7124,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         let drawn_copy_sel = active_copy_sel_end(&root);
         // Hold the frame's output until the cursor is settled (#697).
         terminal.backend_mut().begin_frame();
+        // Where an open prompt put its cursor during the draw (#741), so the
+        // post draw settle and the Win32 caret can follow it.
+        let mut prompt_cursor_pos: Option<(u16, u16)> = None;
         terminal.draw(|f| {
             client_drawn_sel = drawn_copy_sel;
             let area = f.area();
@@ -8188,6 +8191,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 f.render_widget(para, inner);
                 let cx = inner.x + 2 + cur_col as u16;
                 f.set_cursor_position((cx, inner.y));
+                prompt_cursor_pos = Some((cx, inner.y));
             }
             if window_idx_input {
                 let overlay = Block::default().borders(Borders::ALL).title("select window");
@@ -8199,6 +8203,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 f.render_widget(para, inner);
                 let cx = inner.x + 7 + window_idx_buf.len() as u16;
                 f.set_cursor_position((cx, inner.y));
+                prompt_cursor_pos = Some((cx, inner.y));
             }
             if let Some(ref cmd) = confirm_cmd {
                 let overlay = Block::default().borders(Borders::ALL).title("confirm");
@@ -8512,14 +8517,15 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // when no prompt is up: tmux settles the cursor on
                 // `c->prompt_cursor` first and takes the pane in the else
                 // branch (`server_client_reset_state`, server-client.c:1797
-                // to :1808). None here means "keep what the draw asked for",
-                // which is where the overlay put it. The pane's position used
+                // to :1808). The position is the one the overlay asked for
+                // during the draw, passed explicitly so the Win32 caret
+                // follows the prompt as well. The pane's position used
                 // to win instead, so in a pane that was not in copy mode the
                 // prompt had no cursor at all and there was no way to see
                 // where typing would land (#741). A pane IN copy mode sets
                 // neither of the post draw positions, which is why the prompt
                 // had a cursor there and not here.
-                None
+                prompt_cursor_pos
             } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
                 // Content lives inside the border-label reservation; use the render's inner rect.
                 let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
