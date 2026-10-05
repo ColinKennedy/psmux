@@ -780,7 +780,13 @@ fn paste_into_pane_title_appends() {
 }
 
 #[test]
-fn paste_into_window_idx_prompt_keeps_only_digits() {
+fn paste_into_window_idx_prompt_keeps_the_text_as_typed() {
+    // The window index prompt used to keep digits only, so "1a2b3" became
+    // "123" and any letter typed there fell through to the pane. tmux binds
+    // the key as a plain `command-prompt -pindex { select-window -t ':%%' }`
+    // (key-bindings.c:394), which takes any text and lets a window NAME
+    // resolve too, so since the #744 follow up the prompt keeps the paste as
+    // typed. Control characters are still dropped.
     let mut command_buf = String::new();
     let mut command_cursor = 0;
     let mut rename_buf = String::new();
@@ -794,7 +800,7 @@ fn paste_into_window_idx_prompt_keeps_only_digits() {
         true, &mut window_idx_buf,
     );
     assert!(consumed);
-    assert_eq!(window_idx_buf, "123");
+    assert_eq!(window_idx_buf, "1a2b3");
 }
 
 #[test]
