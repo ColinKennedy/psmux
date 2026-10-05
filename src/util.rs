@@ -927,6 +927,53 @@ pub fn str_prefix_within(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// The window of `s` a prompt `cols` wide shows with the cursor visible, and
+/// the column that cursor falls in.
+///
+/// A prompt keeps its cursor as a byte offset, so the column it belongs in is
+/// the display WIDTH of the text before it and not the offset itself: eight
+/// box drawing characters are 24 bytes and 8 columns, and drawing the cursor
+/// at column 24 put it 16 past the text (#741).
+///
+/// The window follows tmux. When the cursor would fall past the right edge,
+/// the text scrolls so the cursor stays inside instead of being drawn outside
+/// the prompt (`status.c:937` to `:944`, tag 3.7c, where `pcursor` is
+/// `utf8_strwidth(prompt_buffer, prompt_index)` and the drawing starts
+/// `offset` columns in). A character straddling the left edge of the window is
+/// dropped whole, as tmux's per character redraw drops it.
+///
+/// Returns `(text to draw, column of the cursor within it)`.
+pub fn prompt_window(s: &str, cursor: usize, cols: usize) -> (&str, usize) {
+    use unicode_width::UnicodeWidthChar;
+    // A prompt with no room at all. Reachable: the caller hands over the box
+    // width less the two columns of its ": " prefix.
+    if cols == 0 {
+        return ("", 0);
+    }
+    let before = str_prefix_within(s, cursor);
+    let pcursor: usize = before.chars().map(|c| c.width().unwrap_or(0)).sum();
+    // One column is kept for the cursor itself, so a cursor at the end of a
+    // full line still has somewhere to sit.
+    let offset = if pcursor >= cols { pcursor - cols + 1 } else { 0 };
+    let mut start = s.len();
+    let mut col = 0usize;
+    for (i, ch) in s.char_indices() {
+        if col >= offset {
+            start = i;
+            break;
+        }
+        col += ch.width().unwrap_or(0);
+    }
+    let shown = str_prefix_within_cols(&s[start..], cols);
+    // `col` is where the shown text really starts. It is `offset` unless a
+    // wide character straddled the edge and was dropped, which starts the
+    // text one column later; the cursor is measured from the same origin as
+    // the text drawn at column 0, so it stays right after what precedes it
+    // instead of one blank cell further (#741 follow up). tmux's
+    // `pcursor - offset` is one column off its own redraw in that case.
+    (shown, pcursor.saturating_sub(col))
+}
+
 /// The longest prefix of `s` whose display width is at most `max_cols`
 /// columns (wide CJK and emoji count 2). For titles cut to a box width,
 /// where a byte budget would both split characters and miscount columns.
@@ -1446,6 +1493,14 @@ mod tests_pipe_pane_cat_file_sink;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_str_prefix_within.rs"]
 mod tests_issue712_str_prefix_within;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue741_prompt_cursor_column.rs"]
+mod tests_issue741_prompt_cursor_column;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue741_prompt_window_edges.rs"]
+mod tests_issue741_prompt_window_edges;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_util_audit.rs"]
