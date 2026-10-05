@@ -873,6 +873,21 @@ fn is_read_retry(e: &io::Error) -> bool {
     ) || matches!(e.raw_os_error(), Some(997) | Some(10004) | Some(10060))
 }
 
+/// Merge a run-shell child's stdout and stderr the way both the persistent and
+/// the one-shot path render it: stdout first, a newline between the two when
+/// neither already provides one.
+pub(crate) fn run_shell_output_text(out: &std::process::Output) -> String {
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    if !stderr_text.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stderr_text);
+    }
+    text
+}
+
 /// Handle a single TCP connection from a client.
 /// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
 /// to the main server event loop via the `tx` channel.
@@ -1584,7 +1599,22 @@ let mut attached_sent = false;
 // `attach -r` (issue #724): set by the client's `client-flags read-only`.
 let mut client_readonly = false;
 let mut pending_chain: Vec<String> = Vec::new();
+// The rest of a command list that follows a foreground run-shell, held until
+// that shell exits (PR #740). tmux runs `run-shell X \; cmd` in that order: the
+// run-shell item waits in the client's queue (cmd-run-shell.c returns
+// CMD_RETURN_WAIT, cmd-queue.c marks it CMDQ_WAITING) and `cmd` runs only once
+// the job's callback continues the queue. The shell itself runs on its own
+// thread so this reader keeps reading; the receiver disconnects when it ends.
+// The 10 ms read timeout above brings the loop back here to release it.
+let mut deferred_chains: Vec<(mpsc::Receiver<()>, Vec<String>)> = Vec::new();
 loop {
+    if pending_chain.is_empty() && line.trim().is_empty() && !deferred_chains.is_empty() {
+        if let Some(i) = deferred_chains.iter().position(|(done, _)| {
+            matches!(done.try_recv(), Err(mpsc::TryRecvError::Disconnected))
+        }) {
+            pending_chain = deferred_chains.remove(i).1;
+        }
+    }
     // Check pending chained commands before reading from socket
     if !pending_chain.is_empty() {
         line = pending_chain.remove(0);
@@ -4560,38 +4590,56 @@ match cmd {
                         let _ = write_stream.flush();
                     }
                 }
+            } else if persistent {
+                // Do NOT run the shell on this thread. It is the reader for an
+                // attached client, and a prefix binding arrives as two lines:
+                // the command, then the client's `prefix-end`. Blocking on
+                // c.output() here withholds that prefix-end - so #{client_prefix}
+                // (the PREFIX status indicator) stays on - and every keystroke
+                // behind it until the command exits. Run it on a thread and post
+                // the result back through the server loop, the way commands.rs
+                // already does for the in-process path.
+                let mut c = crate::commands::build_run_shell_command(&shell_cmd);
+                // The thread needs an owned sender + target: `tx` here borrows
+                // the per-command TargetedSender, which does not outlive the
+                // command loop.
+                let inner = tx.inner.clone();
+                let target = tx.target.clone();
+                // Whatever follows in this command list waits for the shell,
+                // as in tmux. `done` is dropped when the thread ends, which
+                // is what releases it at the top of the loop.
+                let (done, done_rx) = mpsc::channel::<()>();
+                if !pending_chain.is_empty() {
+                    deferred_chains.push((done_rx, std::mem::take(&mut pending_chain)));
+                }
+                std::thread::spawn(move || {
+                    let _done = done;
+                    let tx = TargetedSender::new(&inner, target);
+                    match c.output() {
+                        Ok(out) => {
+                            let text = run_shell_output_text(&out);
+                            if !text.is_empty() {
+                                let _ = tx.send(CtrlReq::ShowTextPopup("run-shell".to_string(), text));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(CtrlReq::StatusMessage(format!("run-shell: {}", e)));
+                        }
+                    }
+                });
             } else {
                 let mut c = crate::commands::build_run_shell_command(&shell_cmd);
-                let result = c.output();
-                match result {
+                match c.output() {
                     Ok(out) => {
-                        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                        let stderr_text = String::from_utf8_lossy(&out.stderr);
-                        if !stderr_text.is_empty() {
-                            if !text.is_empty() && !text.ends_with('\n') {
-                                text.push('\n');
-                            }
-                            text.push_str(&stderr_text);
-                        }
+                        let text = run_shell_output_text(&out);
                         if !text.is_empty() {
-                            if persistent {
-                                let _ = tx.send(CtrlReq::ShowTextPopup("run-shell".to_string(), text));
-                            } else {
-                                let _ = write!(write_stream, "{}", text);
-                                let _ = write_stream.flush();
-                            }
+                            let _ = write!(write_stream, "{}", text);
+                            let _ = write_stream.flush();
                         }
                     }
                     Err(e) => {
-                        // Same newline handling as the -b path above (this one
-                        // predates the branch; fixed alongside for consistency).
-                        let err_msg = format!("run-shell: {}", e);
-                        if persistent {
-                            let _ = tx.send(CtrlReq::StatusMessage(err_msg));
-                        } else {
-                            let _ = write!(write_stream, "{}\n", err_msg);
-                            let _ = write_stream.flush();
-                        }
+                        let _ = write!(write_stream, "run-shell: {}\n", e);
+                        let _ = write_stream.flush();
                     }
                 }
             }
@@ -6351,6 +6399,10 @@ mod tests_send_keys_literal_byte;
 #[cfg(test)]
 #[path = "../../tests-rs/test_refresh_client_flags.rs"]
 mod tests_refresh_client_flags;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_pr740_run_shell_reader.rs"]
+mod tests_pr740_run_shell_reader;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_set_option_control.rs"]

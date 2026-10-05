@@ -80,6 +80,30 @@ pub enum BindingDispatch {
     Commands { cmds: Vec<String>, latch: Option<String> },
 }
 
+/// The lines a binding's command list goes out as (PR #740).
+///
+/// Each command is normally its own line. The server runs a foreground
+/// `run-shell` (no `-b`) on a thread so the client's reader keeps reading, and
+/// separate lines would then run before the shell had finished. tmux runs the
+/// rest of the list only after it: the run-shell item waits in the client's
+/// queue (cmd-run-shell.c returns CMD_RETURN_WAIT, cmd-queue.c CMDQ_WAITING).
+/// So a list in which a foreground run-shell is followed by more commands goes
+/// out as one `\;` joined line, which the server splits again and holds the
+/// tail of until the shell exits. Every other list is unchanged on the wire.
+pub(crate) fn binding_wire_lines(cmds: &[String]) -> Vec<String> {
+    let waits = |sub: &str| {
+        let argv = crate::commands::parse_command_line(sub);
+        matches!(argv.first().map(|s| s.as_str()), Some("run-shell") | Some("run"))
+            && !argv.iter().skip(1).any(|a| a == "-b")
+    };
+    let n = cmds.len();
+    if n > 1 && cmds[..n - 1].iter().any(|c| waits(c)) {
+        vec![format!("{}\n", cmds.join(" \\; "))]
+    } else {
+        cmds.iter().map(|c| format!("{}\n", c)).collect()
+    }
+}
+
 /// Split a binding into the command list tmux would dispatch and report the key
 /// table it leaves latched (issue #640).
 ///
@@ -4304,9 +4328,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 } else {
                                     // Split on \; to support command chaining (issue #192)
                                     let sub_cmds = crate::config::split_chained_commands_pub(&entry.c);
-                                    for sub in &sub_cmds {
-                                        cmd_batch.push(format!("{}\n", sub));
-                                    }
+                                    cmd_batch.extend(binding_wire_lines(&sub_cmds));
                                 }
                             }
                         }
@@ -4429,9 +4451,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                             do_session_nav = Some(next);
                                         }
                                         BindingDispatch::Commands { cmds, latch } => {
-                                            for sub in &cmds {
-                                                cmd_batch.push(format!("{}\n", sub));
-                                            }
+                                            cmd_batch.extend(binding_wire_lines(&cmds));
                                             if latch.is_some() {
                                                 key_table_latch = latch;
                                             }
@@ -5417,8 +5437,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                                         quit_on_detach = true;
                                                     }
                                                 }
-                                                cmd_batch.push(format!("{}\n", sub));
                                             }
+                                            cmd_batch.extend(binding_wire_lines(&sub_cmds));
                                             if quit_on_detach {
                                                 quit = true;
                                             }
