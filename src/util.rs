@@ -944,26 +944,23 @@ pub fn str_prefix_within(s: &str, max_bytes: usize) -> &str {
 ///
 /// Returns `(text to draw, column of the cursor within it)`.
 pub fn prompt_window(s: &str, cursor: usize, cols: usize) -> (&str, usize) {
-    use unicode_width::UnicodeWidthChar;
     // A prompt with no room at all. Reachable: the caller hands over the box
     // width less the two columns of its ": " prefix.
     if cols == 0 {
         return ("", 0);
     }
     let before = str_prefix_within(s, cursor);
-    let pcursor: usize = before.chars().map(|c| c.width().unwrap_or(0)).sum();
+    // Measured the way the pane's grid measures, which `grid_cells` explains.
+    // The prompt used to add up `UnicodeWidthChar` per character, which
+    // disagreed with the grid of the same psmux: a heart with a variation
+    // selector is one cell of two columns in a pane (#533) while the prompt
+    // counted one column, so the cursor sat on top of the next character.
+    let pcursor = grid_width(before);
     // One column is kept for the cursor itself, so a cursor at the end of a
     // full line still has somewhere to sit.
     let offset = if pcursor >= cols { pcursor - cols + 1 } else { 0 };
-    let mut start = s.len();
-    let mut col = 0usize;
-    for (i, ch) in s.char_indices() {
-        if col >= offset {
-            start = i;
-            break;
-        }
-        col += ch.width().unwrap_or(0);
-    }
+    let start = cell_start_at_least(s, offset);
+    let col = grid_width(&s[..start]);
     let shown = str_prefix_within_cols(&s[start..], cols);
     // `col` is where the shown text really starts. It is `offset` unless a
     // wide character straddled the edge and was dropped, which starts the
@@ -978,16 +975,82 @@ pub fn prompt_window(s: &str, cursor: usize, cols: usize) -> (&str, usize) {
 /// columns (wide CJK and emoji count 2). For titles cut to a box width,
 /// where a byte budget would both split characters and miscount columns.
 pub fn str_prefix_within_cols(s: &str, max_cols: usize) -> &str {
-    use unicode_width::UnicodeWidthChar;
-    let mut cols = 0usize;
-    for (i, ch) in s.char_indices() {
-        let w = ch.width().unwrap_or(0);
-        if cols + w > max_cols {
+    let mut used = 0usize;
+    for (i, w) in grid_cells(s) {
+        if used + w > max_cols {
             return &s[..i];
         }
-        cols += w;
+        used += w;
     }
     s
+}
+
+/// Where each cell of `s` starts, and how many columns it takes, counted the
+/// way the pane's grid counts.
+///
+/// The grid gives each character a cell, folds a zero width character into
+/// the cell before it, and promotes that cell to two columns when a variation
+/// selector asks for emoji presentation: `U+2764` is one column and
+/// `U+2764 U+FE0F` is two (`Screen::wants_wide_promotion`, #533, which
+/// follows tmux's `screen_write_combine` and its
+/// `variation-selector-always-wide`). Every terminal this was measured in
+/// gives that sequence two columns.
+///
+/// The prompt is drawn into the same terminal as the pane, so it has to count
+/// the same way the pane does, or the two disagree inside one psmux. What the
+/// grid does NOT do is join a cluster across characters that carry a width of
+/// their own: a skin tone modifier and a ZWJ sequence stay as many cells as
+/// they have characters. Terminals disagree about those, so that question
+/// belongs to the grid and is not decided here.
+fn grid_cells(s: &str) -> Vec<(usize, usize)> {
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    let mut cell_start = 0usize;
+    for (i, ch) in s.char_indices() {
+        let w = vt100::char_width(ch).unwrap_or(0);
+        if w == 0 {
+            // A zero width character belongs to the cell before it. With no
+            // cell to join, it is dropped, as the grid drops one that arrives
+            // in the first column.
+            if let Some(last) = cells.last_mut() {
+                let through = &s[cell_start..i + ch.len_utf8()];
+                if last.1 == 1 && (ch == VS16 || vt100::str_width(through) > 1) {
+                    last.1 = 2;
+                }
+            }
+            continue;
+        }
+        cell_start = i;
+        cells.push((i, w));
+    }
+    cells
+}
+
+/// U+FE0F VARIATION SELECTOR-16, which asks for emoji presentation.
+const VS16: char = '\u{FE0F}';
+
+/// Columns `s` takes in the grid's reckoning.
+fn grid_width(s: &str) -> usize {
+    grid_cells(s).iter().map(|(_, w)| w).sum()
+}
+
+/// Byte offset of the first cell of `s` at or past `cols` columns in, or the
+/// end of the string when it is narrower than that.
+///
+/// This is where a scrolled prompt starts drawing. A cell straddling that
+/// edge goes with the part scrolled off, which is what tmux's per character
+/// redraw does with it.
+fn cell_start_at_least(s: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 0;
+    }
+    let mut at = 0usize;
+    for (i, w) in grid_cells(s) {
+        if at >= cols {
+            return i;
+        }
+        at += w;
+    }
+    s.len()
 }
 
 /// Remove the whole character that ends at byte offset `cursor` (Backspace
@@ -1505,3 +1568,7 @@ mod tests_issue741_prompt_window_edges;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue712_util_audit.rs"]
 mod tests_issue712_util_audit;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue750_prompt_emoji_width.rs"]
+mod test_issue750_prompt_emoji_width;

@@ -374,6 +374,56 @@ Windows Terminal, conhost, Alacritty, WezTerm, mintty, the VS Code terminal, Con
 JetBrains terminal. Every shape DECSCUSR names is drawn in all eight. What differs is whether the
 cursor can be read back, and which of the two ways of asking for a blink the terminal acts on.
 
+### `scripts\probe-emoji-width.ps1`
+
+```powershell
+.\scripts\probe-emoji-width.ps1
+```
+
+How many columns the terminal gives an emoji sequence. Run it in the terminal you want measured,
+not inside psmux or tmux, and not through a pipe: it needs a console whose cursor it can read.
+Either PowerShell will do.
+
+It writes ten sequences one at a time with `WriteConsoleW`, which is the call psmux writes with,
+reads the console's own cursor before and after, and erases each line it used. The difference is
+the number of columns the host gave that sequence. Nothing is taken from a width table.
+
+| Sequence | What it separates |
+|---|---|
+| `U+0041`, `U+3042` | ASCII and a wide character, the control |
+| `U+2764` and `U+2764 U+FE0F` | whether a variation selector makes a text presentation character wide |
+| `U+1F44D` | an emoji that is wide on its own |
+| `U+1F44D U+1F3FD` | a skin tone modifier |
+| `U+1F1EF U+1F1F5` | a regional indicator pair |
+| `U+1F3F3 U+FE0F ZWJ U+1F308`, and a four person family | sequences joined with a zero width joiner |
+
+The run ends with a block that draws each sequence followed by a bar at the column the console
+counted. A glyph that reaches past its own bar was drawn wider than it was counted, and a gap
+before the bar is the opposite, so a screenshot of that block carries what the table cannot.
+
+### `scripts\probe-pane-emoji-shift.ps1`
+
+```powershell
+pwsh -NoProfile -File .\scripts\probe-pane-emoji-shift.ps1
+```
+
+Where a pane's text actually lands. This one runs INSIDE a psmux pane. It prints a ruler, then a
+line per sequence holding the sequence and a `>>` marker, and asks psmux through
+`display-message -p '#{cursor_x}'` where it believes the cursor is. If the marker sits left of
+the column psmux names, the terminal drew the sequence narrower than psmux counted it and the gap
+is the error; if the text after it is overwritten, the terminal drew it wider. Three CJK
+characters on the first line are the control, six columns everywhere measured so far.
+
+The two probes answer different questions and do not always agree inside one terminal. The first
+measures what the console counts for a raw write; this one measures what the screen does once
+psmux has drawn its grid. A terminal whose console counts eleven columns for a joined sequence
+can still draw it as one glyph, and what a user sees is the second.
+
+It forces the output encoding to UTF-8 before writing, and reads each line back with
+`capture-pane` to check the characters arrived. Without the first, .NET turns anything the console
+code page cannot hold into a question mark, one per UTF-16 code unit, and the numbers that come
+back look plausible; the first run of this script measured a row of question marks.
+
 ## Always On Diagnostic Files
 
 These three are written without any variable being set. They exist because the failures they

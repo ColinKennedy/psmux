@@ -372,6 +372,42 @@ pub fn copy_prompt_text(mode: &Mode) -> Option<String> {
     }
 }
 
+/// Where the label ends and where the cursor sits inside the text
+/// `copy_prompt_text` returns, both as byte offsets into it.
+///
+/// `back` is `AppState::copy_prompt_back`, the number of characters between
+/// the cursor and the end of the input, which is how the line editor keeps it
+/// (tmux keeps the same position as `prompt_index`, prompt.c). Byte offsets
+/// are what the client needs, because `util::prompt_window` takes one, so the
+/// conversion happens here where the characters are rather than on the wire.
+///
+/// The label is reported separately because only the input scrolls when the
+/// text outgrows the line: tmux draws the label at `ax`, then the input from
+/// `ax + start` with its own offset (status.c:922 to :948), so the label stays
+/// put and the user can still see which prompt is open.
+///
+/// The copy-mode command prompt has no editor: its keys only append
+/// (`copy_prompt::feed`), so its cursor is always at the end.
+pub fn copy_prompt_cursor(mode: &Mode, back: usize) -> Option<(usize, usize)> {
+    let text = copy_prompt_text(mode)?;
+    let (label_len, back) = match mode {
+        Mode::CopySearch { input, .. } | Mode::CopyGoto { input } => (
+            text.len() - input.len(),
+            // A prompt that was answered and reopened can carry a stale back,
+            // and a history recall replaces the input underneath it, so the
+            // cursor is clamped to the text that is actually there.
+            back.min(input.chars().count()),
+        ),
+        Mode::CopyCommandPrompt(p) => (text.len() - p.input.len(), 0),
+        _ => (text.len(), 0),
+    };
+    let mut at = text.len();
+    for ch in text.chars().rev().take(back) {
+        at -= ch.len_utf8();
+    }
+    Some((label_len, at))
+}
+
 /// Make the status line show the prompt of the pane that has focus now.
 ///
 /// A prompt's sticky message stayed behind when focus moved: `select-pane`
@@ -795,6 +831,10 @@ pub fn toggle_rectangle(app: &mut AppState) {
         crate::types::SelectionMode::Rect => crate::types::SelectionMode::Char,
         _ => crate::types::SelectionMode::Rect,
     };
+    // The shape of the selection is the client's to draw and the cursor has
+    // not moved, so without this the block does not appear until some later
+    // frame. tmux redraws here too (`window_copy_cmd_rectangle_toggle`).
+    app.copy_needs_redraw = true;
 }
 
 /// `copy-mode -u`: enter copy mode and scroll up one page.
@@ -1627,6 +1667,13 @@ pub fn set_mark(app: &mut AppState) {
     if let Some((r, c)) = get_copy_pos(app) {
         app.copy_mark = Some((app.copy_scroll_offset, r, c));
     }
+    // The mark is drawn by the client from the `copy_hl` spans in the frame,
+    // and nothing in the pane or the layout changed, so the frame has to be
+    // asked for. tmux asks the same way: `window_copy_cmd_set_mark` returns
+    // `WINDOW_COPY_CMD_REDRAW` (window-copy.c:2368 to :2376, tag 3.7c). The
+    // `-X` route never needed it, because a command request marks the state
+    // dirty on its own, which is why pressing X was the only way to see this.
+    app.copy_needs_redraw = true;
 }
 
 /// Swap the cursor with the mark — M-x (jump-to-mark).
@@ -1911,6 +1958,10 @@ pub fn select_line(app: &mut AppState) {
         app.copy_pos = Some((r, c));
         app.copy_selection_mode = crate::types::SelectionMode::Line;
     }
+    // Pressing V right after Space moves neither the cursor nor the anchor,
+    // so only the selection mode changes and there is nothing for the frame
+    // to notice. tmux's `window_copy_cmd_select_line` returns REDRAW.
+    app.copy_needs_redraw = true;
 }
 
 /// Highlight kinds in [`copy_highlights`]: a search match, the match under
@@ -1986,6 +2037,11 @@ pub fn clear_selection(app: &mut AppState) {
     if app.copy_selection_mode == crate::types::SelectionMode::Line {
         app.copy_selection_mode = crate::types::SelectionMode::Char;
     }
+    // Dropping the selection and the search highlights takes colour OFF the
+    // screen, which needs a frame as much as putting it on: without this the
+    // matches from the last search stay lit until something else redraws.
+    // tmux's `window_copy_cmd_clear_selection` returns REDRAW.
+    app.copy_needs_redraw = true;
 }
 
 /// Hide or show the copy-mode position indicator, the `P` key and the
@@ -2822,3 +2878,11 @@ mod tests_issue712_copy_search_utf8;
 #[path = "../tests-rs/test_disc694_copy_mode_vi_parity.rs"]
 mod test_disc694_copy_mode_vi_parity;
 
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue746_status_prompt_cursor.rs"]
+mod test_issue746_status_prompt_cursor;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue753_copy_redraw.rs"]
+mod test_issue753_copy_redraw;
