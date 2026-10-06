@@ -75,8 +75,12 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 let cell_fg = pal_resolve(pal, cell.fgcolor());
                 let cell_bg = pal_resolve(pal, cell.bgcolor());
                 let cell_link = cell.hyperlink_id();
-                let mut w = vt100::str_width(t) as u16;
-                if w == 0 { w = 1; }
+                // The grid decides how many columns a cell spans, not a
+                // width measured over its text: a combined cell (#749)
+                // can hold a letter, ZWJ and an emoji in ONE column, as
+                // tmux stores it, and measuring the text would step over
+                // the cells that follow it.
+                let w: u16 = if cell.is_wide() { 2 } else { 1 };
                 let mut fl = 0u8;
                 if cell.dim() { fl |= FLAG_DIM; }
                 if cell.bold() { fl |= FLAG_BOLD; }
@@ -514,8 +518,7 @@ fn dump_layout_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::
                             let cell_fg = pal_resolve(pal, cell.fgcolor());
                             let cell_bg = pal_resolve(pal, cell.bgcolor());
                             let cell_link = cell.hyperlink_id();
-                            let mut w = vt100::str_width(t) as u16;
-                            if w == 0 { w = 1; }
+                            let w: u16 = if cell.is_wide() { 2 } else { 1 }; // #749: the grid's width
                             let mut fl = 0u8;
                             if cell.dim() { fl |= FLAG_DIM; }
                             if cell.bold() { fl |= FLAG_BOLD; }
@@ -1013,8 +1016,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 let t = if t.is_empty() { " " } else { t };
                                 let cfg = pal_resolve(pal, cell.fgcolor());
                                 let cbg = pal_resolve(pal, cell.bgcolor());
-                                let mut w = vt100::str_width(t) as u16;
-                                if w == 0 { w = 1; }
+                                let w: u16 = if cell.is_wide() { 2 } else { 1 }; // #749: the grid's width
                                 let mut fl = 0u8;
                                 if cell.dim()   { fl |= FLAG_DIM; }
                                 if cell.bold()  { fl |= FLAG_BOLD; }
@@ -1088,7 +1090,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 if let Some(cell) = screen.cell(r, c) {
                                     let t = cell.contents();
                                     let t = if t.is_empty() { " " } else { t };
-                                    let w = vt100::str_width(t).max(1) as u16;
+                                    let w: u16 = if cell.is_wide() { 2 } else { 1 }; // #749: the grid's width
                                     row_cells.push(CopyCell {
                                         // Issue #685: copy mode paints the same
                                         // cells, so it resolves the palette too.
