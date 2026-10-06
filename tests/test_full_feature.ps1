@@ -2,6 +2,10 @@
 # Tests ACTUAL command execution, not just list-keys output
 
 $ErrorActionPreference = "Continue"
+# This suite writes a config at a default path (~/.psmux.conf, ~/.tmux.conf or
+# ~/.config/psmux) and expects psmux to load it at startup, but PSMUX_CONFIG_FILE
+# replaces every default path and run_all_tests.ps1 exports it, so clear it (#748).
+Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
 . "$PSScriptRoot\tcp_reply_common.ps1"
 $script:Pass = 0; $script:Fail = 0
 function OK { param($m) Write-Host "  [PASS] $m" -ForegroundColor Green; $script:Pass++ }
