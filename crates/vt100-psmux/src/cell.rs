@@ -35,7 +35,7 @@ struct ClusterTable {
 static CLUSTERS: std::sync::RwLock<Option<ClusterTable>> =
     std::sync::RwLock::new(None);
 
-/// tmux stops issuing indexes at `0xffffff + 1` (utf8_put_item) and the
+/// tmux stops issuing indexes at `0xffffff + 1` (`utf8_put_item`) and the
 /// character is then not combined; the same bound keeps a hostile stream of
 /// distinct sequences from growing the table without limit.
 const MAX_CLUSTERS: usize = 0x00ff_ffff;
@@ -64,6 +64,7 @@ fn intern_cluster(text: &str) -> Option<u32> {
     let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
     table.by_index.push(leaked);
     table.by_text.insert(leaked, index);
+    drop(guard);
     Some(index)
 }
 

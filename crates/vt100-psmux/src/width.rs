@@ -339,10 +339,11 @@ pub enum Join {
     },
 }
 
-/// Decide what character `c`, `width` columns wide on its own, does after the
-/// cell `prev` (its text and its width in columns), or after nothing when
-/// `prev` is `None` (the first column, or a cursor that is not right after the
-/// start of a cell).
+/// Decide what `c` does after the cell `prev`: discard, new cell, or combine.
+///
+/// `width` is `c`'s own width; `prev` is the cell's text and its width in
+/// columns, or `None` after nothing (the first column, or a cursor that is not
+/// right after the start of a cell).
 ///
 /// This is tmux's `screen_write_combine` (screen-write.c), and the one place
 /// psmux makes that decision: the pane's grid (`Screen::text`) and the
@@ -352,8 +353,8 @@ pub enum Join {
 /// Emoji presentation is a property of a *sequence*: a ZWJ family, a skin
 /// tone pair, a flag of two regional indicators and a base followed by VS16
 /// each draw as one glyph two columns wide in tmux and in nearly every
-/// terminal (Windows Terminal, VS Code, JetBrains, WezTerm, Alacritty, ConEmu
-/// and conhost; mintty is the one that draws the parts apart). The rules, all
+/// terminal (Windows Terminal, VS Code, `JetBrains`, `WezTerm`, Alacritty,
+/// `ConEmu` and conhost; mintty is the one that draws the parts apart). The rules, all
 /// tmux's:
 /// - U+3164 HANGUL FILLER is discarded outright.
 /// - ZWJ, VS16 and any other zero width character make no sense alone: they
@@ -410,8 +411,9 @@ pub fn join(prev: Option<(&str, usize)>, c: char, width: usize) -> Join {
     }
 }
 
-/// Where each cell of `s` starts, as a byte offset, and how many columns it
-/// takes, for `s` written into a row wide enough to hold all of it. This
+/// Where each cell of `s` starts, as a byte offset, and its columns.
+///
+/// That is for `s` written into a row wide enough to hold all of it. This
 /// walks `join` exactly as the grid does, so a prompt drawn in the same
 /// terminal as a pane counts the columns the pane counts (#749, #750).
 /// Control characters, which the grid does not draw, take no cell.
