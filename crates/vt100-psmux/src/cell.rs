@@ -6,9 +6,80 @@
 // the same pair on every grid_cell (`us` plus the UNDERSCORE_2..5 attr bits).
 const CONTENT_BYTES: usize = 22;
 
+/// The most UTF-8 bytes one cell holds, combining characters included
+/// (tmux's `UTF8_SIZE`). An emoji ZWJ family of four people is 25 bytes, so
+/// the inline 22 bytes are not enough (#749).
+use crate::width::MAX_CELL_BYTES;
+
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;
+/// The contents live in the process wide cluster table and `contents[..4]`
+/// holds their index there instead of the text itself.
+const IS_INTERNED: u8 = 0b0010_0000;
 const LEN_BITS: u8 = 0b0001_1111;
+
+/// Text too long for a cell's inline bytes: a ZWJ sequence such as a family
+/// or a flag sequence (#749).  Growing every cell to `MAX_CELL_BYTES` would
+/// add twelve bytes to each of the 44 the cell costs today, across all of
+/// scrollback, for text that is rare; tmux faces the same trade and stores any
+/// character over three bytes as an index into a process wide table
+/// (`utf8_from_data` and `utf8_put_item` in utf8.c) whose entries are never
+/// freed.  This is that table, used only for what does not fit inline.
+/// Entries are deduplicated, so equal text always gets the same index and
+/// `Cell`'s byte comparison stays a text comparison.
+struct ClusterTable {
+    by_text: std::collections::HashMap<&'static str, u32>,
+    by_index: Vec<&'static str>,
+}
+
+static CLUSTERS: std::sync::RwLock<Option<ClusterTable>> =
+    std::sync::RwLock::new(None);
+
+/// tmux stops issuing indexes at `0xffffff + 1` (`utf8_put_item`) and the
+/// character is then not combined; the same bound keeps a hostile stream of
+/// distinct sequences from growing the table without limit.
+const MAX_CLUSTERS: usize = 0x00ff_ffff;
+
+fn intern_cluster(text: &str) -> Option<u32> {
+    if let Some(&index) = CLUSTERS
+        .read()
+        .ok()?
+        .as_ref()
+        .and_then(|t| t.by_text.get(text))
+    {
+        return Some(index);
+    }
+    let mut guard = CLUSTERS.write().ok()?;
+    let table = guard.get_or_insert_with(|| ClusterTable {
+        by_text: std::collections::HashMap::new(),
+        by_index: Vec::new(),
+    });
+    if let Some(&index) = table.by_text.get(text) {
+        return Some(index);
+    }
+    if table.by_index.len() >= MAX_CLUSTERS {
+        return None;
+    }
+    let index = u32::try_from(table.by_index.len()).ok()?;
+    let leaked: &'static str = Box::leak(text.to_owned().into_boxed_str());
+    table.by_index.push(leaked);
+    table.by_text.insert(leaked, index);
+    drop(guard);
+    Some(index)
+}
+
+fn interned_cluster(index: u32) -> &'static str {
+    CLUSTERS
+        .read()
+        .ok()
+        .and_then(|t| {
+            t.as_ref()?
+                .by_index
+                .get(usize::try_from(index).ok()?)
+                .copied()
+        })
+        .unwrap_or(" ")
+}
 
 /// Represents a single terminal cell.
 #[derive(Clone, Debug, Eq)]
@@ -74,18 +145,41 @@ impl Cell {
         self.attrs = a;
     }
 
-    pub(crate) fn append(&mut self, c: char) {
+    /// UTF-8 bytes the cell's text takes, which is what tmux compares against
+    /// `UTF8_SIZE` before combining.
+    pub(crate) fn content_bytes(&self) -> usize {
+        self.contents().len()
+    }
+
+    /// Fold `c` into this cell's text.  Returns false, leaving the cell as it
+    /// was, when the result would be longer than `MAX_CELL_BYTES`.
+    pub(crate) fn append(&mut self, c: char) -> bool {
         let len = self.len();
-        if len >= CONTENT_BYTES - 4 {
-            return;
-        }
-        if len == 0 {
+        if len == 0 && !self.is_interned() {
             self.contents[0] = b' ';
             self.len += 1;
         }
+        if !self.is_interned() && self.len() + c.len_utf8() <= CONTENT_BYTES {
+            self.append_char(self.len(), c);
+            return true;
+        }
 
-        // we already checked that we have space for another codepoint
-        self.append_char(self.len(), c);
+        let mut text = String::with_capacity(MAX_CELL_BYTES);
+        text.push_str(self.contents());
+        text.push(c);
+        if text.len() > MAX_CELL_BYTES {
+            return false;
+        }
+        let Some(index) = intern_cluster(&text) else {
+            return false;
+        };
+        self.contents[..4].copy_from_slice(&index.to_le_bytes());
+        self.len = (self.len & (IS_WIDE | IS_WIDE_CONTINUATION)) | IS_INTERNED | 4;
+        true
+    }
+
+    fn is_interned(&self) -> bool {
+        self.len & IS_INTERNED != 0
     }
 
     // Writes bytes representing c at start
@@ -109,6 +203,11 @@ impl Cell {
     #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn contents(&self) -> &str {
+        if self.is_interned() {
+            let mut index = [0u8; 4];
+            index.copy_from_slice(&self.contents[..4]);
+            return interned_cluster(u32::from_le_bytes(index));
+        }
         std::str::from_utf8(&self.contents[..self.len()]).unwrap()
     }
 

@@ -10,10 +10,10 @@
 // one. tmux 3.7c gives it two as well (`#{cursor_x}` after a write), with
 // `variation-selector-always-wide` on by default.
 //
-// What this does NOT decide is a cluster joined across characters that carry a
-// width of their own, a skin tone modifier or a ZWJ sequence. The grid keeps
-// those as separate cells, terminals disagree about them, and the prompt
-// follows the grid rather than taking a side.
+// A cluster joined across characters that carry a width of their own, a skin
+// tone pair, a regional indicator pair or a ZWJ sequence, is one two column
+// cell in the grid since #749, as in tmux. The prompt asks the grid's own rule
+// (`vt100::str_cells`), so it counts those the same way.
 
 use super::{prompt_window, str_prefix_within_cols};
 
@@ -40,14 +40,61 @@ fn the_prompt_agrees_with_the_grid() {
     assert_eq!(end_column("\u{3042}"), 2);
     assert_eq!(end_column("\u{2764}\u{FE0F}"), 2);
     assert_eq!(end_column("\u{1F44D}"), 2);
-    assert_eq!(end_column("\u{1F44D}\u{1F3FD}"), 4, "two cells, not one cluster");
+    assert_eq!(end_column("\u{1F44D}\u{1F3FD}"), 2, "a skin tone pair is one cell (#749)");
     assert_eq!(end_column("\u{1F1EF}\u{1F1F5}"), 2, "a regional indicator pair");
-    assert_eq!(end_column("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"), 4, "the flag is promoted, the rainbow is its own cell");
+    assert_eq!(end_column("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"), 2, "the rainbow joins the flag through the ZWJ (#749)");
     assert_eq!(
         end_column("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"),
-        8,
-        "four cells of two columns, the joiners folded in"
+        2,
+        "the family is one cell of two columns (#749)"
     );
+}
+
+#[test]
+fn clusters_follow_the_grid_rule() {
+    // A skin tone modifier joins its emoji in either order, as tmux tries
+    // utf8_should_combine both ways round.
+    assert_eq!(end_column("\u{1F3FD}\u{1F44D}"), 2);
+    // A modifier outside tmux's table, or two modifiers, stay apart.
+    assert_eq!(end_column("\u{1F4DB}\u{1F3FD}"), 4);
+    assert_eq!(end_column("\u{1F3FD}\u{1F3FD}"), 4);
+    // A flag takes no third indicator; the third stands alone at one column.
+    assert_eq!(end_column("\u{1F1EF}\u{1F1F5}\u{1F1FA}"), 3);
+    assert_eq!(end_column("\u{1F1EF}\u{1F1F5}\u{1F1FA}\u{1F1F8}"), 4);
+    // A letter, ZWJ and an emoji stay one column, as tmux keeps them.
+    assert_eq!(end_column("a\u{200D}\u{1F466}"), 1);
+    // Text after a cluster is counted from the end of its one cell.
+    let fam = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+    let s = format!("{fam}AB");
+    assert_eq!(end_column(&s), 4);
+    let (_, col) = prompt_window(&s, fam.len(), 80);
+    assert_eq!(col, 2, "right after the family");
+    // A cell that does not fit is not drawn in half.
+    assert_eq!(str_prefix_within_cols(&s, 1), "");
+    assert_eq!(str_prefix_within_cols(&s, 3), format!("{fam}A"));
+}
+
+// Discussion #749: the ten sequences measured against tmux 3.7c. The prompt
+// gives each the columns the pane's grid gives it, which since #749 are
+// tmux's: a ZWJ sequence, a skin tone pair, a regional indicator pair and a
+// VS16 sequence are each one two column cell.
+#[test]
+fn the_ten_749_sequences_match_tmux() {
+    let seqs = [
+        "\u{0041}",
+        "\u{3042}",
+        "\u{2764}",
+        "\u{2764}\u{FE0F}",
+        "\u{2733}\u{FE0F}",
+        "\u{1F44D}",
+        "\u{1F44D}\u{1F3FD}",
+        "\u{1F1EF}\u{1F1F5}",
+        "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+    ];
+    let got: Vec<usize> = seqs.iter().map(|s| end_column(s)).collect();
+    println!("prompt cursor columns: {got:?}");
+    assert_eq!(got, vec![1, 2, 1, 2, 2, 2, 2, 2, 2, 2]);
 }
 
 #[test]

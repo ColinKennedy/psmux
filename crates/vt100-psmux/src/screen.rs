@@ -1382,32 +1382,77 @@ impl Screen {
     }
 }
 
-/// U+FE0F VARIATION SELECTOR-16, which requests emoji presentation.
-const VS16: char = '\u{FE0F}';
-
 impl Screen {
-    /// Does appending the zero-width char `c` turn this cell into a
-    /// double-width sequence? (#533)
+    /// Fold `c` into the cell before the cursor when tmux would, and say
+    /// whether `c` has been dealt with (#749). The decision is
+    /// `crate::width::join`, tmux's `screen_write_combine`, which
+    /// `screen_write_cell` calls before anything else; so it runs ahead of the
+    /// wrap decision here too, and a character combining onto the last column
+    /// never wraps.
     ///
-    /// Emoji presentation is a property of the *sequence*, not of any single
-    /// character: `U+2733` is one column on its own, but `U+2733 U+FE0F` is
-    /// two, in real terminals and in tmux alike. Because `text()` measures
-    /// width one char at a time, the base settles the cell at one column and
-    /// the selector is folded in afterwards as a zero-width mark, so the cell
-    /// stays narrow and every column after it drifts left by one.
-    ///
-    /// The trigger mirrors tmux's `screen_write_combine`, which forces the
-    /// stored width to 2 when a VS16 lands on a cell whose width is still 1
-    /// (`variation-selector-always-wide`, on by default). The width measured
-    /// over the whole cell is checked too, so any other sequence that
-    /// `unicode-width` considers double width is promoted as well.
-    fn wants_wide_promotion(cell: &crate::Cell, c: char) -> bool {
-        // A cell that is already wide must not be promoted again: tmux only
-        // promotes when the stored width is 1, so `📛 + VS16` stays 2 columns
-        // rather than growing to 4.
-        cell.has_contents()
-            && !cell.is_wide()
-            && (c == VS16 || crate::width::str_width(cell.contents()) > 1)
+    /// Measured one character at a time, each wide member of an emoji cluster
+    /// took its own two columns, so a family of four spent eight where the
+    /// child process had counted two, and everything after it drifted right.
+    fn combine(&mut self, c: char, width: u16) -> bool {
+        // The cell to combine with is the one the cursor follows: one column
+        // back, or two when that column is the continuation of a wide cell.
+        // It must really start there, so a cursor parked in the middle of a
+        // wide glyph combines with nothing.
+        let pos = self.grid().pos();
+        let mut base = None;
+        if pos.col > 0 {
+            let mut base_col = pos.col - 1;
+            let mut last = self.grid().drawing_cell(crate::grid::Pos {
+                row: pos.row,
+                col: base_col,
+            });
+            if pos.col != 1 && last.is_some_and(crate::Cell::is_wide_continuation) {
+                base_col = pos.col - 2;
+                last = self.grid().drawing_cell(crate::grid::Pos {
+                    row: pos.row,
+                    col: base_col,
+                });
+            }
+            if let Some(last) = last {
+                let last_width = if last.is_wide() { 2 } else { 1 };
+                if pos.col - base_col == last_width && !last.is_wide_continuation() {
+                    base = Some((base_col, last, usize::from(last_width)));
+                }
+            }
+        }
+
+        let decision = crate::width::join(
+            base.map(|(_, cell, w)| (cell.contents(), w)),
+            c,
+            usize::from(width),
+        );
+        let base_col = base.map(|(col, _, _)| col);
+        match (decision, base_col) {
+            (crate::width::Join::Discard, _) => true,
+            (crate::width::Join::NewCell, _) | (_, None) => false,
+            (crate::width::Join::Combine { widen }, Some(base_col)) => {
+                let appended = self
+                    .grid_mut()
+                    .drawing_cell_mut(crate::grid::Pos {
+                        row: pos.row,
+                        col: base_col,
+                    })
+                    .is_some_and(|cell| cell.append(c));
+                if !appended {
+                    // Only the cluster table refusing a new entry gets here;
+                    // tmux then writes the character on its own, which for a
+                    // zero width one shows nothing.
+                    return width == 0;
+                }
+                // Force the width to 2 for modifiers and the variation
+                // selector, but only from 1: a cell already two wide is left
+                // alone, so `📛 VS16` stays two columns rather than four.
+                if widen {
+                    self.promote_cell_to_wide(pos.row, base_col, self.attrs);
+                }
+                true
+            }
+        }
     }
 
     /// Widen the narrow cell at (`row`, `col`) into a two column cell, taking
@@ -1477,6 +1522,10 @@ impl Screen {
             // width() can only return 0, 1, or 2
             .unwrap();
 
+        if self.combine(c, width) {
+            return;
+        }
+
         // A glyph wider than the whole row can never be represented: there is
         // nowhere to put its continuation, and `size.cols - width` underflows
         // just below (#534, reachable once a pane is shrunk to one column).
@@ -1513,159 +1562,81 @@ impl Screen {
         self.grid_mut().col_wrap(width, wrap);
         let pos = self.grid().pos();
 
-        if width == 0 {
-            if pos.col > 0 {
-                let mut base_col = pos.col - 1;
-                let mut prev_cell = self
+        // After a resize, cells may be in inconsistent states (e.g.
+        // a wide char at the last column without its continuation).
+        // Use safe accessors to avoid panics on out-of-bounds.
+        if let Some(cell_ref) = self.grid().drawing_cell(pos) {
+            if cell_ref.is_wide_continuation() {
+                if let Some(prev_cell) = self
                     .grid_mut()
                     .drawing_cell_mut(crate::grid::Pos {
                         row: pos.row,
-                        col: base_col,
+                        col: pos.col - 1,
                     })
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.col - 1 is valid because we just
-                    // checked for pos.col > 0.
-                    .unwrap();
-                if prev_cell.is_wide_continuation() {
-                    base_col = pos.col - 2;
-                    prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row,
-                            col: base_col,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. we know pos.col - 2 is valid
-                        // because the cell at pos.col - 1 is a wide
-                        // continuation character, which means there must be
-                        // the first half of the wide character before it.
-                        .unwrap();
-                }
-                prev_cell.append(c);
-                if Self::wants_wide_promotion(prev_cell, c) {
-                    self.promote_cell_to_wide(pos.row, base_col, attrs);
-                }
-            } else if pos.row > 0 {
-                let prev_row = self
-                    .grid()
-                    .drawing_row(pos.row - 1)
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.row - 1 is valid because we just
-                    // checked for pos.row > 0.
-                    .unwrap();
-                if prev_row.wrapped() {
-                    let mut prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row - 1,
-                            col: size.cols - 1,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. pos.row - 1 is valid because we
-                        // just checked for pos.row > 0. col of size.cols - 1
-                        // is always valid.
-                        .unwrap();
-                    if prev_cell.is_wide_continuation() {
-                        prev_cell = self
-                            .grid_mut()
-                            .drawing_cell_mut(crate::grid::Pos {
-                                row: pos.row - 1,
-                                col: size.cols - 2,
-                            })
-                            // pos.row is valid, since it comes directly from
-                            // self.grid().pos() which we assume to always
-                            // have a valid row value. pos.row - 1 is valid
-                            // because we just checked for pos.row > 0. col of
-                            // size.cols - 2 is valid because the cell at
-                            // size.cols - 1 is a wide continuation character,
-                            // so it must have the first half of the wide
-                            // character before it.
-                            .unwrap();
-                    }
-                    prev_cell.append(c);
+                {
+                    prev_cell.clear(attrs);
                 }
             }
-        } else {
-            // After a resize, cells may be in inconsistent states (e.g.
-            // a wide char at the last column without its continuation).
-            // Use safe accessors to avoid panics on out-of-bounds.
-            if let Some(cell_ref) = self.grid().drawing_cell(pos) {
-                if cell_ref.is_wide_continuation() {
-                    if let Some(prev_cell) = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row,
-                            col: pos.col - 1,
-                        })
-                    {
-                        prev_cell.clear(attrs);
-                    }
-                }
-            }
+        }
 
-            let is_wide_at_pos = self
+        let is_wide_at_pos = self
+            .grid()
+            .drawing_cell(pos)
+            .map_or(false, |c| c.is_wide());
+        if is_wide_at_pos {
+            if let Some(next_cell) = self
+                .grid_mut()
+                .drawing_cell_mut(crate::grid::Pos {
+                    row: pos.row,
+                    col: pos.col + 1,
+                })
+            {
+                next_cell.set(' ', attrs);
+            }
+        }
+
+        if let Some(cell) = self
+            .grid_mut()
+            .drawing_cell_mut(pos)
+        {
+            cell.set(c, attrs);
+        } else {
+            return;
+        }
+        self.grid_mut().col_inc(1);
+        if width > 1 {
+            let pos = self.grid().pos();
+            let is_wide_here = self
                 .grid()
                 .drawing_cell(pos)
                 .map_or(false, |c| c.is_wide());
-            if is_wide_at_pos {
-                if let Some(next_cell) = self
+            if is_wide_here {
+                let next_next_pos = crate::grid::Pos {
+                    row: pos.row,
+                    col: pos.col + 1,
+                };
+                if let Some(next_next_cell) = self
                     .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col + 1,
-                    })
+                    .drawing_cell_mut(next_next_pos)
                 {
-                    next_cell.set(' ', attrs);
-                }
-            }
-
-            if let Some(cell) = self
-                .grid_mut()
-                .drawing_cell_mut(pos)
-            {
-                cell.set(c, attrs);
-            } else {
-                return;
-            }
-            self.grid_mut().col_inc(1);
-            if width > 1 {
-                let pos = self.grid().pos();
-                let is_wide_here = self
-                    .grid()
-                    .drawing_cell(pos)
-                    .map_or(false, |c| c.is_wide());
-                if is_wide_here {
-                    let next_next_pos = crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col + 1,
-                    };
-                    if let Some(next_next_cell) = self
-                        .grid_mut()
-                        .drawing_cell_mut(next_next_pos)
-                    {
-                        next_next_cell.clear(attrs);
-                        if next_next_pos.col == size.cols - 1 {
-                            if let Some(row) = self.grid_mut()
-                                .drawing_row_mut(pos.row)
-                            {
-                                row.wrap(false);
-                            }
+                    next_next_cell.clear(attrs);
+                    if next_next_pos.col == size.cols - 1 {
+                        if let Some(row) = self.grid_mut()
+                            .drawing_row_mut(pos.row)
+                        {
+                            row.wrap(false);
                         }
                     }
                 }
-                if let Some(next_cell) = self
-                    .grid_mut()
-                    .drawing_cell_mut(pos)
-                {
-                    next_cell.clear(crate::attrs::Attrs::default());
-                    next_cell.set_wide_continuation(true);
-                }
-                self.grid_mut().col_inc(1);
             }
+            if let Some(next_cell) = self
+                .grid_mut()
+                .drawing_cell_mut(pos)
+            {
+                next_cell.clear(crate::attrs::Attrs::default());
+                next_cell.set_wide_continuation(true);
+            }
+            self.grid_mut().col_inc(1);
         }
     }
 

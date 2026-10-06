@@ -224,6 +224,8 @@ A command with no `-t` reaches the session with the most recent activity, the sa
 
 Multi-byte UTF-8 characters (box-drawing, emoji, CJK text) render correctly in panes. Pasting CJK text no longer crashes the session. Japanese and Korean IME input is handled with minimal latency (the paste-detection heuristic was tuned to avoid misidentifying rapid IME bursts).
 
+Emoji clusters take the columns tmux gives them (#749). A ZWJ sequence such as a family, an emoji with a skin tone modifier, a flag spelled with two regional indicators, and a character followed by the variation selector U+FE0F each occupy one cell two columns wide, so `U+1F468 ZWJ U+1F469 ZWJ U+1F467 ZWJ U+1F466` moves the cursor two columns, not eight. The rules are tmux's `utf8_should_combine` (utf8-combined.c) and `screen_write_combine` (screen-write.c), including tmux's 32 byte limit on one cell, and command prompts count columns with the same rule. Windows Terminal, VS Code, JetBrains, WezTerm, Alacritty, ConEmu and conhost draw these sequences as one glyph too; mintty is the known outlier and draws the parts separately.
+
 ### Window-scoped Options
 
 Every window carries its own option table, so a window-scoped write reaches one window and nothing else (#648, from the #647 WIN-01 report):
