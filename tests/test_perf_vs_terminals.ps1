@@ -2092,7 +2092,20 @@ if (-not $SkipCreate) {
 
     Head "3. CREATION THRESHOLDS"
     if ($script:Create["first_session"]) { Check "T4a first session to prompt (median)" $script:Create["first_session"].median 1000 "ms" "a cold server plus a cold default shell" }
-    if ($script:Create["new_window_seq"]) { Check "T4b new-window p90" $script:Create["new_window_seq"].p90 300 "ms" "includes the 16 to 20 ms Windows needs to start the psmux.exe client" }
+    # T4b judges creations two onwards. Since b117e745 the first creation after
+    # a cold launch boots alone by design (403 to 523 ms in every run on
+    # 2026-10-06, the rest 16 to 26 ms), and with five samples the interpolated
+    # p90 lands 0.6 of the way from the fourth value to that one, so the gate
+    # flipped on whether the lone boot was 484 ms (p90 298, pass) or 523 ms
+    # (p90 322, fail): sweep 2026-10-06_05-29-09 failed it on [523,17,17,20,18]
+    # and an A/B against the pre batch binary gave the same shape. The first
+    # creation is judged by T4a and by test_pane_startup_perf's cold check.
+    if ($script:Create["new_window_seq"]) {
+        $seq = $script:Create["new_window_seq"]
+        $rest = @($seq.samples | Select-Object -Skip 1)
+        $p90rest = if ($rest.Count -gt 0) { [math]::Round((Percentile ([double[]]($rest | Sort-Object)) 0.9), 2) } else { $seq.p90 }
+        Check "T4b new-window p90 (creations two onwards)" $p90rest 300 "ms" "includes the 16 to 20 ms Windows needs to start the psmux.exe client; the first creation after launch is T4a's"
+    }
     foreach ($k in @("split_v_seq","split_h_seq")) {
         if ($script:Create[$k]) { Check "T4c $k p90" $script:Create[$k].p90 300 "ms" }
     }

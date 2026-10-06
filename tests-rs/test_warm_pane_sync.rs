@@ -137,8 +137,8 @@ fn resize_to_same_size_is_noop() {
     });
 
     assert!(matches!(for_resize(&app, 40, 120), WarmPaneSync::Noop));
-    assert!(matches!(for_resize(&app, 41, 120), WarmPaneSync::Respawn(_)));
-    assert!(matches!(for_resize(&app, 40, 121), WarmPaneSync::Respawn(_)));
+    assert!(matches!(for_resize(&app, 41, 120), WarmPaneSync::RespawnKeepInflight(_)));
+    assert!(matches!(for_resize(&app, 40, 121), WarmPaneSync::RespawnKeepInflight(_)));
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn resize_with_no_warm_pane_returns_respawn() {
     // "do nothing"; for_resize returning Respawn lets `apply` notice
     // and possibly spawn a fresh warm pane at the new size.
     let app = fresh_app();
-    assert!(matches!(for_resize(&app, 30, 80), WarmPaneSync::Respawn(_)));
+    assert!(matches!(for_resize(&app, 30, 80), WarmPaneSync::RespawnKeepInflight(_)));
 }
 
 // ── for_host_colors_change: the palette is baked into the child ─────
@@ -200,7 +200,7 @@ fn host_colors_report_retires_a_spare_that_has_no_palette() {
     app.host_colors = Some(palette((0x11, 0x22, 0x33)));
     assert!(matches!(
         crate::warm_pane_sync::for_host_colors_change(&app),
-        WarmPaneSync::Respawn(_)
+        WarmPaneSync::RespawnKeepInflight(_)
     ));
     app.warm_pane.kill_all();
 }

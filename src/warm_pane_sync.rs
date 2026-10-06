@@ -42,7 +42,22 @@ use crate::types::AppState;
 pub enum WarmPaneSync {
     Noop,
     Patch(WarmPanePatch),
+    /// Kill the pooled spares AND refuse the refills still in flight: what
+    /// changed was captured by the child at `CreateProcessW` (its environment
+    /// block, its shell binary, its command line), so a spare issued before
+    /// the change is stale however fresh it lands. The claim's environment
+    /// adoption (#659), `default-shell`, `set-environment`, predictions and
+    /// the post config respawns are this kind.
     Respawn(&'static str),
+    /// Kill the pooled spares only; a refill still in flight is kept when it
+    /// lands. For changes the landing already reconciles: a client resize is
+    /// absorbed by the transplant (`need_resize`), and a host colour change is
+    /// checked per spare by `land_spare`, which drops a stale palette. Refusing
+    /// the in flight spare on these cost an attached launch its first warm
+    /// creation, because the client reports its colours right after the
+    /// trickle has issued the first spare (test_pr255_active_border, sweeps
+    /// 2026-10-05_19-58-06 and 2026-10-06_05-29-09).
+    RespawnKeepInflight(&'static str),
 }
 
 /// In-place mutations safe to perform on a running warm pane.
@@ -125,7 +140,7 @@ pub fn for_resize(app: &AppState, new_rows: u16, new_cols: u16) -> WarmPaneSync 
     if !app.warm_pane.is_empty() && app.warm_pane.iter().all(|wp| wp.rows == new_rows && wp.cols == new_cols) {
         WarmPaneSync::Noop
     } else {
-        WarmPaneSync::Respawn("client resized")
+        WarmPaneSync::RespawnKeepInflight("client resized")
     }
 }
 
@@ -152,7 +167,7 @@ pub fn for_host_colors_change(app: &AppState) -> WarmPaneSync {
     if app.warm_pane.iter().all(|wp| wp.host_colors == app.host_colors) {
         WarmPaneSync::Noop
     } else {
-        WarmPaneSync::Respawn("host colors changed")
+        WarmPaneSync::RespawnKeepInflight("host colors changed")
     }
 }
 
@@ -221,7 +236,8 @@ pub fn apply(
     match sync {
         WarmPaneSync::Noop => {}
         WarmPaneSync::Patch(patch) => apply_patch(app, patch),
-        WarmPaneSync::Respawn(_reason) => respawn(app, pty_system),
+        WarmPaneSync::Respawn(_reason) => respawn(app, pty_system, true),
+        WarmPaneSync::RespawnKeepInflight(_reason) => respawn(app, pty_system, false),
     }
 }
 
@@ -297,7 +313,7 @@ fn apply_patch_to_existing_panes(app: &mut AppState, patch: &WarmPanePatch) {
     }
 }
 
-fn respawn(app: &mut AppState, _pty_system: &dyn portable_pty::PtySystem) {
+fn respawn(app: &mut AppState, _pty_system: &dyn portable_pty::PtySystem, refuse_inflight: bool) {
     // Kill every spare — there is no in-place way to swap shell binaries or
     // environment blocks, and a pool where only the head was refreshed would
     // hand a stale shell to the second creation.
@@ -321,13 +337,25 @@ fn respawn(app: &mut AppState, _pty_system: &dyn portable_pty::PtySystem) {
     // so far has an id below `next_pane_id`, so raising the floor there makes
     // `WarmPool::push` refuse and kill each one on arrival, the same gate a
     // cold creation uses against late arrivals (ebce952).
+    //
+    // Not for every reason, though: see `RespawnKeepInflight`. A client resize
+    // and a host colour report are reconciled when the spare lands, and both
+    // fire right after an attached launch has issued its first trickled spare,
+    // so refusing it there cost the first creation its warm shell.
     let inflight = app.warm_pane.inflight;
-    let floor = app.next_pane_id;
-    let refused_floor = app.warm_pane.set_issued_floor(floor);
-    crate::warm_trace!(
-        "pool: respawn requested, killed {} spare(s), {} in flight refused below floor {} (dropped {}), target={}",
-        killed, inflight, floor, refused_floor, app.warm_pane.target
-    );
+    if refuse_inflight {
+        let floor = app.next_pane_id;
+        let refused_floor = app.warm_pane.set_issued_floor(floor);
+        crate::warm_trace!(
+            "pool: respawn requested, killed {} spare(s), {} in flight refused below floor {} (dropped {}), target={}",
+            killed, inflight, floor, refused_floor, app.warm_pane.target
+        );
+    } else {
+        crate::warm_trace!(
+            "pool: respawn requested, killed {} spare(s), {} in flight kept, target={}",
+            killed, inflight, app.warm_pane.target
+        );
+    }
 }
 
 /// Helper for warm-pane consume sites in `pane.rs`.  When a warm

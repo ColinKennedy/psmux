@@ -126,3 +126,30 @@ fn a_respawn_with_nothing_in_flight_still_refuses_nothing_new() {
     app.warm_pane.push(spare(7));
     assert_eq!(app.warm_pane.len(), 1);
 }
+
+#[test]
+fn a_client_resize_keeps_the_in_flight_spare() {
+    // A resize is reconciled by the transplant (`need_resize`), and a host
+    // colour report by `land_spare`; both fire right after an attached launch
+    // has issued its first trickled spare, so that spare must be kept.
+    let mut app = app_mid_trickle();
+    let pty_system = portable_pty::native_pty_system();
+    apply(&mut app, &*pty_system, WarmPaneSync::RespawnKeepInflight("client resized"));
+    assert_eq!(app.warm_pane.len(), 0, "the pooled spare is still replaced");
+    app.warm_pane.push(spare(3));
+    assert_eq!(app.warm_pane.len(), 1, "the refill that was in flight lands and is kept");
+    assert_eq!(app.warm_pane.issued_floor(), 0, "no floor is raised for a keep in flight respawn");
+}
+
+#[test]
+fn the_resize_and_host_colour_decisions_keep_in_flight_spares() {
+    // for_resize on an empty pool asks for a respawn (the refill must happen
+    // at the new size), and for_host_colors_change on a pool whose spare
+    // carries other colours does too; both must be the keep in flight kind.
+    let mut app = AppState::new("test_session".to_string());
+    app.warm_pane = crate::types::WarmPool::default();
+    assert!(matches!(for_resize(&app, 24, 80), WarmPaneSync::RespawnKeepInflight(_)));
+    app.warm_pane.push(spare(2));
+    app.host_colors = Some(crate::types::HostColors { fg: Some((1, 2, 3)), bg: None, palette: [None; 16], dark: None });
+    assert!(matches!(for_host_colors_change(&app), WarmPaneSync::RespawnKeepInflight(_)));
+}
