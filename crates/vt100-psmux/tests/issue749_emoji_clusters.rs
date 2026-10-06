@@ -86,19 +86,36 @@ fn clusters_survive_every_chunk_boundary() {
     }
 }
 
-// tmux: a ZWJ is zero width and folds into whatever cell came before it, but
-// the character after the ZWJ only joins when the previous cell is an emoji
-// (utf8_should_combine requires the previous cell to be width 2). After a
-// letter the following wide emoji stands on its own.
+// tmux: a ZWJ is zero width and folds into whatever cell came before it, a
+// letter included, and a character after a cell ending in ZWJ joins that
+// cell WITHOUT widening it (screen_write_combine only forces width 2 for
+// should_combine pairs and VS16). So letter, ZWJ, boy stays one column in
+// tmux 3.7c and the X after it lands on col 1.
 #[test]
-fn letter_followed_by_zwj_does_not_swallow_the_next_emoji() {
+fn letter_followed_by_zwj_keeps_the_letter_cell_narrow() {
     let p = parse(40, &["a\u{200D}\u{1F466}X"]);
     let s = p.screen();
-    assert_eq!(s.cell(0, 0).unwrap().contents(), "a\u{200D}", "ZWJ folds into the letter");
-    assert!(!s.cell(0, 0).unwrap().is_wide(), "the letter stays narrow");
-    assert_eq!(s.cell(0, 1).unwrap().contents(), "\u{1F466}", "the boy gets its own cell");
-    assert_eq!(s.cell(0, 3).unwrap().contents(), "X");
-    assert_eq!(s.cursor_position().1, 4);
+    assert_eq!(s.cell(0, 0).unwrap().contents(), "a\u{200D}\u{1F466}", "all three in one cell");
+    assert!(!s.cell(0, 0).unwrap().is_wide(), "the letter cell stays narrow");
+    assert_eq!(s.cell(0, 1).unwrap().contents(), "X");
+    assert_eq!(s.cursor_position().1, 2);
+}
+
+// A letter followed by ZWJ alone: the joiner folds into the letter.
+#[test]
+fn letter_followed_by_zwj_alone() {
+    let p = parse(40, &["a\u{200D}"]);
+    assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "a\u{200D}");
+    assert_eq!(p.screen().cursor_position().1, 1);
+}
+
+// Zero width characters at column 0 have nothing to combine with and tmux
+// discards them.
+#[test]
+fn zero_width_at_column_0_is_discarded() {
+    assert_eq!(cursor_col_after("\u{200D}\u{FE0F}\u{0301}"), 0);
+    let p = parse(40, &["\u{200D}A"]);
+    assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "A");
 }
 
 // A skin tone modifier with nothing before it is an ordinary wide emoji.
@@ -119,29 +136,79 @@ fn modifier_after_a_letter_stands_alone() {
 
 // Three regional indicators: the first two pair into a flag, the third does
 // not join the flag (tmux utf8_should_combine refuses a third indicator when
-// the cell already holds a pair).
+// the cell already holds a pair). A lone indicator is one column wide, as
+// wcwidth has it, so the third takes one column and a fourth pairs with it.
 #[test]
 fn third_regional_indicator_starts_a_new_cell() {
     let p = parse(40, &["\u{1F1EF}\u{1F1F5}\u{1F1FA}"]);
     let s = p.screen();
     assert_eq!(s.cell(0, 0).unwrap().contents(), "\u{1F1EF}\u{1F1F5}");
     assert_eq!(s.cell(0, 2).unwrap().contents(), "\u{1F1FA}");
-    assert_eq!(s.cursor_position().1, 4);
+    assert!(!s.cell(0, 2).unwrap().is_wide());
+    assert_eq!(s.cursor_position().1, 3);
+    let p = parse(40, &["\u{1F1EF}\u{1F1F5}\u{1F1FA}\u{1F1F8}"]);
+    assert_eq!(p.screen().cell(0, 2).unwrap().contents(), "\u{1F1FA}\u{1F1F8}");
+    assert_eq!(p.screen().cursor_position().1, 4);
 }
 
-// A cluster longer than a cell can hold keeps the cell intact and the column
-// count right: the extra code points are dropped from the cell rather than
-// spilling into new cells, as tmux drops them when utf8_append would overflow
-// UTF8_SIZE.
+// A cluster longer than a cell can hold (tmux UTF8_SIZE, 32 bytes): tmux
+// stops combining at the byte that would overflow. The zero width ZWJ that
+// does not fit is discarded and the next emoji starts a new cell, which the
+// rest of the sequence then joins through its own ZWJs.
+//   cell 0: family ZWJ man                            (32 bytes)
+//   cell 2: woman ZWJ girl ZWJ boy ZWJ man ZWJ woman  (32 bytes)
+//   cell 4: girl ZWJ boy
 #[test]
-fn cluster_longer_than_a_cell_stays_one_cell() {
+fn cluster_longer_than_a_cell_spills_like_tmux() {
     let long = format!("{FAMILY}\u{200D}{FAMILY}\u{200D}{FAMILY}");
     let p = parse(40, &[&format!("{long}X")]);
     let s = p.screen();
-    assert!(s.cell(0, 0).unwrap().is_wide());
-    assert!(s.cell(0, 0).unwrap().contents().starts_with('\u{1F468}'));
-    assert_eq!(s.cell(0, 2).unwrap().contents(), "X", "X still lands on col 2");
-    assert_eq!(s.cursor_position().1, 3);
+    assert_eq!(s.cell(0, 0).unwrap().contents(), format!("{FAMILY}\u{200D}\u{1F468}"));
+    assert_eq!(
+        s.cell(0, 2).unwrap().contents(),
+        "\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}\u{200D}\u{1F468}\u{200D}\u{1F469}"
+    );
+    assert_eq!(s.cell(0, 4).unwrap().contents(), "\u{1F467}\u{200D}\u{1F466}");
+    for col in [0, 2, 4] {
+        assert!(s.cell(0, col).unwrap().is_wide(), "col {col} wide");
+        assert!(s.cell(0, col + 1).unwrap().is_wide_continuation(), "col {} cont", col + 1);
+    }
+    assert_eq!(s.cell(0, 6).unwrap().contents(), "X");
+    assert_eq!(s.cursor_position().1, 7);
+}
+
+// Cells holding clusters past the inline bytes still compare by text.
+#[test]
+fn long_clusters_compare_by_text() {
+    let a = parse(40, &[FAMILY]);
+    let b = parse(40, &[FAMILY]);
+    assert_eq!(a.screen().cell(0, 0), b.screen().cell(0, 0));
+    let other = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}\u{200D}\u{1F466}";
+    let c = parse(40, &[other]);
+    assert_ne!(a.screen().cell(0, 0), c.screen().cell(0, 0));
+    assert_eq!(c.screen().cell(0, 0).unwrap().contents(), other);
+    // Overwriting a long cluster with a plain character leaves no trace.
+    let mut d = parse(40, &[FAMILY]);
+    d.process(b"\x1b[1;1HZ");
+    assert_eq!(d.screen().cell(0, 0).unwrap().contents(), "Z");
+    assert!(!d.screen().cell(0, 0).unwrap().is_wide());
+}
+
+// A modifier BEFORE its emoji also combines: screen_write_combine tries
+// utf8_should_combine in both orders.
+#[test]
+fn modifier_before_its_emoji_combines() {
+    let p = parse(40, &["\u{1F3FD}\u{1F44D}X"]);
+    assert_eq!(p.screen().cell(0, 0).unwrap().contents(), "\u{1F3FD}\u{1F44D}");
+    assert_eq!(p.screen().cell(0, 2).unwrap().contents(), "X");
+}
+
+// Two skin tone modifiers do not combine with each other, and a modifier
+// does not attach to an emoji outside tmux's table.
+#[test]
+fn modifier_outside_the_table_stands_alone() {
+    assert_eq!(cursor_col_after("\u{1F3FD}\u{1F3FD}"), 4);
+    assert_eq!(cursor_col_after("\u{1F4DB}\u{1F3FD}"), 4);
 }
 
 // The cluster arrives with its first emoji on the last column: the wide base
