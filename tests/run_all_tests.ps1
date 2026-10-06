@@ -915,6 +915,22 @@ $env:PSMUX_TEST_RUNNER = '1'
 # psmux honours PSMUX_PSREADLINE_HISTORY in its pane init, so the run gets a
 # throwaway history file of its own.
 $env:PSMUX_PSREADLINE_HISTORY = Join-Path $script:RunDir "psreadline_history.txt"
+
+# Discussion #748: a suite that starts a server without -f loads the machine's
+# own config (~/.psmux.conf, ~/.psmuxrc, ~/.tmux.conf or ~/.config/psmux/psmux.conf),
+# so `set -g base-index 1` on the machine made every suite that targets `:0`
+# fail. PSMUX_CONFIG_FILE replaces all four paths (src/config.rs), so every
+# suite this runner starts inherits an empty config and a sweep runs on the
+# defaults whatever the machine has. A suite that sets its own PSMUX_CONFIG_FILE
+# still wins, and the suites that write a default path config and expect psmux
+# to load it clear the variable at their top. Clean-Server recreates the file
+# before every suite, since a suite may delete or write the file the variable
+# names (test_env_shim removes it) and Storage Sense removes stale TEMP files.
+$script:EmptyConfig = Join-Path $script:RunDir "empty_psmux.conf"
+[System.IO.File]::WriteAllText($script:EmptyConfig, '')
+if ($env:PSMUX_CONFIG_FILE) { Write-Log "PSMUX_CONFIG_FILE was $env:PSMUX_CONFIG_FILE in the launching shell; the run uses its own empty config instead" }
+$env:PSMUX_CONFIG_FILE = $script:EmptyConfig
+Write-Log "Suites inherit PSMUX_CONFIG_FILE=$script:EmptyConfig (empty, see discussion #748)"
 $script:RunStartedAt = Get-Date
 
 $script:CurrentSuiteFile = Join-Path $script:RunDir "current_suite.txt"
@@ -1242,6 +1258,12 @@ function Clean-Server {
     # Remove any test config files (tests should restore originals but may fail)
     Remove-Item "$env:USERPROFILE\.psmux.conf" -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:USERPROFILE\.psmuxrc" -Force -ErrorAction SilentlyContinue
+    # Put the empty config back (discussion #748): the previous suite may have
+    # deleted it, written into it, or cleared the variable in its own process.
+    if ($script:EmptyConfig) {
+        try { [System.IO.File]::WriteAllText($script:EmptyConfig, '') } catch { Write-Log "could not reset $script:EmptyConfig : $_" }
+        $env:PSMUX_CONFIG_FILE = $script:EmptyConfig
+    }
     Remove-Item (Join-Path $script:RunDir "ks_*.tmp") -Force -ErrorAction SilentlyContinue
     # The reap above only sees the panes of servers still ALIVE when it runs.
     # A pane whose server had already died (killed by the suite itself by pid,
