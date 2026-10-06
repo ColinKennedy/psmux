@@ -243,3 +243,47 @@ fn text_extraction_reproduces_the_cluster_bytes() {
     assert_eq!(p2.screen().contents().trim_end(), row, "formatted replay");
     assert_eq!(p2.screen().cursor_position().1, 12);
 }
+
+// `str_cells` is what a prompt counts with. It must give the cells the grid
+// gives, start for start and width for width, so there is one opinion.
+#[test]
+fn str_cells_agrees_with_the_grid() {
+    let long = format!("{FAMILY}\u{200D}{FAMILY}\u{200D}{FAMILY}");
+    let mut cases: Vec<String> = SEQUENCES.iter().map(|(_, s, _)| (*s).to_string()).collect();
+    cases.extend(
+        [
+            "a\u{200D}\u{1F466}X",
+            "\u{1F3FD}\u{1F44D}",
+            "\u{1F3FD}\u{1F3FD}",
+            "\u{1F4DB}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F1EF}\u{1F1F5}\u{1F1FA}\u{1F1F8}\u{1F1FA}",
+            "e\u{0301}\u{0E01}\u{0E48}",
+            "\u{200D}A\u{3164}B",
+            &long,
+        ]
+        .iter()
+        .map(|s| (*s).to_string()),
+    );
+    for s in &cases {
+        let p = parse(80, &[s]);
+        let scr = p.screen();
+        let mut grid: Vec<(String, usize)> = Vec::new();
+        let mut col = 0u16;
+        while col < scr.cursor_position().1 {
+            let cell = scr.cell(0, col).unwrap();
+            let w = if cell.is_wide() { 2 } else { 1 };
+            grid.push((cell.contents().to_string(), w));
+            col += u16::try_from(w).unwrap();
+        }
+        let cells = vt100_psmux::str_cells(s);
+        let widths: Vec<usize> = cells.iter().map(|&(_, w)| w).collect();
+        let grid_widths: Vec<usize> = grid.iter().map(|(_, w)| *w).collect();
+        assert_eq!(widths, grid_widths, "{s:?}: str_cells widths vs grid");
+        // Each cell's text in the grid begins with the character str_cells
+        // says the cell starts on.
+        for ((start, _), (text, _)) in cells.iter().zip(&grid) {
+            assert_eq!(s[*start..].chars().next(), text.chars().next(), "{s:?}: cell at byte {start}");
+        }
+    }
+}

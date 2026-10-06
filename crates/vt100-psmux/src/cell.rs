@@ -6,12 +6,10 @@
 // the same pair on every grid_cell (`us` plus the UNDERSCORE_2..5 attr bits).
 const CONTENT_BYTES: usize = 22;
 
-/// The most UTF-8 bytes one cell holds, combining characters included.  This
-/// is tmux's `UTF8_SIZE` (tmux.h): `screen_write_combine` refuses to fold a
-/// character into a cell once `last.data.size + ud->size` would exceed it,
-/// and the character then starts a cell of its own.  An emoji ZWJ family of
-/// four people is 25 bytes, so the inline 22 bytes are not enough (#749).
-pub(crate) const MAX_CELL_BYTES: usize = 32;
+/// The most UTF-8 bytes one cell holds, combining characters included
+/// (tmux's `UTF8_SIZE`). An emoji ZWJ family of four people is 25 bytes, so
+/// the inline 22 bytes are not enough (#749).
+use crate::width::MAX_CELL_BYTES;
 
 const IS_WIDE: u8 = 0b1000_0000;
 const IS_WIDE_CONTINUATION: u8 = 0b0100_0000;

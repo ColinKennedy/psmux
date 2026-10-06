@@ -242,6 +242,210 @@ pub fn str_width(s: &str) -> usize {
     s.chars().map(|c| char_width(c).unwrap_or(0)).sum()
 }
 
+// ---------------------------------------------------------------------------
+// Combining characters into cells (#749)
+// ---------------------------------------------------------------------------
+
+/// U+FE0F VARIATION SELECTOR-16, which requests emoji presentation.
+const VS16: char = '\u{FE0F}';
+
+/// U+200D ZERO WIDTH JOINER, which glues the emoji either side of it into
+/// one glyph (tmux `utf8_is_zwj`).
+const ZWJ: char = '\u{200D}';
+
+/// U+3164 HANGUL FILLER, which tmux ignores entirely (`screen_write_combine`
+/// returns before looking at the grid). It is invisible and zero width here
+/// anyway, so dropping it changes no column, only what a copy picks up.
+const HANGUL_FILLER: char = '\u{3164}';
+
+/// The most UTF-8 bytes one cell holds, combining characters included: tmux's
+/// `UTF8_SIZE` (tmux.h).
+pub const MAX_CELL_BYTES: usize = 32;
+
+/// U+1F1E6 to U+1F1FF, the regional indicator letters a flag is spelled with.
+fn is_regional_indicator(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+/// U+1F3FB to U+1F3FF, the five Fitzpatrick skin tone modifiers.
+fn is_skin_tone_modifier(c: char) -> bool {
+    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
+/// The emoji tmux lets a skin tone modifier attach to: the `switch (a)` table
+/// in `utf8_should_combine` (utf8-combined.c), copied entry for entry.
+fn takes_skin_tone(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x1F44B..=0x1F450
+            | 0x1F466..=0x1F469
+            | 0x1F46E
+            | 0x1F470..=0x1F478
+            | 0x1F47C
+            | 0x1F481..=0x1F483
+            | 0x1F485..=0x1F487
+            | 0x1F4AA
+            | 0x1F575
+            | 0x1F57A
+            | 0x1F590
+            | 0x1F595
+            | 0x1F596
+            | 0x1F645..=0x1F647
+            | 0x1F64B..=0x1F64F
+            | 0x1F6B4..=0x1F6B6
+            | 0x1F926
+            | 0x1F937..=0x1F939
+            | 0x1F93D
+            | 0x1F93E
+            | 0x1F9B5
+            | 0x1F9B6
+            | 0x1F9B8
+            | 0x1F9B9
+            | 0x1F9CD..=0x1F9CF
+            | 0x1F9D1..=0x1F9DF
+    )
+}
+
+/// tmux `utf8_should_combine(with, add)`. tmux decodes only the first code
+/// point of each side (`mbtowc` stops after one character) but counts the
+/// regional indicators over the whole of each, so a cell that already holds a
+/// flag never takes a third indicator. The skin tone test reads the way tmux
+/// wrote it, with the modifier on the `with` side; `join` tries both orders
+/// exactly as `screen_write_combine` does, so a modifier combines after its
+/// emoji and before it.
+fn should_combine(with: &str, add: &str) -> bool {
+    let (Some(w), Some(a)) = (with.chars().next(), add.chars().next()) else {
+        return false;
+    };
+    if is_regional_indicator(a) && is_regional_indicator(w) {
+        let count = |s: &str| s.chars().filter(|&c| is_regional_indicator(c)).count();
+        return count(with) == 1 && count(add) == 1;
+    }
+    takes_skin_tone(a) && is_skin_tone_modifier(w)
+}
+
+/// What a character does to the cells it is written after.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Join {
+    /// It is thrown away and no column moves.
+    Discard,
+    /// It starts a cell of its own, `char_width` columns wide.
+    NewCell,
+    /// It folds into the previous cell. `widen` says the cell goes from one
+    /// column to two.
+    Combine {
+        /// The previous cell was one column and becomes two.
+        widen: bool,
+    },
+}
+
+/// Decide what character `c`, `width` columns wide on its own, does after the
+/// cell `prev` (its text and its width in columns), or after nothing when
+/// `prev` is `None` (the first column, or a cursor that is not right after the
+/// start of a cell).
+///
+/// This is tmux's `screen_write_combine` (screen-write.c), and the one place
+/// psmux makes that decision: the pane's grid (`Screen::text`) and the
+/// prompts that must count columns the way the grid does (`str_cells`) both
+/// ask here, so they cannot disagree.
+///
+/// Emoji presentation is a property of a *sequence*: a ZWJ family, a skin
+/// tone pair, a flag of two regional indicators and a base followed by VS16
+/// each draw as one glyph two columns wide in tmux and in nearly every
+/// terminal (Windows Terminal, VS Code, JetBrains, WezTerm, Alacritty, ConEmu
+/// and conhost; mintty is the one that draws the parts apart). The rules, all
+/// tmux's:
+/// - U+3164 HANGUL FILLER is discarded outright.
+/// - ZWJ, VS16 and any other zero width character make no sense alone: they
+///   fold into the previous cell and are discarded when there is none.
+/// - VS16 widens a one column cell to two (#533; tmux's
+///   `variation-selector-always-wide`, on by default). A cell already two
+///   wide stays two.
+/// - An ASCII character never combines.
+/// - Any other character folds in only when `should_combine` pairs it with
+///   the cell (a second regional indicator, or a skin tone modifier and its
+///   emoji in either order), which also widens a one column cell to two, or
+///   when the cell ends in a ZWJ, which keeps the cell's width. So a letter,
+///   ZWJ and an emoji stay one column, as in tmux.
+/// - Nothing folds past `MAX_CELL_BYTES` (tmux `UTF8_SIZE`): a zero width
+///   character is then discarded and any other starts its own cell.
+#[must_use]
+pub fn join(prev: Option<(&str, usize)>, c: char, width: usize) -> Join {
+    if c == HANGUL_FILLER {
+        return Join::Discard;
+    }
+    let zero_width = c == ZWJ || c == VS16 || width == 0;
+    let alone = if zero_width {
+        Join::Discard
+    } else {
+        Join::NewCell
+    };
+
+    // tmux: "Cannot combine empty character or at left." `ud->size < 2` is a
+    // single byte, which is ASCII.
+    let Some((text, prev_width)) = prev else {
+        return alone;
+    };
+    if c.is_ascii() {
+        return alone;
+    }
+
+    let mut force_wide = c == VS16;
+    if !zero_width {
+        let mut buf = [0u8; 4];
+        let add: &str = c.encode_utf8(&mut buf);
+        if should_combine(text, add) || should_combine(add, text) {
+            force_wide = true;
+        } else if !text.ends_with(ZWJ) {
+            return Join::NewCell;
+        }
+    }
+
+    // A blank cell is stored empty but holds a space, as in tmux.
+    if text.len().max(1) + c.len_utf8() > MAX_CELL_BYTES {
+        return alone;
+    }
+    Join::Combine {
+        widen: force_wide && prev_width == 1,
+    }
+}
+
+/// Where each cell of `s` starts, as a byte offset, and how many columns it
+/// takes, for `s` written into a row wide enough to hold all of it. This
+/// walks `join` exactly as the grid does, so a prompt drawn in the same
+/// terminal as a pane counts the columns the pane counts (#749, #750).
+/// Control characters, which the grid does not draw, take no cell.
+#[must_use]
+pub fn str_cells(s: &str) -> Vec<(usize, usize)> {
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    // The text of the last cell. It is a run of `s` except where a discarded
+    // character sat inside it, so it is kept apart.
+    let mut last = String::new();
+    for (i, c) in s.char_indices() {
+        let Some(width) = char_width(c) else {
+            continue;
+        };
+        let prev = cells.last().map(|&(_, w)| (last.as_str(), w));
+        match join(prev, c, width) {
+            Join::Discard => {}
+            Join::NewCell => {
+                cells.push((i, width));
+                last.clear();
+                last.push(c);
+            }
+            Join::Combine { widen } => {
+                last.push(c);
+                if widen {
+                    if let Some(cell) = cells.last_mut() {
+                        cell.1 = 2;
+                    }
+                }
+            }
+        }
+    }
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

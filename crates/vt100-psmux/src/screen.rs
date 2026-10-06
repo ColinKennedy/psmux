@@ -1382,183 +1382,77 @@ impl Screen {
     }
 }
 
-/// U+FE0F VARIATION SELECTOR-16, which requests emoji presentation.
-const VS16: char = '\u{FE0F}';
-
-/// U+200D ZERO WIDTH JOINER, which glues the emoji either side of it into
-/// one glyph (tmux `utf8_is_zwj`).
-const ZWJ: char = '\u{200D}';
-
-/// U+3164 HANGUL FILLER, which tmux ignores entirely (`screen_write_combine`
-/// returns before looking at the grid).  It is invisible and zero width here
-/// anyway, so dropping it changes no column, only what a copy picks up.
-const HANGUL_FILLER: char = '\u{3164}';
-
-/// U+1F1E6 to U+1F1FF, the regional indicator letters a flag is spelled with.
-fn is_regional_indicator(c: char) -> bool {
-    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
-}
-
-/// U+1F3FB to U+1F3FF, the five Fitzpatrick skin tone modifiers.
-fn is_skin_tone_modifier(c: char) -> bool {
-    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
-}
-
-/// The emoji tmux lets a skin tone modifier attach to: the `switch (a)` table
-/// in `utf8_should_combine` (utf8-combined.c), copied entry for entry.
-fn takes_skin_tone(c: char) -> bool {
-    matches!(
-        u32::from(c),
-        0x1F44B..=0x1F450
-            | 0x1F466..=0x1F469
-            | 0x1F46E
-            | 0x1F470..=0x1F478
-            | 0x1F47C
-            | 0x1F481..=0x1F483
-            | 0x1F485..=0x1F487
-            | 0x1F4AA
-            | 0x1F575
-            | 0x1F57A
-            | 0x1F590
-            | 0x1F595
-            | 0x1F596
-            | 0x1F645..=0x1F647
-            | 0x1F64B..=0x1F64F
-            | 0x1F6B4..=0x1F6B6
-            | 0x1F926
-            | 0x1F937..=0x1F939
-            | 0x1F93D
-            | 0x1F93E
-            | 0x1F9B5
-            | 0x1F9B6
-            | 0x1F9B8
-            | 0x1F9B9
-            | 0x1F9CD..=0x1F9CF
-            | 0x1F9D1..=0x1F9DF
-    )
-}
-
-/// tmux `utf8_should_combine(with, add)`.  tmux decodes only the first code
-/// point of each side (`mbtowc` stops after one character) but counts the
-/// regional indicators over the whole of each, so a cell that already holds a
-/// flag never takes a third indicator.  The skin tone test reads the way tmux
-/// wrote it, with the modifier on the `with` side; the caller tries both
-/// orders exactly as `screen_write_combine` does, so it matches a modifier
-/// after the emoji and before it.
-fn should_combine(with: &str, add: &str) -> bool {
-    let (Some(w), Some(a)) = (with.chars().next(), add.chars().next()) else {
-        return false;
-    };
-    if is_regional_indicator(a) && is_regional_indicator(w) {
-        let count = |s: &str| s.chars().filter(|&c| is_regional_indicator(c)).count();
-        return count(with) == 1 && count(add) == 1;
-    }
-    takes_skin_tone(a) && is_skin_tone_modifier(w)
-}
-
 impl Screen {
     /// Fold `c` into the cell before the cursor when tmux would, and say
-    /// whether `c` has been dealt with (#749).  This is tmux's
-    /// `screen_write_combine` (screen-write.c), which `screen_write_cell`
-    /// calls before anything else, so it runs ahead of the wrap decision and
-    /// a character combining onto the last column never wraps.
+    /// whether `c` has been dealt with (#749). The decision is
+    /// `crate::width::join`, tmux's `screen_write_combine`, which
+    /// `screen_write_cell` calls before anything else; so it runs ahead of the
+    /// wrap decision here too, and a character combining onto the last column
+    /// never wraps.
     ///
-    /// Emoji presentation is a property of a *sequence*: a ZWJ family, a skin
-    /// tone pair, a flag of two regional indicators and a base followed by
-    /// VS16 each draw as one glyph two columns wide in tmux and in nearly
-    /// every terminal (Windows Terminal, VS Code, JetBrains, WezTerm,
-    /// Alacritty, ConEmu and conhost; mintty is the one that draws the parts
-    /// apart).  Measured one character at a time each wide member took its
-    /// own two columns, so a family of four spent eight where the child
-    /// process had counted two, and everything after it drifted right.
-    ///
-    /// The rules, all tmux's:
-    /// - ZWJ, VS16 and any other zero width character make no sense alone:
-    ///   they fold into the previous cell, and are discarded when there is
-    ///   no cell to fold into (column 0, or a cell that is not where the
-    ///   character before the cursor starts).
-    /// - VS16 widens a one column cell to two (#533; tmux's
-    ///   `variation-selector-always-wide`, on by default).  A cell already
-    ///   two wide stays two.
-    /// - A character with width folds in only when `should_combine` pairs it
-    ///   with the cell (a second regional indicator, a skin tone modifier and
-    ///   its emoji in either order), which also widens the cell to two, or
-    ///   when the cell ends in a ZWJ, which keeps the cell's width.  So a
-    ///   letter, ZWJ and an emoji stay one column, as in tmux.
-    /// - Nothing is folded past `MAX_CELL_BYTES` (tmux `UTF8_SIZE`): a zero
-    ///   width character is then dropped and any other starts its own cell.
+    /// Measured one character at a time, each wide member of an emoji cluster
+    /// took its own two columns, so a family of four spent eight where the
+    /// child process had counted two, and everything after it drifted right.
     fn combine(&mut self, c: char, width: u16) -> bool {
-        if c == HANGUL_FILLER {
-            return true;
-        }
-        let zero_width = c == ZWJ || c == VS16 || width == 0;
-        let mut force_wide = c == VS16;
-
-        // tmux: "Cannot combine empty character or at left."  `ud->size < 2`
-        // is a single byte, which is ASCII.
-        let pos = self.grid().pos();
-        if c.is_ascii() || pos.col == 0 {
-            return zero_width;
-        }
-
         // The cell to combine with is the one the cursor follows: one column
         // back, or two when that column is the continuation of a wide cell.
         // It must really start there, so a cursor parked in the middle of a
         // wide glyph combines with nothing.
-        let mut base_col = pos.col - 1;
-        let Some(mut last) = self.grid().drawing_cell(crate::grid::Pos {
-            row: pos.row,
-            col: base_col,
-        }) else {
-            return zero_width;
-        };
-        if pos.col != 1 && last.is_wide_continuation() {
-            base_col = pos.col - 2;
-            let Some(cell) = self.grid().drawing_cell(crate::grid::Pos {
+        let pos = self.grid().pos();
+        let mut base = None;
+        if pos.col > 0 {
+            let mut base_col = pos.col - 1;
+            let mut last = self.grid().drawing_cell(crate::grid::Pos {
                 row: pos.row,
                 col: base_col,
-            }) else {
-                return zero_width;
-            };
-            last = cell;
-        }
-        let last_width = if last.is_wide() { 2 } else { 1 };
-        if pos.col - base_col != last_width || last.is_wide_continuation() {
-            return zero_width;
-        }
-
-        if !zero_width {
-            let mut buf = [0u8; 4];
-            let add: &str = c.encode_utf8(&mut buf);
-            let with = last.contents();
-            if should_combine(with, add) || should_combine(add, with) {
-                force_wide = true;
-            } else if !with.ends_with(ZWJ) {
-                return false;
+            });
+            if pos.col != 1 && last.is_some_and(crate::Cell::is_wide_continuation) {
+                base_col = pos.col - 2;
+                last = self.grid().drawing_cell(crate::grid::Pos {
+                    row: pos.row,
+                    col: base_col,
+                });
+            }
+            if let Some(last) = last {
+                let last_width = if last.is_wide() { 2 } else { 1 };
+                if pos.col - base_col == last_width && !last.is_wide_continuation() {
+                    base = Some((base_col, last, usize::from(last_width)));
+                }
             }
         }
 
-        if last.content_bytes() + c.len_utf8() > crate::cell::MAX_CELL_BYTES {
-            return zero_width;
+        let decision = crate::width::join(
+            base.map(|(_, cell, w)| (cell.contents(), w)),
+            c,
+            usize::from(width),
+        );
+        let base_col = base.map(|(col, _, _)| col);
+        match (decision, base_col) {
+            (crate::width::Join::Discard, _) => true,
+            (crate::width::Join::NewCell, _) | (_, None) => false,
+            (crate::width::Join::Combine { widen }, Some(base_col)) => {
+                let appended = self
+                    .grid_mut()
+                    .drawing_cell_mut(crate::grid::Pos {
+                        row: pos.row,
+                        col: base_col,
+                    })
+                    .is_some_and(|cell| cell.append(c));
+                if !appended {
+                    // Only the cluster table refusing a new entry gets here;
+                    // tmux then writes the character on its own, which for a
+                    // zero width one shows nothing.
+                    return width == 0;
+                }
+                // Force the width to 2 for modifiers and the variation
+                // selector, but only from 1: a cell already two wide is left
+                // alone, so `📛 VS16` stays two columns rather than four.
+                if widen {
+                    self.promote_cell_to_wide(pos.row, base_col, self.attrs);
+                }
+                true
+            }
         }
-        let appended = self
-            .grid_mut()
-            .drawing_cell_mut(crate::grid::Pos {
-                row: pos.row,
-                col: base_col,
-            })
-            .is_some_and(|cell| cell.append(c));
-        if !appended {
-            return zero_width;
-        }
-
-        // Force the width to 2 for modifiers and the variation selector, but
-        // only from 1: a cell already two wide is left alone, so `📛 VS16`
-        // stays two columns rather than growing to four.
-        if force_wide && last_width == 1 {
-            self.promote_cell_to_wide(pos.row, base_col, self.attrs);
-        }
-        true
     }
 
     /// Widen the narrow cell at (`row`, `col`) into a two column cell, taking

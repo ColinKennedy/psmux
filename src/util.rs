@@ -988,45 +988,17 @@ pub fn str_prefix_within_cols(s: &str, max_cols: usize) -> &str {
 /// Where each cell of `s` starts, and how many columns it takes, counted the
 /// way the pane's grid counts.
 ///
-/// The grid gives each character a cell, folds a zero width character into
-/// the cell before it, and promotes that cell to two columns when a variation
-/// selector asks for emoji presentation: `U+2764` is one column and
-/// `U+2764 U+FE0F` is two (`Screen::wants_wide_promotion`, #533, which
-/// follows tmux's `screen_write_combine` and its
-/// `variation-selector-always-wide`). Every terminal this was measured in
-/// gives that sequence two columns.
-///
 /// The prompt is drawn into the same terminal as the pane, so it has to count
-/// the same way the pane does, or the two disagree inside one psmux. What the
-/// grid does NOT do is join a cluster across characters that carry a width of
-/// their own: a skin tone modifier and a ZWJ sequence stay as many cells as
-/// they have characters. Terminals disagree about those, so that question
-/// belongs to the grid and is not decided here.
+/// the same way the pane does, or the two disagree inside one psmux. The
+/// grid folds an emoji cluster into one cell the way tmux's
+/// `screen_write_combine` does: a variation selector sequence (#533, #750), a
+/// ZWJ sequence, a skin tone pair and a regional indicator pair are each one
+/// cell of two columns (#749). `vt100::str_cells` walks the very rule the
+/// grid writes with (`vt100::width::join`), so there is one opinion and not
+/// two to keep in step.
 fn grid_cells(s: &str) -> Vec<(usize, usize)> {
-    let mut cells: Vec<(usize, usize)> = Vec::new();
-    let mut cell_start = 0usize;
-    for (i, ch) in s.char_indices() {
-        let w = vt100::char_width(ch).unwrap_or(0);
-        if w == 0 {
-            // A zero width character belongs to the cell before it. With no
-            // cell to join, it is dropped, as the grid drops one that arrives
-            // in the first column.
-            if let Some(last) = cells.last_mut() {
-                let through = &s[cell_start..i + ch.len_utf8()];
-                if last.1 == 1 && (ch == VS16 || vt100::str_width(through) > 1) {
-                    last.1 = 2;
-                }
-            }
-            continue;
-        }
-        cell_start = i;
-        cells.push((i, w));
-    }
-    cells
+    vt100::str_cells(s)
 }
-
-/// U+FE0F VARIATION SELECTOR-16, which asks for emoji presentation.
-const VS16: char = '\u{FE0F}';
 
 /// Columns `s` takes in the grid's reckoning.
 fn grid_width(s: &str) -> usize {

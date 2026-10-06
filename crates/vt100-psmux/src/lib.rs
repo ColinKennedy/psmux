@@ -72,5 +72,5 @@ pub use parser::Parser;
 pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};
 pub use width::{
     char_width, clear_codepoint_widths, has_overrides, parse_entry as parse_codepoint_width_entry,
-    set_codepoint_widths, str_width, WidthOverride, MAX_OVERRIDE_WIDTH,
+    set_codepoint_widths, str_cells, str_width, WidthOverride, MAX_OVERRIDE_WIDTH,
 };
