@@ -201,6 +201,27 @@ fn serialize_overlay_json(app: &AppState) -> String {
             out.push_str(",\"status_message\":\"");
             out.push_str(&json_escape_string(msg));
             out.push('"');
+            // A copy-mode prompt is a status message here, because copy mode
+            // lives in the server and the command prompt lives in the client
+            // (crate::input). tmux has no such split: its copy-mode search and
+            // goto line prompts ARE command prompts (key-bindings.c:514, :515
+            // and :530), so status.c draws their cursor like any other
+            // prompt's. The client cannot draw one without knowing where it
+            // sits, so the offset rides along with the text, and only for a
+            // message that IS the prompt: a display-message has no cursor.
+            if crate::copy_mode::copy_prompt_text(&app.mode).as_deref() == Some(msg.as_str()) {
+                if let Some((label, at)) =
+                    crate::copy_mode::copy_prompt_cursor(&app.mode, app.copy_prompt_back)
+                {
+                    // The label goes too: only the input scrolls when the
+                    // prompt outgrows the line, as in tmux (status.c:922 to
+                    // :948), so the client has to know where it ends.
+                    out.push_str(",\"status_label\":");
+                    out.push_str(&label.to_string());
+                    out.push_str(",\"status_cursor\":");
+                    out.push_str(&at.to_string());
+                }
+            }
         }
     }
     out
@@ -3835,7 +3856,25 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(combined_buf.clone());
                     dump_state_seen_full.insert(dump_client_id);
                 }
-                CtrlReq::SendText(s) => { app.status_message = None; crate::input::stamp_interactive_text(&mut app); send_text_to_active(&mut app, &s)?; echo_pending_until = Some(Instant::now()); }
+                CtrlReq::SendText(s) => {
+                    // A copy-mode prompt is drawn by the client from the
+                    // status message, so a key that only edits that prompt
+                    // changes no pane cell: the frame diff is empty and
+                    // nothing would be pushed until the client's once a
+                    // second dump-state poll. Moving the cursor inside the
+                    // prompt is exactly that case, so the push is owed
+                    // whenever a prompt was open before the key or is open
+                    // after it, which also covers the one that opens or
+                    // closes it.
+                    let prompt_before = crate::copy_mode::copy_prompt_text(&app.mode).is_some();
+                    app.status_message = None;
+                    crate::input::stamp_interactive_text(&mut app);
+                    send_text_to_active(&mut app, &s)?;
+                    if prompt_before || crate::copy_mode::copy_prompt_text(&app.mode).is_some() {
+                        state_dirty = true;
+                    }
+                    echo_pending_until = Some(Instant::now());
+                }
                 CtrlReq::ClientActivity(cid) => {
                     // `#{client_activity}` is the last input from THIS client
                     // (tmux c->activity_time), not its last resize (#724).
@@ -3853,7 +3892,19 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::PtyWake => { /* the wake itself is the whole point; the
                     PTY_DATA_READY swap above already set state_dirty. */ }
-                CtrlReq::SendKey(k) => { crate::pty_trace::mark("g", 0, k.as_bytes()); app.status_message = None; crate::input::stamp_interactive_key(&mut app, &k); send_key_to_active(&mut app, &k)?; echo_pending_until = Some(Instant::now()); }
+                CtrlReq::SendKey(k) => {
+                    // Same as SendText above: a prompt edit owes a frame even
+                    // though no cell changed.
+                    let prompt_before = crate::copy_mode::copy_prompt_text(&app.mode).is_some();
+                    crate::pty_trace::mark("g", 0, k.as_bytes());
+                    app.status_message = None;
+                    crate::input::stamp_interactive_key(&mut app, &k);
+                    send_key_to_active(&mut app, &k)?;
+                    if prompt_before || crate::copy_mode::copy_prompt_text(&app.mode).is_some() {
+                        state_dirty = true;
+                    }
+                    echo_pending_until = Some(Instant::now());
+                }
                 CtrlReq::SendPaste(s) => { send_paste_to_active(&mut app, &s)?; echo_pending_until = Some(Instant::now()); }
                 CtrlReq::PasteBuffer(pb, resp) => {
                     // No `?` here on purpose: a write that fails because the

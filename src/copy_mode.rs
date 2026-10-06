@@ -372,6 +372,42 @@ pub fn copy_prompt_text(mode: &Mode) -> Option<String> {
     }
 }
 
+/// Where the label ends and where the cursor sits inside the text
+/// `copy_prompt_text` returns, both as byte offsets into it.
+///
+/// `back` is `AppState::copy_prompt_back`, the number of characters between
+/// the cursor and the end of the input, which is how the line editor keeps it
+/// (tmux keeps the same position as `prompt_index`, prompt.c). Byte offsets
+/// are what the client needs, because `util::prompt_window` takes one, so the
+/// conversion happens here where the characters are rather than on the wire.
+///
+/// The label is reported separately because only the input scrolls when the
+/// text outgrows the line: tmux draws the label at `ax`, then the input from
+/// `ax + start` with its own offset (status.c:922 to :948), so the label stays
+/// put and the user can still see which prompt is open.
+///
+/// The copy-mode command prompt has no editor: its keys only append
+/// (`copy_prompt::feed`), so its cursor is always at the end.
+pub fn copy_prompt_cursor(mode: &Mode, back: usize) -> Option<(usize, usize)> {
+    let text = copy_prompt_text(mode)?;
+    let (label_len, back) = match mode {
+        Mode::CopySearch { input, .. } | Mode::CopyGoto { input } => (
+            text.len() - input.len(),
+            // A prompt that was answered and reopened can carry a stale back,
+            // and a history recall replaces the input underneath it, so the
+            // cursor is clamped to the text that is actually there.
+            back.min(input.chars().count()),
+        ),
+        Mode::CopyCommandPrompt(p) => (text.len() - p.input.len(), 0),
+        _ => (text.len(), 0),
+    };
+    let mut at = text.len();
+    for ch in text.chars().rev().take(back) {
+        at -= ch.len_utf8();
+    }
+    Some((label_len, at))
+}
+
 /// Make the status line show the prompt of the pane that has focus now.
 ///
 /// A prompt's sticky message stayed behind when focus moved: `select-pane`
@@ -2822,3 +2858,7 @@ mod tests_issue712_copy_search_utf8;
 #[path = "../tests-rs/test_disc694_copy_mode_vi_parity.rs"]
 mod test_disc694_copy_mode_vi_parity;
 
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue746_status_prompt_cursor.rs"]
+mod test_issue746_status_prompt_cursor;

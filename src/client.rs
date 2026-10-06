@@ -3433,6 +3433,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         /// Status bar message from display-message (without -p)
         #[serde(default)]
         status_message: Option<String>,
+        /// Byte offset of the cursor inside `status_message`, sent only when
+        /// the message is an open copy-mode prompt (search, goto line, or a
+        /// command prompt from the copy-mode table). `None` for a
+        /// display-message, which has no cursor of its own.
+        #[serde(default)]
+        status_cursor: Option<usize>,
+        /// Byte length of that prompt's label, the part before the typed
+        /// text. Only the text after it scrolls when the prompt outgrows the
+        /// line, so the label stays readable (tmux status.c:922 to :948).
+        #[serde(default)]
+        status_label: Option<usize>,
         /// Customize-mode overlay active
         #[serde(default)]
         customize_active: bool,
@@ -7300,6 +7311,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // Where an open prompt put its cursor during the draw (#741), so the
         // post draw settle and the Win32 caret can follow it.
         let mut prompt_cursor_pos: Option<(u16, u16)> = None;
+        // Whether that prompt was a copy-mode one on the status line, which
+        // the cursor settle has to treat like the client's own prompts.
+        let mut status_prompt_open = false;
         terminal.draw(|f| {
             client_drawn_sel = drawn_copy_sel;
             let area = f.area();
@@ -8268,11 +8282,63 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         _ => "bg=yellow,fg=black",
                     }
                 );
-                let padded = if msg.len() < status_chunk.width as usize {
-                    format!("{}{}", msg, " ".repeat(status_chunk.width as usize - msg.len()))
-                } else {
-                    msg.chars().take(status_chunk.width as usize).collect()
+                // The line is measured in display columns. The padding used
+                // msg.len(), a BYTE count, so a message holding any multi
+                // byte character was never padded and message-style stopped
+                // where the text did instead of filling the line; the
+                // truncation took `width` CHARACTERS, which is twice that
+                // many columns when they are wide. Same class as #741.
+                let cols = status_chunk.width as usize;
+                // An open copy-mode prompt sends where its cursor sits, and
+                // the input scrolls with it so a long search term keeps what
+                // is being typed on screen. The label does not scroll: tmux
+                // draws it at `ax` and then the input from `ax + start` with
+                // its own offset (status.c:922 to :948), so which prompt is
+                // open stays readable however long the term gets.
+                let (padded, prompt_col) = match (state.status_cursor, state.status_label) {
+                    (Some(at), Some(label_len)) if label_len <= msg.len() => {
+                        let (label, input) = msg.split_at(label_len.min(msg.len()));
+                        let label_cols = unicode_width::UnicodeWidthStr::width(label);
+                        let avail = cols.saturating_sub(label_cols);
+                        let (shown, cur_col) = crate::util::prompt_window(
+                            input,
+                            at.saturating_sub(label_len),
+                            avail,
+                        );
+                        let used =
+                            label_cols + unicode_width::UnicodeWidthStr::width(shown);
+                        (
+                            format!("{}{}{}", label, shown, " ".repeat(cols.saturating_sub(used))),
+                            Some(label_cols + cur_col),
+                        )
+                    }
+                    _ => {
+                        // A display-message has no cursor: it starts at the
+                        // left and is cut on the right, which is what a
+                        // cursor of 0 gives.
+                        let (shown, _) = crate::util::prompt_window(msg, 0, cols);
+                        let used = unicode_width::UnicodeWidthStr::width(shown);
+                        (
+                            format!("{}{}", shown, " ".repeat(cols.saturating_sub(used))),
+                            None,
+                        )
+                    }
                 };
+                // `status off` leaves the status chunk no rows, so the
+                // prompt is not on screen and there is nowhere to put its
+                // cursor. tmux is the same: with no status line there is no
+                // prompt area to draw into.
+                if let (Some(col), true) = (prompt_col, status_chunk.height > 0) {
+                    // The prompt owns the cursor while it is open, the way
+                    // tmux settles c->prompt_cursor before the pane's
+                    // position (server-client.c:1797 to :1808). Without this
+                    // the cursor stayed in the pane, so the line editor the
+                    // prompt gained moved something invisible.
+                    let cx = status_chunk.x + col as u16;
+                    f.set_cursor_position((cx, status_chunk.y));
+                    prompt_cursor_pos = Some((cx, status_chunk.y));
+                    status_prompt_open = true;
+                }
                 Paragraph::new(Line::from(Span::styled(padded, msg_style))).style(msg_style)
             } else {
                 Paragraph::new(Line::from(status_spans)).style(sb_base)
@@ -8690,7 +8756,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 srv_popup_cursor.and_then(|c| {
                     popup_cursor_screen_pos(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c)
                 })
-            } else if command_input || window_idx_input {
+            } else if command_input || window_idx_input || status_prompt_open {
                 // An open prompt owns the cursor, and the pane only gets it
                 // when no prompt is up: tmux settles the cursor on
                 // `c->prompt_cursor` first and takes the pane in the else
@@ -8703,6 +8769,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // where typing would land (#741). A pane IN copy mode sets
                 // neither of the post draw positions, which is why the prompt
                 // had a cursor there and not here.
+                //
+                // A copy-mode prompt on the status line (search, goto line,
+                // or a command prompt opened from the copy-mode table) is the
+                // same case: it lives in the server, so it reaches the client
+                // as the status message plus the offset of its cursor, and
+                // the draw above turned that into a position.
                 prompt_cursor_pos
             } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
                 // Content lives inside the border-label reservation; use the render's inner rect.
@@ -8724,6 +8796,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 && !(srv_popup_active && srv_popup_has_pty)
                 && !command_input
                 && !window_idx_input
+                && !status_prompt_open
             {
                 if let (Some((cc, cr)), Some(outer)) = (post_draw_park, active_pane_area) {
                     let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
