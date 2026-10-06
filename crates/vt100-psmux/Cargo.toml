@@ -81,6 +81,10 @@ path = "tests/issue641_scrollback_compaction.rs"
 name = "issue685_osc4_palette"
 path = "tests/issue685_osc4_palette.rs"
 
+[[test]]
+name = "issue749_emoji_clusters"
+path = "tests/issue749_emoji_clusters.rs"
+
 [dependencies.itoa]
 version = "1.0.18"
 
