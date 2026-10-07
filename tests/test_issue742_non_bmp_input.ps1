@@ -129,9 +129,12 @@ try {
     if ($wnHex -eq '0041,D83D,DE0A,0042') { Write-Pass "command prompt keeps the emoji" }
     else { Write-Fail "command prompt: window_name [$wnHex], wanted [0041,D83D,DE0A,0042]" }
 
-    # The same parser drops a control character delivered with vk=0 (the
-    # shape a Cygwin or MSYS pseudo console produces for Ctrl+B), so such a
-    # prefix never armed. 0x02 then c must open a window like a real Ctrl+B.
+    # The same parser drops a control character delivered with vk=0, so such a
+    # prefix never armed. No terminal measured types Ctrl+B in this shape (a
+    # ConPTY host such as mintty, winpty, sshd or a byte writing terminal gets
+    # vk=B, see console_tap.rs); it comes from WM_CHAR posted to a console
+    # window, a win32-input-mode report with Vk=0, or WriteConsoleInput.
+    # 0x02 then c must open a window like a real Ctrl+B.
     Write-Host "`n=== vk=0 control character as the prefix ===" -ForegroundColor Cyan
     $before = (P list-windows -t $SESS | Measure-Object).Count
     Inject '{UTF16:0002}{SLEEP:300}c'

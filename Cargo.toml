@@ -1,6 +1,7 @@
 [package]
 name = "psmux"
 version = "3.3.8"
+authors = ["Godwin Sam Josh"]
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"

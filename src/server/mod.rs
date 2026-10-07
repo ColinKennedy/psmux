@@ -1878,6 +1878,14 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
 
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     crate::startup_trace::mark("srv.entry");
+    // From here on this process is the server: a console injection must leave
+    // it detached rather than move it into its parent's console, which for a
+    // cold start is the console of the client that spawned it (issue #761).
+    // Set here and not in the `server` argument dispatch so every way into the
+    // server loop gets it.
+    #[cfg(windows)]
+    crate::platform::mouse_inject::SERVER_PROCESS
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
     let panic_session_name = session_name.clone();
@@ -3717,13 +3725,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // session it belonged to (no consumer could tell two
                     // sessions' dump-state responses apart without a separate
                     // display-message round trip). Append it alongside the
-                    // other one-off top-level fields.
-                    if combined_buf.ends_with('}') {
-                        combined_buf.pop();
-                        combined_buf.push_str(",\"session_name\":\"");
-                        combined_buf.push_str(&json_escape_string(&app.session_name));
-                        combined_buf.push_str("\"}");
-                    }
+                    // other one-off top-level fields. The push path below does
+                    // the same through the same helper.
+                    helpers::append_session_name_json(&app.session_name, &mut combined_buf);
                     // Inject overlay state (popup, menu, confirm, display_panes)
                     {
                         // Inject clock_colour if set
@@ -4820,6 +4824,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     rekey_session_guard(&mut session_guard, &app.port_file_base());
                     // Update env so run-shell/hooks from this server target the new name
                     env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
+                    // The name travels in every frame (`session_name`), and
+                    // nothing else a rename touches moves combined_data_version,
+                    // so without this an idle client was answered "NC" forever
+                    // and its status line kept the old name (#759). Same as
+                    // RenameWindow, which tmux redraws with server_status_*.
+                    meta_dirty = true;
                     hook_event = Some("after-rename-session");
                 }
                 CtrlReq::ClaimSession(name, client_cwd, client_priority, client_env_file, client_window_name, resp) => {
@@ -8187,6 +8197,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     );
                 }
             }
+            // The session's name, as the dump-state reply carries it. Attached
+            // clients take most frames from this push, so without it their
+            // `[#S]` and the rename overlay never saw the live name.
+            helpers::append_session_name_json(&app.session_name, &mut combined_buf);
             // Inject overlay state (popup, menu, confirm, display_panes)
             {
                 // Inject clock_colour if set
