@@ -4502,10 +4502,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     // open on the current name, as tmux does
                                     // with `command-prompt -I'#W'`.
                                     renaming = true; session_renaming = false;
-                                    rename_buf = active_window_name.clone(); rename_back = 0;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{window_name}", &active_window_name);
+                                    rename_back = 0;
                                 } else if cmd == "rename-session" {
                                     renaming = true; session_renaming = true;
-                                    rename_buf = session_label.clone(); rename_back = 0;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{session_name}", &session_label);
+                                    rename_back = 0;
                                 } else if cmd == "command-prompt" || cmd.starts_with("command-prompt ") {
                                     command_input = true;
                                     command_history_idx = command_history.len();
@@ -4607,7 +4611,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('d') => { quit = true; }
                                 KeyCode::Char(',') => {
                                     renaming = true; session_renaming = false;
-                                    rename_buf = active_window_name.clone(); rename_back = 0;
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{window_name}", &active_window_name);
+                                    rename_back = 0;
                                 }
                                 KeyCode::Char('$') => {
                                     // Rename session, through the same overlay,
@@ -4615,7 +4621,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     // with `command-prompt -I'#S'`.
                                     renaming = true;
                                     session_renaming = true;
-                                    rename_buf = session_label.clone();
+                                    rename_buf = overlay_initial_name(
+                                        port, &session_key, "#{session_name}", &session_label);
                                     rename_back = 0;
                                 }
                                 KeyCode::Char('?') => {
@@ -9523,6 +9530,38 @@ fn duplicates_recent_paste(text: &str, recent: Option<(&str, Duration)>) -> bool
 #[cfg(windows)]
 fn paste_buffer_has_non_ascii(buf: &str) -> bool {
     buf.chars().any(|c| !c.is_ascii())
+}
+
+/// The name a rename overlay opens on, asked for as it opens.
+///
+/// `session_label` and `active_window_name` are what the last parsed frame
+/// said. That is fine for the status line, which re-reads them on every
+/// repaint and so catches up on its own, and wrong for an overlay, which keeps
+/// whatever it copied: a name typed over a stale value renames the wrong thing
+/// back. The overlay therefore asks, the way `choose-tree`, `choose-session`
+/// and `choose-buffer` ask for their lists.
+///
+/// The port and the key are the ones this client attached with, not a fresh
+/// lookup. A `rename-session` moves the `.port` file and writes the same port
+/// number into the new one, so these survive the very rename this exists for,
+/// while a lookup by the client's own session name would go to the pre rename
+/// base and find nothing.
+///
+/// Falls back to the frame's value when the server does not answer inside the
+/// budget, the same one the choosers use, so the overlay is never worse off
+/// than before. `fetch_authed_response` trims the reply and treats an empty
+/// one, an "OK" and an "ERROR:" as no answer, so each of those falls back too.
+fn overlay_initial_name(port: u16, session_key: &str, fmt: &str, fallback: &str) -> String {
+    let addr = format!("127.0.0.1:{}", port);
+    let cmd = format!("display-message -p {}\n", fmt);
+    crate::session::fetch_authed_response(
+        &addr,
+        session_key,
+        cmd.as_bytes(),
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+    )
+    .unwrap_or_else(|| fallback.to_string())
 }
 
 /// Route a clipboard paste into the active client-side text overlay
