@@ -1878,6 +1878,14 @@ fn run_copy_mode_command_by_name(app: &mut AppState, cmd: &str) {
 
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     crate::startup_trace::mark("srv.entry");
+    // From here on this process is the server: a console injection must leave
+    // it detached rather than move it into its parent's console, which for a
+    // cold start is the console of the client that spawned it (issue #761).
+    // Set here and not in the `server` argument dispatch so every way into the
+    // server loop gets it.
+    #[cfg(windows)]
+    crate::platform::mouse_inject::SERVER_PROCESS
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
     let panic_session_name = session_name.clone();
