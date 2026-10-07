@@ -1,5 +1,17 @@
-# Scratch probe: cold launch then five new-window (each to prompt), a burst of
-# eight, and idle memory, for several pool depths, interleaved.
+# Probe (not run by the sweep): cold launch then five new-window (each timed to
+# its prompt), a burst of eight, and idle memory, for several pool depths,
+# interleaved. Depth is set with PSMUX_WARM_POOL_SIZE on the same binary (or
+# -UseDefault for the compiled default). Every run uses its own fresh
+# `-L pool34_<pid>_<run>_<depth>` namespace and cleans up only that namespace's
+# process tree. This is what chose warm-pool-size 3 (docs/warm-sessions.md,
+# "Why the default is three"). Cadences used there:
+#
+#   immediate  -GapMs 0 -BetweenMs 0          (agent tooling)
+#   human      -GapMs 2000 -BetweenMs 300 -SkipBurst
+#   slow       -GapMs 2000 -BetweenMs 1000
+#   cold burst -Windows 0 -BurstSettleMs 0    (eight at once right after launch)
+#
+#   pwsh -NoProfile -File tests\probe_pool_depth_cold_launch.ps1 -Binary <psmux.exe> -Depths "2,3,4" -Runs 6 -Out r.json
 param(
     [Parameter(Mandatory)][string]$Binary,
     # A comma list STRING: `pwsh -File` hands "2,3,4" over as one string, and an
