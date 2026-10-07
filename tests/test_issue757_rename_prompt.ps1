@@ -19,11 +19,12 @@
 $ErrorActionPreference = "Continue"
 $PSMUX = if ($env:PSMUX_TEST_BIN) { $env:PSMUX_TEST_BIN } else { (Get-Command psmux -EA Stop).Source }
 $psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
-$script:TestsPassed = 0; $script:TestsFailed = 0
+$script:TestsPassed = 0; $script:TestsFailed = 0; $script:Skipped = 0
 $script:Opened = @()
 
 function Write-Pass($msg) { Write-Host "  [PASS] $msg" -ForegroundColor Green; $script:TestsPassed++ }
 function Write-Fail($msg) { Write-Host "  [FAIL] $msg" -ForegroundColor Red; $script:TestsFailed++ }
+function Write-Skip($msg) { Write-Host "  [SKIP] $msg" -ForegroundColor DarkYellow; $script:Skipped++ }
 function Write-Info($msg) { Write-Host "  [INFO] $msg" -ForegroundColor DarkCyan }
 function Write-Head($msg) { Write-Host "`n--- $msg ---" -ForegroundColor Yellow }
 function Check($ok, $pass, $fail) { if ($ok) { Write-Pass $pass } else { Write-Fail $fail } }
@@ -312,6 +313,51 @@ Write-Info "status row: [$($status.Trim())]"
 Check ($status -match '\[beta\]') "the status line reads [beta]" "it reads [$($status.Trim())]"
 Check ($status -notmatch [regex]::Escape($NS)) "the -L namespace is not in the status line" `
     "the status line carries the namespace [$NS]"
+
+# ── 10. C-c and C-g close the prompt, as tmux's prompt.c does ──
+#
+# Before, C-c went to the shell behind the overlay as a real interrupt on
+# master, and did nothing at all once the overlay had an editor. A closed
+# overlay must also be repainted away on an idle pane.
+
+Write-Head "10. C-c and C-g close the overlay, with no side effects"
+foreach ($k in "c", "g") {
+    Inj "^b{SLEEP:300},"
+    Check ($null -ne (Find-Name (Screen))) "prefix , opened the overlay" "no overlay before C-$k"
+    Inj "^$k"
+    Check ($null -eq (Find-Name (Screen))) "C-$k closed it" "the overlay is still drawn after C-$k"
+}
+$w = ((& $PSMUX -L $NS list-windows -a -F '#{window_name}') -join '').Trim()
+Check ($w -eq "ZaphaX") "the window kept its name" "the window reads [$w]"
+
+# ── 11. keys the overlay has no use for stay in it ──
+#
+# Tab, Up and F5 used to fall through to the pane while the overlay was up:
+# PSReadLine recalled a history line into the shell behind it.
+
+Write-Head "11. Tab, Up and F5 do not reach the pane"
+$before = ((P capture-pane -p) -join "`n").TrimEnd()
+Inj "^b{SLEEP:300},"
+Inj "{MOD:09:09:0000}"
+Inj "{UP}"
+Inj "{F5}"
+Check ((Name-Value (Find-Name (Screen))) -eq 'ZaphaX') "the overlay still holds ZaphaX" "it reads [$(Name-Value (Find-Name (Screen)))]"
+Inj "{ESC}"
+Start-Sleep -Milliseconds 600
+$after = ((P capture-pane -p) -join "`n").TrimEnd()
+Check ($before -eq $after) "the pane is unchanged" "the pane changed behind the overlay"
+
+# ── 12. AltGr characters are typed ──
+#
+# Windows reports AltGr as Ctrl+Alt, so `@` on a German layout (AltGr+Q) is
+# Char('@') with CONTROL and ALT. It is text, not a Ctrl chord.
+
+Write-Head "12. AltGr @ is typed into the overlay"
+Inj "^b{SLEEP:300},"
+Inj "^u"
+Inj "ab{MOD:51:40:0009}cd"
+Check ((Name-Value (Find-Name (Screen))) -eq 'ab@cd') "the field reads ab@cd" "it reads [$(Name-Value (Find-Name (Screen)))]"
+Inj "{ESC}"
 
 # A rename-session done OUTSIDE this client is not covered here. It has to
 # arrive in a frame, and the server answers dump-state with "NC" after a

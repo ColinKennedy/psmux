@@ -20,7 +20,7 @@
 $ErrorActionPreference = "Continue"
 $PSMUX = if ($env:PSMUX_TEST_BIN) { $env:PSMUX_TEST_BIN } else { (Get-Command psmux -EA Stop).Source }
 $psmuxDir = if ($env:PSMUX_DATA_DIR) { $env:PSMUX_DATA_DIR } else { "$env:USERPROFILE\.psmux" }
-$script:TestsPassed = 0; $script:TestsFailed = 0
+$script:TestsPassed = 0; $script:TestsFailed = 0; $script:Skipped = 0
 $script:Opened = @()
 
 function Write-Pass($msg) { Write-Host "  [PASS] $msg" -ForegroundColor Green; $script:TestsPassed++ }
@@ -244,6 +244,68 @@ Inj "^b{SLEEP:300}`$"
 $pr = Screen; $nm = Find-Name $pr
 Check ($nm -and (Name-Value $nm).Length -gt 0) "the overlay is not empty" "it reads []"
 Inj "{ESC}"
+
+# ── 5. a server that cannot answer: the overlay opens on the cached name ──
+#
+# The server process is suspended (NtSuspendProcess on its own PID, which this
+# suite started), so the fetch connects through the kernel backlog and then
+# hears nothing. The overlay must still open inside the fetch budget, on the
+# name the client already had, and keep taking keys. The server is resumed in a
+# finally block whatever happens.
+
+Write-Head "5. a suspended server: the overlay still opens, on the cached name"
+Add-Type -Namespace I759 -Name Nt -MemberDefinition @'
+[DllImport("ntdll.dll")] public static extern int NtSuspendProcess(System.IntPtr h);
+[DllImport("ntdll.dll")] public static extern int NtResumeProcess(System.IntPtr h);
+[DllImport("kernel32.dll")] public static extern System.IntPtr OpenProcess(uint a, bool i, int pid);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(System.IntPtr h);
+'@ -EA SilentlyContinue
+$spid = 0
+[int]::TryParse(((P display-message -p '#{pid}') -join '').Trim(), [ref]$spid) | Out-Null
+if ($spid -le 0) {
+    Write-Skip "could not read the server pid"
+} else {
+    $h = [I759.Nt]::OpenProcess(0x0800, $false, $spid)
+    try {
+        [void][I759.Nt]::NtSuspendProcess($h)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Inj "^b{SLEEP:300}`$"
+        $nm = $null
+        while ($sw.ElapsedMilliseconds -lt 5000) { $nm = Find-Name (Screen); if ($nm) { break } }
+        Write-Info "overlay after $($sw.ElapsedMilliseconds) ms, reads [$(Name-Value $nm)]"
+        Check ((Name-Value $nm) -eq 'sesKZ') "the overlay opens on the cached name sesKZ" "it reads [$(Name-Value $nm)]"
+        Inj "Q"
+        $nm = Find-Name (Screen)
+        Check ((Name-Value $nm) -eq 'sesKZQ') "the client still takes keys" "it reads [$(Name-Value $nm)]"
+        Inj "{ESC}"
+    } finally {
+        [void][I759.Nt]::NtResumeProcess($h); [void][I759.Nt]::CloseHandle($h)
+    }
+    Start-Sleep -Milliseconds 800
+    $now = ((P list-sessions -F '#{session_name}') -join ' ').Trim()
+    Check ($now -eq 'sesKZ') "Escape left the session as it was" "list-sessions reads [$now]"
+}
+
+# ── 6. the status line follows a rename made elsewhere ──
+#
+# The rig's `status-left ''` leaves the client's own `[#S] ` default. Its name
+# comes from the session_name field of each frame, which the server's push
+# frames used to lack, and RenameSession did not mark the frame stale, so on an
+# idle pane the status line kept the old name indefinitely.
+
+Write-Head "6. the status line follows a CLI rename-session"
+& $PSMUX -L $NS rename-session -t sesKZ "stat" 2>&1 | Out-Null
+$sw = [Diagnostics.Stopwatch]::StartNew(); $row = ""
+while ($sw.ElapsedMilliseconds -lt 5000) {
+    $pr = Screen
+    $row = if ($pr.Count -ge 30) { [string]$pr[29] } else { "" }
+    if ($row -match '\[stat\]') { break }
+    Start-Sleep -Milliseconds 100
+}
+Write-Info "status row after $($sw.ElapsedMilliseconds) ms: [$($row.Trim())]"
+Check ($row -match '\[stat\]') "the status line reads [stat]" "it reads [$($row.Trim())]"
+Check ($row -notmatch [regex]::Escape($NS)) "the -L namespace is not in the status line" `
+    "the status line carries the namespace [$NS]"
 
 # ── Cleanup ──
 
