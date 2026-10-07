@@ -102,7 +102,7 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
     "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
-    "Publisher" "Josh"
+    "Publisher" "Godwin Sam Josh"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
     "URLInfoAbout" "https://github.com/psmux/psmux"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\psmux" \
