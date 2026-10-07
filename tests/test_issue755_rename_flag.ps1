@@ -16,6 +16,10 @@
 # with `display-message -p`. Keys go in through tests\injector.cs, into a real
 # attached client.
 #
+# Each rename here clears the field with C-u before typing, because the overlay
+# opens holding the current name (#757). Without that the typed name is appended
+# to the one already there and every check reads a name nobody asked for.
+#
 # Set PSMUX_TEST_BIN to test a binary that is not on PATH.
 
 $ErrorActionPreference = "Continue"
@@ -141,6 +145,7 @@ Write-Info "start: session [$(Session-Name)] window [$(Window-Name)]"
 
 Write-Head "1. prefix , renames the window"
 Inj "^b{SLEEP:300},"
+Inj "^u"
 Inj "winA{ENTER}"
 $s = Session-Name; $w = Window-Name
 Check (($w -eq "winA") -and ($s -eq $SESS)) `
@@ -151,6 +156,7 @@ Check (($w -eq "winA") -and ($s -eq $SESS)) `
 
 Write-Head "2. prefix `$ renames the session"
 Inj "^b{SLEEP:300}`$"
+Inj "^u"
 Inj "sessB{ENTER}"
 Start-Sleep -Milliseconds 400
 $s = Session-Name
@@ -168,6 +174,7 @@ Check (($s -eq "sessB") -and ($w -eq "winA")) `
     "Escape already changed something: session [$s] window [$w]"
 
 Inj "^b{SLEEP:300},"
+Inj "^u"
 Inj "winC{ENTER}"
 Start-Sleep -Milliseconds 400
 $s = Session-Name; $w = Window-Name
@@ -182,6 +189,7 @@ $before = Session-Name
 Inj "^b{SLEEP:300}`$"
 Inj "{ESC}"
 Inj "^b{SLEEP:300},"
+Inj "^u"
 Inj "winD{ENTER}"
 Start-Sleep -Milliseconds 400
 $s2 = Session-Name; $w2 = Window-Name

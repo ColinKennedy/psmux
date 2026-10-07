@@ -2882,6 +2882,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut renaming = false;
     let mut session_renaming = false;
     let mut rename_buf = String::new();
+    // Where the cursor sits in `rename_buf`, counted in characters back from
+    // the end, the way the copy-mode prompts count it
+    // (`AppState::copy_prompt_back`). Zero is the end, where a prompt that has
+    // just opened puts it.
+    let mut rename_back: usize = 0;
     let mut pane_renaming = false;
     let mut pane_title_buf = String::new();
     let mut command_input = false;
@@ -2957,6 +2962,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut popup_rect_last: Option<Rect> = None;
     let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
     let current_session = name.clone();
+    // What the session is CALLED, as against `current_session`, which is the
+    // port file base: under `-L ns` the base reads `ns__name`, and it is read
+    // once at attach, so a later `rename-session` never reaches it. The server
+    // puts the live name in every frame (`session_name`, issue #7 batch D), so
+    // this follows a rename. Until the first frame lands there is nothing
+    // better than the base to show.
+    let mut session_label = name.clone();
     let mut last_sent_size: (u16, u16) = SIZE_NOT_REPORTED;
     let mut last_status_lines: u16 = 1; // track server's status_lines for correct client-size height
     let mut last_dump_time = Instant::now() - Duration::from_millis(250);
@@ -3205,6 +3217,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     struct DumpState {
         layout: LayoutJson,
         windows: Vec<WinStatus>,
+        /// The session's own name, which a `rename-session` changes under the
+        /// client's feet. The port file base cannot stand in for it.
+        #[serde(default)]
+        session_name: Option<String>,
         #[serde(default)]
         prefix: Option<String>,
         #[serde(default)]
@@ -4482,10 +4498,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     cmd_batch.push(format!("{}\n", cmd));
                                 } else if cmd == "rename-window" {
                                     // Say which rename this is rather than
-                                    // leaving whatever the last one set.
-                                    renaming = true; rename_buf.clear(); session_renaming = false;
+                                    // leaving whatever the last one set, and
+                                    // open on the current name, as tmux does
+                                    // with `command-prompt -I'#W'`.
+                                    renaming = true; session_renaming = false;
+                                    rename_buf = active_window_name.clone(); rename_back = 0;
                                 } else if cmd == "rename-session" {
-                                    renaming = true; rename_buf.clear(); session_renaming = true;
+                                    renaming = true; session_renaming = true;
+                                    rename_buf = session_label.clone(); rename_back = 0;
                                 } else if cmd == "command-prompt" || cmd.starts_with("command-prompt ") {
                                     command_input = true;
                                     command_history_idx = command_history.len();
@@ -4499,8 +4519,8 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         .initial
                                         .replace("#W", &active_window_name)
                                         .replace("#{window_name}", &active_window_name)
-                                        .replace("#S", &current_session)
-                                        .replace("#{session_name}", &current_session);
+                                        .replace("#S", &session_label)
+                                        .replace("#{session_name}", &session_label);
                                     command_cursor = command_buf.len();
                                     command_template = spec.template;
                                     command_prompt_label = spec.label;
@@ -4585,14 +4605,18 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Left => { cmd_batch.push("select-pane -L\n".into()); }
                                 KeyCode::Right => { cmd_batch.push("select-pane -R\n".into()); }
                                 KeyCode::Char('d') => { quit = true; }
-                                KeyCode::Char(',') => { renaming = true; rename_buf.clear(); session_renaming = false; }
+                                KeyCode::Char(',') => {
+                                    renaming = true; session_renaming = false;
+                                    rename_buf = active_window_name.clone(); rename_back = 0;
+                                }
                                 KeyCode::Char('$') => {
-                                    // Rename session — reuse rename overlay
+                                    // Rename session, through the same overlay,
+                                    // opened on the current name as tmux does
+                                    // with `command-prompt -I'#S'`.
                                     renaming = true;
-                                    rename_buf.clear();
-                                    // Mark that we're renaming the session, not a window
-                                    // We'll detect this by checking if pane_renaming is used as a flag
                                     session_renaming = true;
+                                    rename_buf = session_label.clone();
+                                    rename_back = 0;
                                 }
                                 KeyCode::Char('?') => {
                                     // Build comprehensive help overlay from help.rs
@@ -5405,7 +5429,17 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if confirm_cmd.is_some() => {
                                     confirm_cmd = None;
                                 }
-                                KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { rename_buf.push(c); paste_gesture.record_char(c); }
+                                // A control character is an editing key, not
+                                // text, so it goes to the editor arm below.
+                                KeyCode::Char(c) if renaming && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    let name = format!("c-{}", c.to_ascii_lowercase());
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &name);
+                                }
+                                KeyCode::Char(c) if renaming && !paste_burst_active => {
+                                    let mut buf = [0u8; 4];
+                                    crate::copy_mode::prompt_insert(&mut rename_buf, rename_back, c.encode_utf8(&mut buf));
+                                    paste_gesture.record_char(c);
+                                }
                                 KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); paste_gesture.record_char(c); }
                                 // tmux binds the window index prompt as a plain
                                 // `command-prompt -pindex` (key-bindings.c:394), so it takes any text and
@@ -5415,7 +5449,30 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // letter typed or pasted here reached the shell.
                                 KeyCode::Char(c) if window_idx_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { window_idx_buf.push(c); paste_gesture.record_char(c); }
                                 KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); paste_gesture.record_char(c); }
-                                KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
+                                // The copy-mode prompt editor, as it stands,
+                                // reused here: tmux reaches this overlay
+                                // through `command-prompt`, which has the full
+                                // editor, so the keys a user tries are the
+                                // same ones. `prompt_edit` is not changed by
+                                // this, only called.
+                                KeyCode::Backspace if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, "backspace");
+                                }
+                                KeyCode::Delete if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, "delete");
+                                }
+                                KeyCode::Left if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, "left");
+                                }
+                                KeyCode::Right if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, "right");
+                                }
+                                KeyCode::Home if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, "home");
+                                }
+                                KeyCode::End if renaming => {
+                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, "end");
+                                }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
                                 KeyCode::Backspace if window_idx_input => { let _ = window_idx_buf.pop(); }
                                 KeyCode::Backspace if command_input => {
@@ -5430,6 +5487,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Enter if renaming => {
                                     if session_renaming {
                                         cmd_batch.push(format!("rename-session {}\n", quote_arg(&rename_buf)));
+                                        // Take the new name now rather than wait
+                                        // for the frame that carries it. The
+                                        // rename moves the port file, so the
+                                        // next frame is a second or two away
+                                        // across the reconnect, and a `prefix $`
+                                        // in between would open on the old name
+                                        // again. The frame still has the last
+                                        // word, so a name the server refuses
+                                        // corrects itself.
+                                        session_label = rename_buf.clone();
                                         session_renaming = false;
                                     } else {
                                         cmd_batch.push(format!("rename-window {}\n", quote_arg(&rename_buf)));
@@ -7029,6 +7096,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         if let Some(aw) = windows.iter().find(|w| w.active) {
             active_window_name = aw.name.clone();
         }
+        // Same reason as the window name above: the rename overlay and `#S`
+        // open on it, so it has to be the name the session has now.
+        if let Some(sn) = state.session_name {
+            session_label = sn;
+        }
         last_tree = state.tree;
         let base_index = state.base_index;
         client_copy_mode = active_pane_in_copy_mode(&root);
@@ -8073,7 +8145,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             // Left portion: custom status_left or default [session] prefix
             let left_prefix = match custom_status_left {
                 Some(ref sl) => sl.clone(),
-                None => format!("[{}] ", name),
+                None => format!("[{}] ", session_label),
             };
             if client_log_enabled() {
                 client_log("status", &format!("parsing left_prefix ({} chars): [{}]",
@@ -8411,8 +8483,24 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
-                let para = Paragraph::new(format!("name: {}", rename_buf));
-                f.render_widget(para, overlay.inner(oa));
+                let inner = overlay.inner(oa);
+                // `rename_back` counts characters from the end; the window
+                // needs the byte offset, and the same walk the copy-mode
+                // prompts do turns one into the other.
+                let mut at = rename_buf.len();
+                for ch in rename_buf.chars().rev().take(rename_back.min(rename_buf.chars().count())) {
+                    at -= ch.len_utf8();
+                }
+                let avail = inner.width.saturating_sub(6) as usize; // after "name: "
+                let (shown, cur_col) = crate::util::prompt_window(&rename_buf, at, avail);
+                let para = Paragraph::new(format!("name: {}", shown));
+                f.render_widget(para, inner);
+                // An open prompt owns the cursor, as the command prompt and the
+                // window index prompt have since #741 and #746. Without it the
+                // overlay gave no sign of where the next character would land.
+                let cx = inner.x + 6 + cur_col as u16;
+                f.set_cursor_position((cx, inner.y));
+                prompt_cursor_pos = Some((cx, inner.y));
             }
             if pane_renaming {
                 let overlay = Block::default().borders(Borders::ALL).title("set pane title");
@@ -8765,7 +8853,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 srv_popup_cursor.and_then(|c| {
                     popup_cursor_screen_pos(content_chunk, srv_popup_width, srv_popup_height, srv_popup_scroll, c)
                 })
-            } else if command_input || window_idx_input || status_prompt_open {
+            } else if command_input || window_idx_input || status_prompt_open || renaming {
                 // An open prompt owns the cursor, and the pane only gets it
                 // when no prompt is up: tmux settles the cursor on
                 // `c->prompt_cursor` first and takes the pane in the else
@@ -8806,6 +8894,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 && !command_input
                 && !window_idx_input
                 && !status_prompt_open
+                && !renaming
             {
                 if let (Some((cc, cr)), Some(outer)) = (post_draw_park, active_pane_area) {
                     let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
