@@ -948,6 +948,10 @@ impl WarmPool {
         self.last_claim = None;
         self.surge_until = None;
     }
+    /// Whether a creation claimed from this pool within `window` of now.
+    pub fn claimed_within(&self, window: std::time::Duration) -> bool {
+        matches!(self.last_claim, Some(t) if t.elapsed() <= window)
+    }
     pub fn is_surging(&self) -> bool {
         matches!(self.surge_until, Some(t) if std::time::Instant::now() < t)
     }
@@ -1878,7 +1882,8 @@ pub struct AppState {
     /// from the first window's creation until its shell has started.
     pub boot_hold: Option<BootHold>,
     /// After the boot hold releases, the pool starts one spare at a time
-    /// until one is ready or somebody claims. See [`BootHold`].
+    /// until one is ready and creations have stopped coming. See [`BootHold`]
+    /// and `pane::trickle_deficit`.
     pub pool_trickle: bool,
     /// Where a finished background spare is posted back to the server loop.
     /// Held here rather than only in `run_server` so a claim can schedule its

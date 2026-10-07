@@ -602,6 +602,35 @@ fn boot_hold_release_trickles_the_pool_one_spare_at_a_time() {
 }
 
 #[test]
+fn creations_right_after_the_hold_keep_the_trickle_going() {
+    // 2026-10-08: a claim used to end the trickle, so the first new-window
+    // right after the cold prompt took the one booting spare and the refill
+    // then started `warm-pool-size` shells beside it (788 ms at depth 3), and
+    // the next miss surged eight more (5th window 1.2 to 2 s). The trickle now
+    // lasts while creations keep coming: one shell booting at a time.
+    let mut trickle = true;
+    let mut pool = WarmPool::new(3);
+    pool.note_claim(false);
+    assert!(pool.claimed_within(crate::types::WARM_BURST_WINDOW));
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 3), 1, "the claim did not widen the refill");
+    pool.push(ready_spare(3));
+    assert_eq!(
+        crate::pane::trickle_deficit(&mut trickle, &pool, 2),
+        1,
+        "a ready spare with creations still coming: one more booting, not the whole deficit"
+    );
+    assert!(trickle);
+    pool.inflight = 1;
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 1), 0, "one already booting");
+    // Creations stopped: the first ready spare ends the trickle and the pool
+    // refills at full width.
+    pool.inflight = 0;
+    pool.forget_last_claim_for_test();
+    assert_eq!(crate::pane::trickle_deficit(&mut trickle, &pool, 2), 2);
+    assert!(!trickle);
+}
+
+#[test]
 fn forgetting_claims_keeps_the_first_new_window_out_of_a_surge() {
     // The server's own first window goes through the claim path. Counting it
     // made the user's first new-window the second claim of a "burst" and

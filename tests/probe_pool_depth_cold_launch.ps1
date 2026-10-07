@@ -13,7 +13,11 @@ param(
     # Human cadence: wait GapMs after pane one's prompt before the first
     # new-window, and BetweenMs between one creation's prompt and the next.
     [int]$GapMs = 0,
-    [int]$BetweenMs = 0
+    [int]$BetweenMs = 0,
+    # The burst of eight: how long after the five windows (or after the cold
+    # prompt with -Windows 0) it starts.
+    [int]$BurstSettleMs = 9000,
+    [int]$Windows = 5
 )
 $ErrorActionPreference = "Continue"
 $DataDir = "$env:USERPROFILE\.psmux"
@@ -88,7 +92,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         $cold = Wait-Prompt $inf "$($Sess):0.0" $sw
         $times = @(); $wids = @()
         if ($GapMs -gt 0) { Start-Sleep -Milliseconds $GapMs }
-        for ($i = 1; $i -le 5; $i++) {
+        for ($i = 1; $i -le $Windows; $i++) {
             if ($i -gt 1 -and $BetweenMs -gt 0) { Start-Sleep -Milliseconds $BetweenMs }
             $t = [Diagnostics.Stopwatch]::StartNew()
             $id = (Invoke-Psmux $inf.Port $inf.Key "new-window -P -F '#{pane_id}'").Trim().Trim("'")
@@ -98,7 +102,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         }
         $burst = @(); $burstAll = -1
         if (-not $SkipBurst) {
-            Start-Sleep -Milliseconds 9000   # surge over, pool back at target
+            if ($BurstSettleMs -gt 0) { Start-Sleep -Milliseconds $BurstSettleMs }   # surge over, pool back at target
             $t = [Diagnostics.Stopwatch]::StartNew()
             $ids = @()
             for ($i = 1; $i -le 8; $i++) { $ids += (Invoke-Psmux $inf.Port $inf.Key "new-window -P -F '#{pane_id}'").Trim().Trim("'") }

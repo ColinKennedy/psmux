@@ -329,6 +329,29 @@ shell booting alone right after the prompt (350 to 456 ms), came out 281.7,
 220.1, 280.8 and 247.3 ms against its 300 ms limit; with five samples the p90
 is 0.6 of that one creation, so the margin is that shell's boot.
 
+### Creations that keep coming right after launch
+
+Until 2026-10-08 the first claim ended the trickle. The first `new-window`
+issued the moment pane one showed its prompt took the one booting spare, and
+the claim's refill then started the whole `warm-pool-size` beside it; the next
+claim to find nothing ready surged to eight. With a deeper pool that got
+worse, not better: at depth 8 the first window took 1.6 to 1.7 s. The trickle
+now lasts while creations keep coming, so after the hold exactly one spare
+boots at a time until creations stop for 1.5 s (`WARM_BURST_WINDOW`) and a
+spare is ready; then the pool refills at full width.
+
+Measured interleaved on the same machine, depth 3, eight runs each,
+`tests/probe_pool_depth_cold_launch.ps1` (ms to each prompt):
+
+| cadence                                   | trickle ends at a claim         | trickle lasts while creating   |
+|-------------------------------------------|---------------------------------|--------------------------------|
+| five windows, each the moment the last showed its prompt | w1 546 to 904, w5 784 to 1990 | every window 79 to 546 |
+| eight issued at once right after the prompt, all eight up | 3557 to 4552 | 1647 to 1732 |
+| 2 s after the prompt, then 300 ms apart   | 2 to 8 each                     | 3 to 9 each                    |
+
+Cold launch to the first prompt is not affected (the trickle starts after it),
+and neither is a creation into a settled pool (the trickle has ended by then).
+
 ### Teardown
 
 A spare that is still being spawned belongs to nobody: the shell exists, its
