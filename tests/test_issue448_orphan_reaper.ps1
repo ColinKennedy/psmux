@@ -86,15 +86,32 @@ $orphanPort = (Get-Content "$psmuxDir\reap_orphan.port" -Raw).Trim()
 Write-Host "    orphan server PID=$orphanPid port=$orphanPort; aging past 10s grace..." -ForegroundColor DarkGray
 Start-Sleep -Seconds 12
 # Orphan it: remove ALL registry files, then trigger the reaper IMMEDIATELY
-# (inside the ~5s self-heal window) via any psmux command.
-Remove-Item "$psmuxDir\reap_orphan.*" -Force -EA SilentlyContinue
-if (Is-PidAlive $orphanPid) { Write-Pass "orphan process still alive after registry removal (untracked live server)" }
-else { Write-Fail "orphan process died before reaper could run" }
-& $PSMUX list-sessions 2>&1 | Out-Null   # runs cleanup + reaper at startup
-Start-Sleep -Seconds 2
-if (-not (Is-PidAlive $orphanPid)) { Write-Pass "reaper TERMINATED the orphaned server $orphanPid" }
+# via any psmux command. The server rewrites its own registry files every few
+# seconds (self-heal), and a server that has done so is tracked again, so the
+# reaper is RIGHT to spare it. Sweep 2026-10-07_01-38-07 failed here once in
+# about a dozen runs, never standalone: the rewrite landed between the delete
+# and the reaper. So a survivor whose registry came back is that race and is
+# orphaned again; a survivor with no registry file is a real reaper failure.
+$reaped = $false; $selfHealed = 0
+for ($attempt = 1; $attempt -le 3 -and -not $reaped; $attempt++) {
+    Remove-Item "$psmuxDir\reap_orphan.*" -Force -EA SilentlyContinue
+    if ($attempt -eq 1) {
+        if (Is-PidAlive $orphanPid) { Write-Pass "orphan process still alive after registry removal (untracked live server)" }
+        else { Write-Fail "orphan process died before reaper could run" }
+    }
+    & $PSMUX list-sessions 2>&1 | Out-Null   # runs cleanup + reaper at startup
+    Start-Sleep -Seconds 2
+    if (-not (Is-PidAlive $orphanPid)) { $reaped = $true; break }
+    if (Test-Path "$psmuxDir\reap_orphan.port") {
+        $selfHealed++
+        Write-Host "    attempt ${attempt}: the server self-healed its registry before the reaper ran; orphaning it again" -ForegroundColor DarkGray
+        continue
+    }
+    break
+}
+if ($reaped) { Write-Pass "reaper TERMINATED the orphaned server $orphanPid (self-heal races: $selfHealed)" }
 else {
-    Write-Fail "orphaned server $orphanPid survived the reaper"
+    Write-Fail "orphaned server $orphanPid survived the reaper with no registry file referencing it (self-heal races: $selfHealed)"
     Stop-Process -Id ([int](Parse-Pid $orphanPid)) -Force -EA SilentlyContinue
 }
 

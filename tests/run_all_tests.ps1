@@ -919,18 +919,30 @@ $env:PSMUX_PSREADLINE_HISTORY = Join-Path $script:RunDir "psreadline_history.txt
 # Discussion #748: a suite that starts a server without -f loads the machine's
 # own config (~/.psmux.conf, ~/.psmuxrc, ~/.tmux.conf or ~/.config/psmux/psmux.conf),
 # so `set -g base-index 1` on the machine made every suite that targets `:0`
-# fail. PSMUX_CONFIG_FILE replaces all four paths (src/config.rs), so every
-# suite this runner starts inherits an empty config and a sweep runs on the
-# defaults whatever the machine has. A suite that sets its own PSMUX_CONFIG_FILE
-# still wins, and the suites that write a default path config and expect psmux
-# to load it clear the variable at their top. Clean-Server recreates the file
-# before every suite, since a suite may delete or write the file the variable
-# names (test_env_shim removes it) and Storage Sense removes stale TEMP files.
-$script:EmptyConfig = Join-Path $script:RunDir "empty_psmux.conf"
-[System.IO.File]::WriteAllText($script:EmptyConfig, '')
-if ($env:PSMUX_CONFIG_FILE) { Write-Log "PSMUX_CONFIG_FILE was $env:PSMUX_CONFIG_FILE in the launching shell; the run uses its own empty config instead" }
-$env:PSMUX_CONFIG_FILE = $script:EmptyConfig
-Write-Log "Suites inherit PSMUX_CONFIG_FILE=$script:EmptyConfig (empty, see discussion #748)"
+# fail. The sweep must run on the defaults, but it must NOT get there by
+# exporting PSMUX_CONFIG_FILE: a client with a custom config never claims a
+# warm standby (src/main.rs, has_custom_config), so every suite would quietly
+# test the cold path instead of the one users run. Sweep 2026-10-07_01-38-07
+# did exactly that: test_pane_startup_perf measured new-session at 879 ms with
+# a standby armed, and test_kill_server_reaps_warm saw its session cold spawned.
+# So the variable is cleared. ~/.psmux.conf and ~/.psmuxrc are the runner's to
+# remove (Clean-Server does it before every suite, since suites write them);
+# the other two are the developer's, and either one stops the run before
+# anything starts rather than being deleted.
+if ($env:PSMUX_CONFIG_FILE) {
+    Write-Log "PSMUX_CONFIG_FILE was $env:PSMUX_CONFIG_FILE in the launching shell; cleared so suites run on the defaults and the warm path"
+    Remove-Item Env:PSMUX_CONFIG_FILE -ErrorAction SilentlyContinue
+}
+$script:DefaultConfigs = @(
+    "$env:USERPROFILE\.tmux.conf", "$env:USERPROFILE\.config\psmux\psmux.conf"
+) | Where-Object { Test-Path -LiteralPath $_ }
+if ($script:DefaultConfigs) {
+    Write-Host "This machine has a psmux config at a default path, which every suite would inherit:" -ForegroundColor Red
+    $script:DefaultConfigs | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+    Write-Host "Move it aside for the sweep (discussion #748), then start the run again." -ForegroundColor Red
+    Write-Log "ABORT: default path config present: $($script:DefaultConfigs -join ', ')"
+    exit 2
+}
 $script:RunStartedAt = Get-Date
 
 $script:CurrentSuiteFile = Join-Path $script:RunDir "current_suite.txt"
@@ -1258,12 +1270,6 @@ function Clean-Server {
     # Remove any test config files (tests should restore originals but may fail)
     Remove-Item "$env:USERPROFILE\.psmux.conf" -Force -ErrorAction SilentlyContinue
     Remove-Item "$env:USERPROFILE\.psmuxrc" -Force -ErrorAction SilentlyContinue
-    # Put the empty config back (discussion #748): the previous suite may have
-    # deleted it, written into it, or cleared the variable in its own process.
-    if ($script:EmptyConfig) {
-        try { [System.IO.File]::WriteAllText($script:EmptyConfig, '') } catch { Write-Log "could not reset $script:EmptyConfig : $_" }
-        $env:PSMUX_CONFIG_FILE = $script:EmptyConfig
-    }
     Remove-Item (Join-Path $script:RunDir "ks_*.tmp") -Force -ErrorAction SilentlyContinue
     # The reap above only sees the panes of servers still ALIVE when it runs.
     # A pane whose server had already died (killed by the suite itself by pid,

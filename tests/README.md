@@ -22,10 +22,19 @@ Set-Content -Path $env:PSMUX_CONFIG_FILE -Value '' -NoNewline
 pwsh -NoProfile -File tests\test_issue335_copy_search_prompt.ps1
 ```
 
-`run_all_tests.ps1` does this for you: every suite it starts inherits an empty
-config it keeps in the run's log directory.
+There is a cost: a client that runs with `-f` or `PSMUX_CONFIG_FILE` never
+claims a warm standby, so a suite run this way tests the cold start path. That
+is fine for a suite about a key, a prompt or a target, and wrong for a suite
+about the warm pool or start up speed.
 
-A suite can also isolate itself by dot sourcing `tests\isolated_config.ps1`
+That is also why `run_all_tests.ps1` does NOT export the variable. Exporting it
+moved every warm pool suite onto the cold path (sweep 2026-10-07_01-38-07:
+`new-session` measured 879 ms with a standby armed). Instead the runner clears
+`PSMUX_CONFIG_FILE`, removes `~/.psmux.conf` and `~/.psmuxrc` before every
+suite as it always has, and refuses to start while `~/.tmux.conf` or
+`~/.config/psmux/psmux.conf` exists, because those are yours to move aside.
+
+A suite that does not depend on the warm path can isolate itself by dot sourcing `tests\isolated_config.ps1`
 near its top, which writes a config of its own, sets `PSMUX_CONFIG_FILE` for
 the suite's process and replaces any value already set:
 
