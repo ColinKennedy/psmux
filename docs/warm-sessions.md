@@ -329,28 +329,34 @@ shell booting alone right after the prompt (350 to 456 ms), came out 281.7,
 220.1, 280.8 and 247.3 ms against its 300 ms limit; with five samples the p90
 is 0.6 of that one creation, so the margin is that shell's boot.
 
-### Creations that keep coming right after launch
+### Creations right after launch: two trickle variants tried and dropped
 
-Until 2026-10-08 the first claim ended the trickle. The first `new-window`
-issued the moment pane one showed its prompt took the one booting spare, and
-the claim's refill then started the whole `warm-pool-size` beside it; the next
-claim to find nothing ready surged to eight. With a deeper pool that got
-worse, not better: at depth 8 the first window took 1.6 to 1.7 s. The trickle
-now lasts while creations keep coming, so after the hold exactly one spare
-boots at a time until creations stop for 1.5 s (`WARM_BURST_WINDOW`) and a
-spare is ready; then the pool refills at full width.
+A deeper pool does nothing for a `new-window` issued the moment pane one shows
+its prompt: the pool is still empty behind the boot hold, the claim takes the
+one trickled spare, and its refill starts the whole `warm-pool-size` beside it
+(at depth 8 that first window took 1.6 to 1.7 s; at depth 3 five windows each
+issued the moment the last showed its prompt came out p50 [788, 91, 2, 2,
+1648] ms with the fifth up to 2 s). Two ways of keeping the trickle on past
+that claim were measured on 2026-10-08, interleaved, depth 3, eight runs:
 
-Measured interleaved on the same machine, depth 3, eight runs each,
-`tests/probe_pool_depth_cold_launch.ps1` (ms to each prompt):
+* Keep the trickle after a claim that found nothing ready (a ready claim still
+  ends it). The first window went from about 790 to 510 ms, but the stall moved
+  to the third: [528, 90, 1622, 2, 3] and up to 2.2 s.
+* Keep the trickle while creations keep coming (one shell booting at a time
+  until claims stop for 1.5 s). Back to back windows became [500, 95, 500,
+  100, 505] with nothing over 546 ms, and eight issued at once right after the
+  prompt came up in 1.65 to 1.73 s instead of 3.5 to 4.5 s. It failed
+  `tests/test_pane_startup_perf.ps1` three runs of three (new-window median
+  over creations two to five 345 ms against 300; the splits after it
+  [34, 527, 282, 531] against a budget of one slow), which passed three of
+  three without it, and `tests/test_issue661_warm_pool_depth_holds.ps1` once in
+  three, because the pool never fills while creations keep coming.
 
-| cadence                                   | trickle ends at a claim         | trickle lasts while creating   |
-|-------------------------------------------|---------------------------------|--------------------------------|
-| five windows, each the moment the last showed its prompt | w1 546 to 904, w5 784 to 1990 | every window 79 to 546 |
-| eight issued at once right after the prompt, all eight up | 3557 to 4552 | 1647 to 1732 |
-| 2 s after the prompt, then 300 ms apart   | 2 to 8 each                     | 3 to 9 each                    |
-
-Cold launch to the first prompt is not affected (the trickle starts after it),
-and neither is a creation into a settled pool (the trickle has ended by then).
+Both only move the shell starting around, as the experiments in "The third
+quick creation at depth two" found: the total is fixed by how many creations
+follow, and a run issued faster than a shell boots pays for it somewhere. The
+pace a person creates windows at (see "Why the default is three") never meets
+the trickle at all.
 
 ### Teardown
 

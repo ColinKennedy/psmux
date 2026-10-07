@@ -994,7 +994,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
         was_ready = r;
     }
     if warm_eligible {
-        // A claim no longer ends the trickle: see trickle_deficit.
+        app.pool_trickle = false;
         app.warm_pane.note_claim(was_ready);
         if !was_ready {
             crate::warm_trace!(
@@ -1426,25 +1426,13 @@ pub fn warm_spawn_permit() -> Option<WarmSpawnPermit> {
 /// The refill right after the boot hold trickles: one spare booting at a time
 /// until one is ready, so the shell a user's next creation will wait on boots
 /// with at most one companion (one pwsh 7 beside another costs it ~70 ms, two
-/// cost ~110 ms). The trickle ends at the first ready spare once no creation
-/// has claimed for [`crate::types::WARM_BURST_WINDOW`].
-///
-/// A claim used to end it too, and that was the slow first window after a
-/// cold launch: the claim took the one booting spare and the refill started
-/// the whole `warm-pool-size` beside it, then the next miss surged eight. At
-/// depth 3, five `new-window` each issued the moment the previous one showed
-/// its prompt came out p50 [788, 91, 2, 2, 1648] ms with the 5th up to 2 s;
-/// keeping one shell booting at a time while creations keep coming made them
-/// about [500, 95, 500, 100, 505] with nothing over 546 ms, and eight
-/// creations issued at once right after the cold prompt went from 3.5 to
-/// 4.5 s for all eight to 1.65 to 1.73 s. Creations at a human pace (2 s after
-/// the prompt, then 300 ms apart) never see the trickle, which has ended by
-/// then, and cold launch is untouched (the trickle starts after it).
+/// cost ~110 ms). A claim ends the trickle (the claim sites clear the flag),
+/// and so does the first ready spare.
 pub fn trickle_deficit(trickle: &mut bool, pool: &crate::types::WarmPool, deficit: usize) -> usize {
     if !*trickle {
         return deficit;
     }
-    if pool.ready_len() > 0 && !pool.claimed_within(crate::types::WARM_BURST_WINDOW) {
+    if pool.ready_len() > 0 {
         *trickle = false;
         return deficit;
     }
@@ -1873,7 +1861,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
         was_ready = r;
     }
     if warm_eligible {
-        // A claim no longer ends the trickle: see trickle_deficit.
+        app.pool_trickle = false;
         app.warm_pane.note_claim(was_ready);
         if !was_ready {
             crate::warm_trace!(
