@@ -65,6 +65,14 @@ function Wait-Attached {
 Write-Host "`n=== Nested client OSC color reply leak ===" -ForegroundColor Cyan
 Cleanup
 
+# A server remembers the last palette a client reported in ~/.psmux/host_colors
+# so its spares are born with it (paths::host_colors_file). The planted
+# PSMUX_HOST_COLORS below is reported like a measurement, so without this the
+# suite left fg=112233 there for every later session on the machine, and a
+# terminal that never answers was handed it as its palette. Kept and put back.
+$hostColorsFile = Join-Path $psmuxDir "host_colors"
+$hostColorsSaved = if (Test-Path -LiteralPath $hostColorsFile) { [IO.File]::ReadAllText($hostColorsFile) } else { $null }
+
 # ── PART A: control, plain attach with no psmux around the client ──────────
 Write-Host "`n[Part A] control: plain (non nested) attach stays clean" -ForegroundColor Yellow
 & $PSMUX new-session -d -s "clkplain" 2>&1 | Out-Null
@@ -194,6 +202,10 @@ try { Stop-Process -Id $hostProc.Id -Force -EA SilentlyContinue } catch {}
 Start-Sleep -Seconds 2
 Remove-Item "$psmuxDir\clkhost.*" -Force -EA SilentlyContinue
 Remove-Item env:PSMUX_HOST_COLORS -EA SilentlyContinue
+# The planted palette above was remembered as this data root's guess; with it
+# in place a host client that measured nothing would still hand the pane
+# fg=112233 and this check would pass on a dead detector.
+Remove-Item -LiteralPath $hostColorsFile -Force -EA SilentlyContinue
 
 $wt = (Get-Command wt.exe -EA SilentlyContinue).Source
 if ($wt) {
@@ -210,7 +222,7 @@ if ($wt) {
     & $PSMUX send-keys -t "clkhost" "`"[`$env:PSMUX_HOST_COLORS]`" | Set-Content '$envOut'" Enter 2>&1 | Out-Null
     Start-Sleep -Seconds 3
     $measured = if (Test-Path $envOut) { (Get-Content $envOut -Raw) } else { "" }
-    if ("$measured" -match "fg=[0-9a-f]{6}" -and "$measured" -match "bg=[0-9a-f]{6}") {
+    if ("$measured" -match "fg=[0-9a-f]{6}" -and "$measured" -match "bg=[0-9a-f]{6}" -and "$measured" -notmatch "112233|445566") {
         Write-Pass "top-level client still measures the real terminal ($("$measured".Trim()))"
     } else {
         Write-Fail "host-color detection is dead: pane child got '$("$measured".Trim())' with nothing planted"
@@ -258,6 +270,8 @@ try { Stop-Process -Id $tuiProc.Id -Force -EA SilentlyContinue } catch {}
 try { Stop-Process -Id $hostProc.Id -Force -EA SilentlyContinue } catch {}
 Cleanup
 Remove-Item "$env:TEMP\psmux_colorleak_env.txt" -Force -EA SilentlyContinue
+if ($null -ne $hostColorsSaved) { [IO.File]::WriteAllText($hostColorsFile, $hostColorsSaved) }
+else { Remove-Item -LiteralPath $hostColorsFile -Force -EA SilentlyContinue }
 
 Write-Host "`n=== Results ===" -ForegroundColor Cyan
 Write-Host "  Passed: $($script:TestsPassed)" -ForegroundColor Green
