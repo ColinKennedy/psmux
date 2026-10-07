@@ -1473,7 +1473,7 @@ fn expand_client_var(var: &str, app: &AppState) -> Option<String> {
             }
         },
         "client_termname" | "client_termtype" => env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        "client_termfeatures" => "256,RGB,title".into(),
+        "client_termfeatures" => "256,RGB,hyperlinks,title".into(),
         "client_utf8" => "1".into(),
         "client_cell_width" => "8".into(),
         "client_cell_height" => "16".into(),
