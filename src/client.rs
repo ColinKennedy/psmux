@@ -4334,6 +4334,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 command_template = None;
                                 command_prompt_label = None;
                                 renaming = false;
+                                // Which of the two renames the overlay was
+                                // doing goes with it. Without this the flag
+                                // outlived the cancelled prompt and the next
+                                // `,` renamed the session: the arm further
+                                // down that clears both never runs, because
+                                // this branch takes Escape first.
+                                session_renaming = false;
                                 pane_renaming = false;
                                 tree_chooser = false;
                                 buffer_chooser = false;
@@ -4474,7 +4481,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     // Direct kill without confirmation (user explicitly bound without confirm-before)
                                     cmd_batch.push(format!("{}\n", cmd));
                                 } else if cmd == "rename-window" {
-                                    renaming = true; rename_buf.clear();
+                                    // Say which rename this is rather than
+                                    // leaving whatever the last one set.
+                                    renaming = true; rename_buf.clear(); session_renaming = false;
                                 } else if cmd == "rename-session" {
                                     renaming = true; rename_buf.clear(); session_renaming = true;
                                 } else if cmd == "command-prompt" || cmd.starts_with("command-prompt ") {
@@ -4576,7 +4585,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Left => { cmd_batch.push("select-pane -L\n".into()); }
                                 KeyCode::Right => { cmd_batch.push("select-pane -R\n".into()); }
                                 KeyCode::Char('d') => { quit = true; }
-                                KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
+                                KeyCode::Char(',') => { renaming = true; rename_buf.clear(); session_renaming = false; }
                                 KeyCode::Char('$') => {
                                     // Rename session — reuse rename overlay
                                     renaming = true;
