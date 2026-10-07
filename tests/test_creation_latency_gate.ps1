@@ -45,6 +45,10 @@
 #                every one of them really creates a pane and really moves the
 #                active pane id, so none of these samples can be a refusal
 #                recorded as a fast creation.
+#   cold launch  five new-window at a human pace (2 s after the first prompt,
+#                then 300 ms apart) on a FRESH server whose pool is still
+#                filling. Gated on creation 4: master d19e9905 (depth 2) gave
+#                [790, 724, 852] ms here, depth 3 gives 15 to 16 ms.
 #   sessions     new-session to a visible prompt, twice: once with the warm
 #                server pool allowed to serve the claim and once with
 #                PSMUX_NO_WARM=1 so the client has to cold spawn a server. The
@@ -193,6 +197,16 @@ param(
     [switch]$SkipVariants,
     [switch]$SkipSessions,
     [switch]$SkipKill,
+    # The cold launch cell: a fresh server, ColdLaunchGapMs for the user to see
+    # the prompt, then five new-window ColdLaunchBetweenMs apart. Its hard gate
+    # is the p50 over the reps of creation FOUR, the one the depth two default
+    # stalled (p50 791 ms, max 918 ms on 2026-10-08) and depth three does not
+    # (3 ms). See docs/warm-sessions.md, "Why the default is three".
+    [int]$ColdLaunchReps = 3,
+    [int]$ColdLaunchGapMs = 2000,
+    [int]$ColdLaunchBetweenMs = 300,
+    [int]$ColdLaunchC4P50LimitMs = 150,
+    [switch]$SkipColdLaunch,
     [string]$MetricsDir = ""
 )
 
@@ -433,6 +447,68 @@ function Test-Cell {
     Assert-Tail ($max -le $MaxLimitMs) `
         ("$Label max {0:N0}ms is within {1}ms" -f $max, $MaxLimitMs) `
         ("$Label max {0:N0}ms exceeds {1}ms  [{2}]" -f $max, $MaxLimitMs, $list)
+}
+
+# ── a few windows at a human pace right after a cold launch ───────────────
+#
+# The deep cells above start after a settle, with the pool full. This one does
+# not: a fresh server, the prompt, ColdLaunchGapMs for the user to read it, then
+# five new-window ColdLaunchBetweenMs apart, each timed to its own prompt. The
+# pool is still filling behind the boot hold when they arrive, which is where a
+# shallow default pool stalled the fourth creation for most of a second.
+$script:ColdLaunchBlock = $null
+function Test-ColdLaunchRun {
+    Write-Test ("cold launch, {0} ms gap, then 5 new-window {1} ms apart, x{2}" -f $ColdLaunchGapMs, $ColdLaunchBetweenMs, $ColdLaunchReps)
+    $runs = @(); $colds = @()
+    for ($r = 0; $r -lt $ColdLaunchReps; $r++) {
+        Remove-Namespace
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Start-Process -FilePath $Binary -ArgumentList "-L", $Ns, "new-session", "-d", "-s", $Sess -WindowStyle Hidden | Out-Null
+        $inf = Wait-Registered
+        if ($null -eq $inf -or -not (Wait-FirstPrompt $inf.Port $inf.Key)) {
+            Write-Info "  cold launch rep $($r + 1): the session never reached a prompt"
+            continue
+        }
+        $colds += [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+        Start-Sleep -Milliseconds $ColdLaunchGapMs
+        $v = @()
+        for ($i = 0; $i -lt 5; $i++) {
+            if ($i -gt 0) { Start-Sleep -Milliseconds $ColdLaunchBetweenMs }
+            $old = Get-ActivePaneId $inf.Port $inf.Key
+            $v += [math]::Round((Measure-Creation $inf.Port $inf.Key "new-window" $old), 1)
+        }
+        $runs += , $v
+        Write-Info ("  rep {0}: cold {1:N0} ms, creations [{2}]" -f ($r + 1), $colds[-1], (($v | ForEach-Object { [int]$_ }) -join ', '))
+    }
+    Remove-Namespace
+    Add-PerfLoadSample "after cold launch run" | Out-Null
+    $c4 = @($runs | ForEach-Object { $_[3] } | Where-Object { $_ -ge 0 })
+    $allSamples["cold launch creation 4"] = $c4
+    $allSamples["cold launch to prompt"] = $colds
+    $script:ColdLaunchBlock = [ordered]@{
+        reps = $ColdLaunchReps; gap_ms = $ColdLaunchGapMs; between_ms = $ColdLaunchBetweenMs
+        c4_p50_limit_ms = $ColdLaunchC4P50LimitMs
+        cold_to_prompt_ms = $colds
+        creations_ms = @($runs | ForEach-Object { , @($_) })
+    }
+    if ($c4.Count -lt $ColdLaunchReps) {
+        Write-Fail "cold launch run - only $($c4.Count) of $ColdLaunchReps reps produced a 4th window"
+        return
+    }
+    $s = @($c4 | Sort-Object)
+    $median = $s[[int][Math]::Floor(($s.Count - 1) / 2)]
+    $list = (($c4 | ForEach-Object { [int]$_ }) -join ', ')
+    Write-Perf ("{0,-18} med={1,6:N0} max={2,6:N0} ms  [{3}]" -f "cold c4 (human)", $median, $s[-1], $list)
+    if ($median -le $ColdLaunchC4P50LimitMs) {
+        Write-Pass ("cold launch creation 4 p50 {0:N0}ms is within {1}ms" -f $median, $ColdLaunchC4P50LimitMs)
+    } else {
+        Write-Fail ("cold launch creation 4 p50 {0:N0}ms exceeds {1}ms - the pool is too shallow for a few windows opened after launch  [{2}]" -f $median, $ColdLaunchC4P50LimitMs, $list)
+    }
+    $all = @($runs | ForEach-Object { $_ } | Where-Object { $_ -ge 0 })
+    $mx = ($all | Measure-Object -Maximum).Maximum
+    Assert-Tail ($mx -le $MaxLimitMs) `
+        ("cold launch run max {0:N0}ms is within {1}ms" -f $mx, $MaxLimitMs) `
+        ("cold launch run max {0:N0}ms exceeds {1}ms" -f $mx, $MaxLimitMs)
 }
 
 # ── the split flags the three deep cells do not cover ─────────────────────
@@ -829,6 +905,7 @@ Write-Info ("machine load at the start: {0}% of total cpu" -f (Get-PerfLoadSumma
 Test-Cell -Label "new-window"      -Cmd "new-window"
 Test-Cell -Label "split-window -v" -Cmd "split-window -v" -KillAfter
 Test-Cell -Label "split-window -h" -Cmd "split-window -h" -KillAfter
+if (-not $SkipColdLaunch) { Test-ColdLaunchRun }
 if (-not $SkipVariants) { Test-Variants }
 if (-not $SkipSessions) { Test-Sessions }
 if (-not $SkipKill)     { Test-Kill }
@@ -883,6 +960,7 @@ $outFile = Write-PerfMetrics -Suite "test_creation_latency_gate" -Binary $Binary
     samples_ms = $allSamples
     stats_ms = $stats
     resources = $script:ResourceBlock
+    cold_launch_run = $script:ColdLaunchBlock
     passed = $script:TestsPassed
     failed = $script:TestsFailed
 })
