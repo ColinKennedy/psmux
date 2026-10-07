@@ -1035,7 +1035,7 @@ pub mod mouse_inject {
     const MOUSE_EVENT: u16 = 0x0002;
     const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
 
-    /// Set once by the `server` subcommand.  The server must not re-attach to
+    /// Set once on entry to `server::run_server`.  The server must not re-attach to
     /// its parent's console after an injection: for a cold server the parent
     /// is the client that spawned it, and over ssh that console is the ssh
     /// channel's, so when the client disconnects the server is torn down with
@@ -6157,6 +6157,10 @@ pub fn ime_restore() {
 }
 
 #[cfg(test)]
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue761_server_console_detach.rs"]
+mod tests_issue761_server_console_detach;
+
 #[cfg(windows)]
 #[path = "../tests-rs/test_issue265_argv_backslash.rs"]
 mod tests_issue265_argv_backslash;

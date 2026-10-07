@@ -1752,9 +1752,6 @@ fn run_main() -> io::Result<()> {
             }
             "server" => {
                 // Internal command - run headless server (used when spawning background server)
-                #[cfg(windows)]
-                crate::platform::mouse_inject::SERVER_PROCESS
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
                 // Parse -L socket name for namespace isolation
                 let server_socket_name = args.iter().position(|a| a == "-L").and_then(|i| args.get(i+1)).map(|s| s.clone());
