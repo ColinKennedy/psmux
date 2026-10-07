@@ -145,6 +145,25 @@ fn default_depth_is_greater_than_one() {
     assert!(WARM_POOL_SIZE_DEFAULT <= WARM_POOL_SIZE_MAX);
 }
 
+#[test]
+fn default_depth_serves_a_quick_run_after_a_cold_launch() {
+    // 2026-10-08: at depth two, five new-windows 300 ms apart after a cold
+    // launch stalled the 3rd and 4th (p50 173 and 791 ms); depth three kept
+    // all five at 3 ms. See WARM_POOL_SIZE_DEFAULT for the measurement.
+    assert_eq!(WARM_POOL_SIZE_DEFAULT, 3);
+    let app = AppState::new("pooldefault".to_string());
+    // The env override is how the measurement was taken; without it the
+    // compiled default is what a fresh server gets.
+    if std::env::var("PSMUX_WARM_POOL_SIZE").is_err() && std::env::var("PSMUX_NO_WARM").is_err() {
+        assert_eq!(app.warm_pane.target, 3);
+    }
+    let def = crate::server::option_catalog::OPTION_CATALOG
+        .iter()
+        .find(|d| d.name == "warm-pool-size")
+        .expect("warm-pool-size is in the catalog");
+    assert_eq!(def.default, WARM_POOL_SIZE_DEFAULT.to_string(), "catalog default drifted from the compiled one");
+}
+
 // ── readiness: the thing depth alone did not fix ───────────────────
 //
 // Depth-N with async refill removed the fast/slow ALTERNATION and left a

@@ -41,7 +41,10 @@ slow. Depth is the cure, because the spare handed to creation N+1 has then had
 the whole of creation N to finish booting.
 
 ```
-# default: keep two spare shells ready
+# default: keep three spare shells ready
+set -g warm-pool-size 3
+
+# the old default, one idle shell less
 set -g warm-pool-size 2
 
 # a machine with memory to spare and bursty window creation
@@ -52,10 +55,34 @@ set -g warm-pool-size 0
 ```
 
 The value is clamped to 8. Each spare is a real shell process, so the cost is
-linear: measured on Windows 11 with pwsh, one unit of depth costs one process
-and about 94 MB of working set, and an idle server plus its spares burns under
+linear: measured on Windows 11 with pwsh, one unit of depth costs one shell
+plus its console host and about 100 MB of working set, and an idle server plus its spares burns under
 0.1% of a 32 core machine. `PSMUX_WARM_POOL_SIZE` sets the boot time value for a
 single run without touching the config.
+
+### Why the default is three
+
+The default was two until 2026-10-08. Two serves a creation now and then, and
+it stalls the moment somebody opens a few windows in quick succession after
+launching psmux. Measured with `tests/probe_pool_depth_cold_launch.ps1` on the
+same build, depth set by `PSMUX_WARM_POOL_SIZE`, six runs per depth: a cold
+`new-session`, 2 s for the user to see the prompt, then five `new-window` 300 ms
+apart, each timed until its prompt is visible (p50 / max in ms):
+
+| depth | cold launch | 1st | 2nd | 3rd       | 4th       | 5th | idle tree         |
+|-------|-------------|-----|-----|-----------|-----------|-----|-------------------|
+| 2     | 833 / 932   | 3/7 | 3/4 | 173 / 535 | 791 / 918 | 3/4 | 559 MB, 14 procs  |
+| 3     | 834 / 850   | 3/3 | 3/3 | 3 / 4     | 3 / 3     | 3/3 | 662 MB, 16 procs  |
+| 4     | 847 / 858   | 3/4 | 3/3 | 3 / 3     | 3 / 3     | 3/3 | 764 MB, 18 procs  |
+
+The idle tree is the server, the standby server and every descendant (shells
+and their console hosts) 14 s after launch. With a full second between
+creations even depth two keeps up (every creation 3 to 7 ms), and with no gap
+at all no depth is enough for every creation (see the bursts below). Three is
+the least memory that removes the stall at a human pace, and cold launch did
+not move. The standby server still waits for two ready spares, not three, before
+it spawns after the boot hold (`STANDBY_OWED_READY` in `src/server/mod.rs`), so
+the default behaves exactly like `PSMUX_WARM_POOL_SIZE=3` did on the old build.
 
 Refills run on a background thread, so a burst of creations never waits on a
 `CreateProcess` and the server loop is never stalled by one.

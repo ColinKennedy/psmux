@@ -9,7 +9,11 @@ param(
     [switch]$UseDefault,     # do not set PSMUX_WARM_POOL_SIZE (measures compiled default)
     [string]$Out = "",
     [switch]$SkipBurst,
-    [switch]$SkipMem
+    [switch]$SkipMem,
+    # Human cadence: wait GapMs after pane one's prompt before the first
+    # new-window, and BetweenMs between one creation's prompt and the next.
+    [int]$GapMs = 0,
+    [int]$BetweenMs = 0
 )
 $ErrorActionPreference = "Continue"
 $DataDir = "$env:USERPROFILE\.psmux"
@@ -83,7 +87,9 @@ for ($run = 1; $run -le $Runs; $run++) {
         if (-not $inf) { Write-Host "run $run d=$d never registered"; Cleanup $ns; continue }
         $cold = Wait-Prompt $inf "$($Sess):0.0" $sw
         $times = @(); $wids = @()
+        if ($GapMs -gt 0) { Start-Sleep -Milliseconds $GapMs }
         for ($i = 1; $i -le 5; $i++) {
+            if ($i -gt 1 -and $BetweenMs -gt 0) { Start-Sleep -Milliseconds $BetweenMs }
             $t = [Diagnostics.Stopwatch]::StartNew()
             $id = (Invoke-Psmux $inf.Port $inf.Key "new-window -P -F '#{pane_id}'").Trim().Trim("'")
             if ($id -notmatch '^%\d+$') { Write-Host "  bad id [$id]"; $id = (Invoke-Psmux $inf.Port $inf.Key "display-message -p '#{pane_id}'").Trim().Trim("'") }
@@ -119,7 +125,7 @@ for ($run = 1; $run -le $Runs; $run++) {
             $mem = [math]::Round((($ps | Measure-Object WorkingSetSize -Sum).Sum) / 1MB, 0)
             Cleanup $ns2
         }
-        $row = [pscustomobject]@{ run = $run; depth = $d; cold_ms = [math]::Round($cold, 0); w = ($times -join ","); w4 = $times[3]; wmax = ($times | Measure-Object -Maximum).Maximum; burst = ($burst -join ","); burst_all = $burstAll; idle_mb = $mem; nproc = $nproc }
+        $row = [pscustomobject]@{ run = $run; depth = $d; gap_ms = $GapMs; between_ms = $BetweenMs; cold_ms = [math]::Round($cold, 0); w = ($times -join ","); w4 = $times[3]; wmax = ($times | Measure-Object -Maximum).Maximum; burst = ($burst -join ","); burst_all = $burstAll; idle_mb = $mem; nproc = $nproc }
         $results.Add($row)
         Write-Host (("run {0} d={1} cold={2} windows=[{3}] burst=[{4}] mem={5}MB procs={6}" -f $run, $d, $row.cold_ms, $row.w, $row.burst, $mem, $nproc) + " ids=" + ($wids -join ","))
     }

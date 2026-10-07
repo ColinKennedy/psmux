@@ -231,6 +231,14 @@ fn serialize_overlay_json(app: &AppState) -> String {
 /// spares. It is only needed by the NEXT `new-session`.
 const STANDBY_OWED_MAX: Duration = Duration::from_millis(2000);
 
+/// How many ready spares the owed standby spawn waits for (capped by the
+/// pool's own target). Two, and deliberately not `WARM_POOL_SIZE_DEFAULT`:
+/// that default was two when this wait was measured, and tying the two
+/// together would make a deeper default hold the standby until three or four
+/// spares are up (usually the full STANDBY_OWED_MAX), so the shipped default
+/// would behave differently from the same depth set by `PSMUX_WARM_POOL_SIZE`.
+const STANDBY_OWED_READY: usize = 2;
+
 /// Put every pane that exists now under the boot hold. A window or split
 /// created while the hold is on is a shell somebody is waiting on, so the hold
 /// keeps the pool and the standby back until it has started too.
@@ -2527,7 +2535,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             }
             crate::pane::schedule_warm_refill(&mut app);
             if let Some(t) = standby_owed_at {
-                let want = app.warm_pane.effective_target(false).min(crate::types::WARM_POOL_SIZE_DEFAULT);
+                let want = app.warm_pane.effective_target(false).min(STANDBY_OWED_READY);
                 if app.warm_pane.ready_len() >= want || t.elapsed() >= STANDBY_OWED_MAX {
                     standby_owed_at = None;
                     crate::warm_trace!("pool: owed standby spawn now (ready={})", app.warm_pane.ready_len());
