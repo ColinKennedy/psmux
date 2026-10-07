@@ -32,6 +32,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\perf_metrics_common.ps1"
+if (-not $Psmux -and $env:PSMUX_EXE) { $Psmux = $env:PSMUX_EXE }
 if (-not $Psmux -and $env:PSMUX_TEST_BIN) { $Psmux = $env:PSMUX_TEST_BIN }
 if (-not $Psmux -and $env:PSMUX_TEST_BINARY) { $Psmux = $env:PSMUX_TEST_BINARY }
 if ($Psmux) {

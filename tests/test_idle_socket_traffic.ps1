@@ -123,6 +123,7 @@ function Write-Pass($m) { Write-Host "  [PASS] $m" -ForegroundColor Green; $scri
 function Write-Fail($m) { Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:TestsFailed++ }
 function Write-Info($m) { Write-Host "  [INFO] $m" -ForegroundColor DarkCyan }
 
+if (-not $Binary -and $env:PSMUX_EXE) { $Binary = $env:PSMUX_EXE }
 if (-not $Binary) {
     $cmd = Get-Command psmux -EA SilentlyContinue
     if (-not $cmd) { Write-Fail "psmux not found on PATH and no -Binary given"; exit 1 }

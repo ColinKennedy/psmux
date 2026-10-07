@@ -34,8 +34,11 @@
 #
 # WHAT ELSE IS TIMED HERE
 #
-#   variants     the split flags the deep cells do not cover: -f, -b, -bh, -bv
-#                and a split that carries its own command. Five samples each
+#   variants     the split flags the deep cells do not cover: -f, -b, -bh, -bv,
+#                -l in cells and in percent (each checked to have produced the
+#                size it asked for), a split issued in a ZOOMED window (checked
+#                to really be zoomed first) and a split that carries its own
+#                command. Five samples each
 #                rather than ten, because these are shape checks on flag
 #                handling and not the distribution study the three deep cells
 #                are. Verified on 2026-09-22 against the installed 0bcc421 that
@@ -223,6 +226,7 @@ function Write-Perf { param($msg) Write-Host "[PERF] $msg" -ForegroundColor Mage
 # and a gate that quietly timed the installed psmux instead would report a green
 # sweep for a build nobody measured. -Binary or PSMUX_TEST_BINARY override,
 # which is how two builds are compared against each other.
+if (-not $Binary -and $env:PSMUX_EXE) { $Binary = $env:PSMUX_EXE }
 if (-not $Binary -and $env:PSMUX_TEST_BIN) { $Binary = $env:PSMUX_TEST_BIN }
 if (-not $Binary -and $env:PSMUX_TEST_BINARY) { $Binary = $env:PSMUX_TEST_BINARY }
 if (-not $Binary) {
@@ -462,17 +466,66 @@ function Test-Variants {
         "split -b"       = @{ cmd = "split-window -b";  limit = $VariantP50LimitMs }
         "split -bh"      = @{ cmd = "split-window -bh"; limit = $VariantP50LimitMs }
         "split -bv"      = @{ cmd = "split-window -bv"; limit = $VariantP50LimitMs }
+        # Sizes, both forms tmux accepts: a cell count and a percentage. The
+        # size is applied by the layout after the pane exists, so these go
+        # through the same claim as a plain split and are budgeted like one.
+        "split -l 10"    = @{ cmd = "split-window -v -l 10";  limit = $VariantP50LimitMs }
+        "split -l 30%"   = @{ cmd = "split-window -h -l 30%"; limit = $VariantP50LimitMs }
+        # A split issued while the window is ZOOMED. tmux unzooms first
+        # (cmd-split-window.c, window_unzoom) and then splits, so this is the
+        # unzoom plus resize of every pane plus the claim. It needs a window
+        # with two panes to zoom at all (tmux refuses to zoom a lone pane), so
+        # the cell keeps one extra pane for its whole run and zooms the active
+        # pane before every sample; Test-Variants checks the zoom engaged, so
+        # an unzoomed split can never be recorded as the zoomed one.
+        "split zoomed"   = @{ cmd = "split-window -v"; limit = $VariantP50LimitMs; zoom = $true }
         "split with cmd" = @{ cmd = "split-window -h pwsh -NoLogo -NoProfile"; limit = $CommandSplitP50LimitMs }
     }
     foreach ($label in @($cells.Keys)) {
         $t = @()
+        $zoom = [bool]$cells[$label].zoom
+        $basePane = ""
+        if ($zoom) {
+            $o0 = Get-ActivePaneId $inf.Port $inf.Key
+            if ((Measure-Creation $inf.Port $inf.Key "split-window -h" $o0) -lt 0) {
+                Write-Fail "$label - could not make the second pane the zoom needs"
+                continue
+            }
+            $basePane = Get-ActivePaneId $inf.Port $inf.Key
+        }
         for ($i = 0; $i -lt $VariantCount; $i++) {
+            if ($zoom) {
+                Invoke-Psmux $inf.Port $inf.Key "resize-pane -Z" | Out-Null
+                $zf = (Get-Text (Invoke-Psmux $inf.Port $inf.Key "display-message -p '#{window_zoomed_flag}'")).Trim().Trim("'")
+                if ($zf -ne "1") {
+                    Write-Info "  $label sample $($i + 1): the window did not zoom (window_zoomed_flag '$zf'), sample dropped"
+                    continue
+                }
+            }
             $old = Get-ActivePaneId $inf.Port $inf.Key
             $ms = Measure-Creation $inf.Port $inf.Key $cells[$label].cmd $old
             if ($ms -ge 0) { $t += $ms } else { Write-Info "  $label sample $($i + 1) produced no pane" }
+            # A size flag that is accepted and ignored would time an ordinary
+            # split under the wrong name, so the first sample of a sized cell
+            # checks the new pane really got the size it asked for (within two
+            # cells, for the border and percentage rounding).
+            if ($ms -ge 0 -and $i -eq 0 -and $cells[$label].cmd -match '-l (\d+)(%?)') {
+                $want = [int]$Matches[1]; $pct = ($Matches[2] -eq '%')
+                $dim = if ($cells[$label].cmd -match '-h') { 'width' } else { 'height' }
+                $got = (Get-Text (Invoke-Psmux $inf.Port $inf.Key "display-message -p '#{pane_$dim} #{window_$dim}'")).Trim().Trim("'") -split '\s+'
+                if ($got.Count -ge 2) {
+                    $exp = if ($pct) { [math]::Round([int]$got[1] * $want / 100.0) } else { $want }
+                    if ([math]::Abs([int]$got[0] - $exp) -le 2) {
+                        Write-Pass ("$label made a pane {0} {1} against {2} asked for" -f $got[0], $dim, $exp)
+                    } else {
+                        Write-Fail ("$label made a pane {0} {1}, but {2} was asked for (window {3}), so its timing is not a sized split" -f $got[0], $dim, $exp, $got[1])
+                    }
+                }
+            }
             Invoke-Psmux $inf.Port $inf.Key "kill-pane" | Out-Null
             Start-Sleep -Milliseconds 150
         }
+        if ($basePane) { Invoke-Psmux $inf.Port $inf.Key "kill-pane -t $basePane" | Out-Null; Start-Sleep -Milliseconds 150 }
         $allSamples[$label] = @($t | ForEach-Object { [math]::Round($_, 1) })
         if ($t.Count -lt $VariantCount) {
             Write-Fail "$label - only $($t.Count) of $VariantCount creations produced a pane"

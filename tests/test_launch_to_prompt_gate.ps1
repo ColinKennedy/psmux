@@ -113,6 +113,7 @@ function Write-Skip { param($msg) Write-Host "[SKIP] $msg" -ForegroundColor Yell
 function Write-Info { param($msg) Write-Host "[INFO] $msg" -ForegroundColor Cyan }
 function Write-Perf { param($msg) Write-Host "[PERF] $msg" -ForegroundColor Magenta }
 
+if (-not $Binary -and $env:PSMUX_EXE) { $Binary = $env:PSMUX_EXE }
 if (-not $Binary -and $env:PSMUX_TEST_BIN) { $Binary = $env:PSMUX_TEST_BIN }
 if (-not $Binary -and $env:PSMUX_TEST_BINARY) { $Binary = $env:PSMUX_TEST_BINARY }
 if (-not $Binary) {

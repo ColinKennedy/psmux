@@ -198,6 +198,7 @@ function Write-Info($msg) { Write-Host "  [INFO] $msg" -ForegroundColor DarkCyan
 # measured the installed psmux instead would report a green sweep for a build
 # nobody timed. -Binary or PSMUX_TEST_BINARY still override, which is how two
 # builds are compared against each other.
+if (-not $Binary -and $env:PSMUX_EXE) { $Binary = $env:PSMUX_EXE }
 if (-not $Binary -and $env:PSMUX_TEST_BIN) { $Binary = $env:PSMUX_TEST_BIN }
 if (-not $Binary -and $env:PSMUX_TEST_BINARY) { $Binary = $env:PSMUX_TEST_BINARY }
 if (-not $Binary) {
