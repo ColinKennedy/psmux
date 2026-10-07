@@ -5437,10 +5437,24 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     confirm_cmd = None;
                                 }
                                 // A control character is an editing key, not
-                                // text, so it goes to the editor arm below.
-                                KeyCode::Char(c) if renaming && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    let name = format!("c-{}", c.to_ascii_lowercase());
-                                    let _ = crate::copy_mode::prompt_edit(&mut rename_buf, &mut rename_back, &name);
+                                // text, so it goes to the editor. AltGr is the
+                                // exception: Windows reports it as Ctrl+Alt, so
+                                // `@` on a German layout arrives as Ctrl+Alt+@
+                                // and has to be typed, which the text arm below
+                                // does. C-c and C-g close the prompt, as tmux's
+                                // prompt.c does.
+                                KeyCode::Char(c) if renaming
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !is_altgr_char(c, key.modifiers) => {
+                                    if rename_overlay_ctrl_key(&mut rename_buf, &mut rename_back, c) {
+                                        renaming = false;
+                                        session_renaming = false;
+                                        // Nothing else asks for a repaint here:
+                                        // on an idle pane no frame comes, and the
+                                        // closed overlay stayed drawn. Escape's
+                                        // branch does the same.
+                                        selection_changed = true;
+                                    }
                                 }
                                 KeyCode::Char(c) if renaming && !paste_burst_active => {
                                     let mut buf = [0u8; 4];
@@ -5663,6 +5677,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     command_buf.drain(pos..command_cursor);
                                     command_cursor = pos;
                                 }
+                                // Every key the rename overlay has no use for
+                                // stops here. Up, Down, Tab, PageUp, F keys and
+                                // the rest used to fall through to the arms
+                                // below and reach the pane's shell while the
+                                // overlay sat on top of it, the way C-c did
+                                // before the overlay had an editor. tmux's
+                                // prompt keeps every key it is given.
+                                _ if renaming => {}
 
                                 // The CONTROL guard is load bearing (issue #623).
                                 // `fold_nul_to_ctrl_space` has already rewritten a
@@ -9530,6 +9552,31 @@ fn duplicates_recent_paste(text: &str, recent: Option<(&str, Duration)>) -> bool
 #[cfg(windows)]
 fn paste_buffer_has_non_ascii(buf: &str) -> bool {
     buf.chars().any(|c| !c.is_ascii())
+}
+
+/// True for a character AltGr produced. Windows reports AltGr as Ctrl+Alt, so
+/// `@ { } [ ] \ | ~` on German, Czech and similar layouts arrive as Char with
+/// CONTROL and ALT both set; a genuine Ctrl+Alt chord carries a lowercase
+/// letter instead. Same rule as `normalize_key_for_binding` and the pane arms.
+pub(crate) fn is_altgr_char(c: char, mods: KeyModifiers) -> bool {
+    mods.contains(KeyModifiers::CONTROL)
+        && mods.contains(KeyModifiers::ALT)
+        && !c.is_ascii_lowercase()
+}
+
+/// A Ctrl+letter typed into the rename overlay. Returns true when the key
+/// closes the overlay: C-c and C-g cancel tmux's prompt (prompt.c, beside
+/// Escape) and C-[ is Escape itself. Anything else goes to the copy-mode prompt
+/// editor, which ignores what it has no meaning for; none of them may reach
+/// the pane behind the overlay.
+pub(crate) fn rename_overlay_ctrl_key(buf: &mut String, back: &mut usize, c: char) -> bool {
+    match c.to_ascii_lowercase() {
+        'c' | 'g' | '[' => true,
+        lc => {
+            let _ = crate::copy_mode::prompt_edit(buf, back, &format!("c-{}", lc));
+            false
+        }
+    }
 }
 
 /// The name a rename overlay opens on, asked for as it opens.

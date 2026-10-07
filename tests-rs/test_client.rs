@@ -1204,3 +1204,56 @@ fn stage2_quiet_is_measured_from_the_last_character_not_from_the_hold() {
     // A long paste that is still arriving 2 s in is not over.
     assert!(!stage2_paste_is_over(Duration::from_secs(2), Duration::from_millis(5)));
 }
+
+// ── rename overlay keys (#757 follow up) ──
+//
+// The overlay's editing keys came from the copy-mode prompt editor, but three
+// things tmux's prompt does were missing: C-c and C-g close it (prompt.c, beside
+// Escape), AltGr characters are text rather than Ctrl chords, and a Ctrl key it
+// has no use for stays in the overlay instead of reaching the pane.
+
+#[cfg(windows)]
+#[test]
+fn rename_overlay_ctrl_c_g_and_bracket_cancel() {
+    for c in ['c', 'g', '[', 'C', 'G'] {
+        let mut buf = String::from("alpha");
+        let mut back = 2usize;
+        assert!(rename_overlay_ctrl_key(&mut buf, &mut back, c), "C-{} must cancel", c);
+        assert_eq!(buf, "alpha", "cancelling leaves the text alone");
+        assert_eq!(back, 2);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn rename_overlay_ctrl_keys_edit_like_tmux_emacs_prompt() {
+    let mut buf = String::from("alpha");
+    let mut back = 0usize;
+    assert!(!rename_overlay_ctrl_key(&mut buf, &mut back, 'a'));
+    assert_eq!(back, 5, "C-a goes to the start");
+    assert!(!rename_overlay_ctrl_key(&mut buf, &mut back, 'f'));
+    assert_eq!(back, 4, "C-f moves one right");
+    assert!(!rename_overlay_ctrl_key(&mut buf, &mut back, 'd'));
+    assert_eq!(buf, "apha", "C-d deletes under the cursor");
+    assert!(!rename_overlay_ctrl_key(&mut buf, &mut back, 'k'));
+    assert_eq!(buf, "a", "C-k kills to the end");
+    assert!(!rename_overlay_ctrl_key(&mut buf, &mut back, 'u'));
+    assert_eq!(buf, "", "C-u clears the line");
+    // A Ctrl key the editor has no meaning for is swallowed, not an error.
+    let mut buf = String::from("x");
+    let mut back = 0usize;
+    assert!(!rename_overlay_ctrl_key(&mut buf, &mut back, 'z'));
+    assert_eq!(buf, "x");
+}
+
+#[cfg(windows)]
+#[test]
+fn rename_overlay_altgr_chars_are_text_and_ctrl_alt_letters_are_not() {
+    let ca = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    for c in ['@', '{', '}', '[', ']', '\\', '|', '~', '\u{20ac}'] {
+        assert!(is_altgr_char(c, ca), "{:?} with Ctrl+Alt is AltGr", c);
+    }
+    assert!(!is_altgr_char('q', ca), "Ctrl+Alt+q is a real chord");
+    assert!(!is_altgr_char('@', KeyModifiers::CONTROL), "Ctrl alone is not AltGr");
+    assert!(!is_altgr_char('@', KeyModifiers::NONE));
+}
