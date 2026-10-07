@@ -750,12 +750,21 @@ pub struct WarmPool {
 
 /// Default depth of the spare shell pool (`warm-pool-size`).
 ///
-/// Two, not one: with a single spare every other creation in a sequence claims
-/// a shell that was spawned moments earlier and pays its whole boot. Two costs
-/// one extra idle shell (about 45 MB of working set on Windows with pwsh) and
-/// removes the alternation. Users who create windows in long bursts can raise
-/// it; `set -g warm-pool-size 0` (or `PSMUX_NO_WARM=1`) turns the pool off.
-pub const WARM_POOL_SIZE_DEFAULT: usize = 2;
+/// Not one: with a single spare every other creation in a sequence claims a
+/// shell that was spawned moments earlier and pays its whole boot.
+///
+/// Three, not two. Measured 2026-10-08 (tests/probe_pool_depth_cold_launch.ps1,
+/// six runs per depth, same binary, depth set by `PSMUX_WARM_POOL_SIZE`): a
+/// cold launch, 2 s for the user to look at the prompt, then five `new-window`
+/// 300 ms apart, each timed to its prompt. Depth two stalled the third and
+/// fourth creation (p50 173 and 791 ms, max 535 and 918 ms); depth three and
+/// four kept every one of the five at 3 to 4 ms. Three is the least memory that
+/// removes the stall: one more idle pwsh and its console host, about 100 MB of
+/// working set for the whole session tree. Cold launch to the first prompt did
+/// not move (p50 833 / 834 / 847 ms for depth 2 / 3 / 4). Users who create
+/// windows in long bursts can raise it; `set -g warm-pool-size 0` (or
+/// `PSMUX_NO_WARM=1`) turns the pool off.
+pub const WARM_POOL_SIZE_DEFAULT: usize = 3;
 
 /// Hard ceiling on `warm-pool-size`. Each spare is a real shell process plus a
 /// ConPTY, so an unbounded pool is an unbounded memory leak by configuration.

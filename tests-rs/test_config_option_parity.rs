@@ -87,7 +87,7 @@ fn non_default_value(name: &str) -> Option<&'static str> {
         "prediction-dimming" => "on",
         "allow-predictions" => "on",
         "warm" => "off",
-        "warm-pool-size" => "3",
+        "warm-pool-size" => "5",
         "cursor-style" => "block",
         "cursor-blink" => "on",
         "claude-code-fix-tty" => "off",
