@@ -150,6 +150,22 @@ pub(crate) fn append_floats_json(app: &AppState, buf: &mut String) {
     buf.push('}');
 }
 
+/// Append the session's own name to a frame that currently ends with `}`.
+///
+/// Issue #7 batch D put it in the dump-state reply, but an attached client
+/// receives most of its frames from the push path, which builds the same JSON
+/// separately and had no such field. The client's `session_label` (default
+/// status-left, `command-prompt -I '#S'`, the rename overlay's fallback) then
+/// kept the port file base, `ns__name`, and never heard about a rename (#759
+/// follow up). Both builders call this so the two frames cannot drift again.
+pub(crate) fn append_session_name_json(name: &str, buf: &mut String) {
+    if !buf.ends_with('}') { return; }
+    buf.pop();
+    buf.push_str(",\"session_name\":\"");
+    buf.push_str(&json_escape_string(name));
+    buf.push_str("\"}");
+}
+
 pub(crate) fn json_escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
@@ -1137,6 +1153,10 @@ mod tests_issue556_color_reply_order;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue559_monitor_silence.rs"]
 mod tests_issue559_monitor_silence;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue759_session_name_frame.rs"]
+mod tests_issue759_session_name_frame;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue658_rename_walk_activity_gate.rs"]
