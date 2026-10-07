@@ -1262,8 +1262,8 @@ pub fn land_spare(app: &mut AppState, slot: Option<crate::types::WarmPane>) {
 /// This used to be 80ms, "a little over two" of the 20 to 37ms a refill took to
 /// post its spare back. That figure was measured when spawns were serialised,
 /// which means it was the cost of ONE `CreateProcessW` with the machine
-/// otherwise idle. A surge then ran four of them at once (it runs
-/// [`WARM_SPAWN_CONCURRENCY`] now) and each cost 90 to 190ms, so 80ms expired every single time, and what
+/// otherwise idle. A surge now runs [`WARM_SPAWN_CONCURRENCY`] of them at once
+/// and each costs 90 to 190ms, so 80ms expired every single time, and what
 /// follows a timeout is not merely one cold spawn (#686):
 ///
 ///   the claim cold spawns and takes the next pane id, which raises the pool's
@@ -1363,59 +1363,15 @@ pub fn await_inflight_spare(
 /// spawned another eight: a burst of ten new windows produced sixty shells and
 /// a p50 of 251ms, worse than the serialised build.
 ///
-/// Four was where the September measurement put the knee: three concurrent
-/// spawns cost ~64ms each, five ~99ms, eight 130ms and up.
-///
-/// ONE, IN PANE ID ORDER, since 2026-10-07. The default shell on this machine
-/// (and on any machine that installed PowerShell 7 from the Store) is the MSIX
-/// pwsh, and Windows creates packaged processes one at a time: eight
-/// `Process.Start` of it with no psmux at all took 93, 151, 154, 153, 152,
-/// 151, 148, 152 ms, 1.48 s in all, and 1, 2, 4 or 8 threads all finish in
-/// about 1.5 s. So four permits never bought throughput for it; what they did
-/// was put four activations in flight at once, and a pwsh that is booting
-/// stalls while activations are pending. Traced with PSMUX_WARM_TRACE after a
-/// cold launch: the third creation took the last ready spare, the surge put
-/// seven spawns behind four permits, `CreateProcessW` went from 92 ms solo to
-/// 478 to 983 ms, and the fourth creation, which had been handed the one
-/// spare already booting, waited 1.2 to 2.1 s for its prompt.
-///
-/// One at a time, lowest pane id first, fixes that and two more things. The
-/// spare a claim is about to wait on is never booting beside a queue of
-/// activations it cannot overtake, and spares land in id order, which is the
-/// order claims hand them out in (`WarmPool::claim` takes the lowest id), so a
-/// claim no longer passes over two READY spares to take a newborn lower id that
-/// a later permit happened to start last. Measured interleaved against master
-/// 1eaf5302 (cold launch then eight new-window, each to its prompt):
-///
-///   Store pwsh, back to back   max p50 1832 -> 759 ms, run 2953 -> 2414 ms
-///   Store pwsh, 300 ms apart   max p50 1191 -> 730 ms, run 2132 -> 1225 ms
-///   Store pwsh, burst of 8     last prompt 4104 -> 2259 ms
-///   Windows PowerShell 5.1     unchanged (run 754 vs 719 ms, burst 476 vs 514)
-///
-/// The first spare of a batch still lands inside [`WARM_INFLIGHT_WAIT`]: one
-/// spawn alone is the 90 to 160 ms case.
-pub const WARM_SPAWN_CONCURRENCY: usize = 1;
+/// Four is where the measurement puts the knee on this machine: three
+/// concurrent spawns cost ~64ms each, five cost ~99ms, eight cost 130ms and up.
+/// At four the per spawn cost stays near the single spawn figure, so the first
+/// spare still lands inside the claim's wait budget, and eight spares take two
+/// short waves instead of one long queue.
+pub const WARM_SPAWN_CONCURRENCY: usize = 4;
 
-/// Spawns inside `CreateProcessW` now, and the pane ids of the spawn threads
-/// waiting for a permit. Kept under one lock so the "lowest waiting id goes
-/// next" rule is decided atomically with taking the slot.
-struct SpawnQueue {
-    in_use: usize,
-    waiting: std::collections::BTreeSet<usize>,
-}
-
-impl SpawnQueue {
-    /// Whether the spawn for `pane_id` may enter now: a slot is free and no
-    /// lower pane id is waiting for one.
-    fn may_enter(&self, pane_id: usize, limit: usize) -> bool {
-        self.in_use < limit && self.waiting.first().map_or(true, |&lo| lo >= pane_id)
-    }
-}
-
-static WARM_SPAWN_SLOTS: (std::sync::Mutex<SpawnQueue>, std::sync::Condvar) = (
-    std::sync::Mutex::new(SpawnQueue { in_use: 0, waiting: std::collections::BTreeSet::new() }),
-    std::sync::Condvar::new(),
-);
+static WARM_SPAWN_SLOTS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
 
 /// A permit to be inside a ConPTY spawn. Released on drop.
 pub struct WarmSpawnPermit;
@@ -1423,11 +1379,9 @@ pub struct WarmSpawnPermit;
 impl Drop for WarmSpawnPermit {
     fn drop(&mut self) {
         let (m, cv) = &WARM_SPAWN_SLOTS;
-        let mut q = m.lock().unwrap_or_else(|e| e.into_inner());
-        q.in_use = q.in_use.saturating_sub(1);
-        // Every waiter, not one: only the lowest id may take the slot, and
-        // notify_one could wake a different thread.
-        cv.notify_all();
+        let mut n = m.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        cv.notify_one();
     }
 }
 
@@ -1437,28 +1391,22 @@ impl Drop for WarmSpawnPermit {
 ///
 /// Only the background spare spawner queues here. A cold spawn on the loop
 /// thread is a user waiting on a window, so it never queues behind spares.
-///
-/// Permits go out lowest pane id first (see [`WARM_SPAWN_CONCURRENCY`]).
-pub fn warm_spawn_permit(pane_id: usize) -> Option<WarmSpawnPermit> {
+pub fn warm_spawn_permit() -> Option<WarmSpawnPermit> {
     let (m, cv) = &WARM_SPAWN_SLOTS;
-    let mut q = m.lock().unwrap_or_else(|e| e.into_inner());
-    q.waiting.insert(pane_id);
+    let mut n = m.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if crate::warm_pane_sync::inflight::is_tearing_down() {
-            q.waiting.remove(&pane_id);
-            cv.notify_all();
             return None;
         }
-        if q.may_enter(pane_id, WARM_SPAWN_CONCURRENCY) {
-            q.waiting.remove(&pane_id);
-            q.in_use += 1;
+        if *n < WARM_SPAWN_CONCURRENCY {
+            *n += 1;
             return Some(WarmSpawnPermit);
         }
         // Timed, so the teardown check above is re-run rather than waited on.
         let (g, _) = cv
-            .wait_timeout(q, std::time::Duration::from_millis(5))
+            .wait_timeout(n, std::time::Duration::from_millis(5))
             .unwrap_or_else(|e| e.into_inner());
-        q = g;
+        n = g;
     }
 }
 
@@ -1522,7 +1470,7 @@ pub fn schedule_warm_refill(app: &mut AppState) {
         let started = std::thread::Builder::new()
             .name("psmux-warm-spawn".into())
             .spawn(move || {
-                let Some(_permit) = warm_spawn_permit(params.pane_id) else {
+                let Some(_permit) = warm_spawn_permit() else {
                     // Teardown began before this spawn started: no process was
                     // ever created, so there is nothing for the reaper to kill.
                     crate::warm_pane_sync::inflight::release(params.pane_id);
@@ -4431,38 +4379,6 @@ mod test_windowsapps_alias_shell;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue475_claude_wrapper.rs"]
 mod test_issue475_claude_wrapper;
-
-#[cfg(test)]
-mod tests_warm_spawn_order {
-    use super::SpawnQueue;
-    use std::collections::BTreeSet;
-
-    fn q(in_use: usize, waiting: &[usize]) -> SpawnQueue {
-        SpawnQueue { in_use, waiting: waiting.iter().copied().collect::<BTreeSet<_>>() }
-    }
-
-    #[test]
-    fn lowest_waiting_id_goes_first() {
-        let s = q(0, &[5, 6, 7]);
-        assert!(s.may_enter(5, 1));
-        assert!(!s.may_enter(6, 1), "a higher id must not overtake a lower one still waiting");
-        assert!(!s.may_enter(7, 1));
-    }
-
-    #[test]
-    fn nobody_enters_while_the_slot_is_taken() {
-        let s = q(1, &[5]);
-        assert!(!s.may_enter(5, 1));
-        assert!(s.may_enter(5, 2));
-    }
-
-    #[test]
-    fn a_higher_id_does_not_jump_a_lower_waiter() {
-        let s = q(0, &[3]);
-        assert!(!s.may_enter(4, 1));
-        assert!(s.may_enter(2, 1));
-    }
-}
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue399_teammate_settings_priority.rs"]
