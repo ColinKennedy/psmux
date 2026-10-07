@@ -1035,6 +1035,24 @@ pub mod mouse_inject {
     const MOUSE_EVENT: u16 = 0x0002;
     const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
 
+    /// Set once by the `server` subcommand.  The server must not re-attach to
+    /// its parent's console after an injection: for a cold server the parent
+    /// is the client that spawned it, and over ssh that console is the ssh
+    /// channel's, so when the client disconnects the server is torn down with
+    /// it.  `spawn_server_hidden` gives the server a hidden console of its
+    /// own, so `had_console` is true and "server mode: leave detached" did not
+    /// hold.
+    pub static SERVER_PROCESS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Re-attach to the parent's console after an injection, except in the
+    /// server, which stays detached.
+    unsafe fn reattach_parent_console() {
+        if !SERVER_PROCESS.load(std::sync::atomic::Ordering::Relaxed) {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+
     // dwButtonState flags
     pub const FROM_LEFT_1ST_BUTTON_PRESSED: u32 = 0x0001;
     pub const RIGHTMOST_BUTTON_PRESSED: u32     = 0x0002;
@@ -1436,7 +1454,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "query_vti_enabled") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return None;
             }
 
@@ -1457,7 +1475,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log("query_vti_enabled: CreateFileW(CONIN$) FAILED");
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return None;
             }
 
@@ -1470,7 +1488,7 @@ pub mod mouse_inject {
 
             CloseHandle(handle);
             FreeConsole();
-            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+            if had_console { reattach_parent_console(); }
 
             if ok == 0 {
                 debug_log("query_vti_enabled: GetConsoleMode FAILED");
@@ -1505,7 +1523,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "ensure_vti_enabled") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1526,7 +1544,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log("ensure_vti_enabled: CreateFileW(CONIN$) FAILED");
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1550,7 +1568,7 @@ pub mod mouse_inject {
 
             CloseHandle(handle);
             FreeConsole();
-            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+            if had_console { reattach_parent_console(); }
 
             ok
         }
@@ -1594,7 +1612,7 @@ pub mod mouse_inject {
 
             // Detach from the current console and attach to the child's.
             if !free_and_attach(child_pid, "send_mouse_event") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1617,7 +1635,7 @@ pub mod mouse_inject {
                 let err = GetLastError();
                 debug_log(&format!("send_mouse_event: CreateFileW(CONIN$) FAILED err={}", err));
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1668,7 +1686,7 @@ pub mod mouse_inject {
             // Only re-attach if we had our own console (app/standalone mode)
             // Server mode: leave detached to avoid conhost cycling
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             result != 0
@@ -1701,7 +1719,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "query_console_input_mode") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return None;
             }
 
@@ -1722,7 +1740,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log("query_console_input_mode: CreateFileW(CONIN$) FAILED");
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return None;
             }
 
@@ -1735,7 +1753,7 @@ pub mod mouse_inject {
 
             CloseHandle(handle);
             FreeConsole();
-            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+            if had_console { reattach_parent_console(); }
 
             if ok == 0 {
                 debug_log("query_console_input_mode: GetConsoleMode FAILED");
@@ -1765,7 +1783,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "send_vt_sequence") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1785,7 +1803,7 @@ pub mod mouse_inject {
 
             if handle == INVALID_HANDLE || handle == 0 {
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1890,7 +1908,7 @@ pub mod mouse_inject {
             CloseHandle(handle);
             FreeConsole();
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             result != 0
@@ -1942,7 +1960,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "send_vt_response") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1964,7 +1982,7 @@ pub mod mouse_inject {
                 let err = GetLastError();
                 debug_log(&format!("send_vt_response: CreateFileW(CONIN$) FAILED err={}", err));
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -1985,7 +2003,7 @@ pub mod mouse_inject {
                     ));
                     CloseHandle(handle);
                     FreeConsole();
-                    if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                    if had_console { reattach_parent_console(); }
                     return false;
                 }
             }
@@ -2099,7 +2117,7 @@ pub mod mouse_inject {
             CloseHandle(handle);
             FreeConsole();
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             last_result != 0 && offset == records.len()
@@ -2176,7 +2194,7 @@ pub mod mouse_inject {
                 let had_console = GetConsoleWindow() != 0;
                 if !free_and_attach(child_pid, "inject_paste") {
                     last_err = GetLastError();
-                    if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                    if had_console { reattach_parent_console(); }
                     return None;
                 }
                 let conin: [u16; 7] = [
@@ -2211,7 +2229,7 @@ pub mod mouse_inject {
                     CloseHandle(handle);
                 }
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 result
             }
         });
@@ -2339,7 +2357,7 @@ pub mod mouse_inject {
             unsafe {
                 let had_console = GetConsoleWindow() != 0;
                 if !free_and_attach(child_pid, "strip_processed_input") {
-                    if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                    if had_console { reattach_parent_console(); }
                     return;
                 }
                 // A plain native app on the console (ping under Git Bash) is
@@ -2350,7 +2368,7 @@ pub mod mouse_inject {
                 if n > 0 && crate::platform::process_info::console_has_plain_native_app(&pids[..n.min(64)]) {
                     log("plain native app on pane console: keep PROCESSED_INPUT so its interrupt still fires");
                     FreeConsole();
-                    if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                    if had_console { reattach_parent_console(); }
                     return;
                 }
                 let conin: [u16; 7] = [
@@ -2377,7 +2395,7 @@ pub mod mouse_inject {
                     CloseHandle(handle);
                 }
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
             }
         }
 
@@ -2454,7 +2472,7 @@ pub mod mouse_inject {
             log(&format!("called: pid={} reattach={} had_console={}", child_pid, reattach, had_console));
 
             if !free_and_attach(child_pid, "ctrl_c") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2519,7 +2537,7 @@ pub mod mouse_inject {
                     }
                 }
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2559,7 +2577,7 @@ pub mod mouse_inject {
                     fg_leaf_pid, child_pid
                 ));
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2609,7 +2627,7 @@ pub mod mouse_inject {
                             log(&format!("raw-mode non-shell foreground pid={}: deliver raw 0x03, skip CTRL_C_EVENT", child_pid));
                             CloseHandle(handle);
                             FreeConsole();
-                            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                            if had_console { reattach_parent_console(); }
                             return false;
                         }
                         // Raw-mode shell prompt (e.g. PSReadLine).  Flip
@@ -2666,7 +2684,7 @@ pub mod mouse_inject {
             SetConsoleCtrlHandler(None, 0);
 
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             ok != 0
@@ -2735,7 +2753,7 @@ pub mod mouse_inject {
             log(&format!("called: pid={} reattach={} had_console={}", child_pid, reattach, had_console));
 
             if !free_and_attach(child_pid, "ctrl_break") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2759,7 +2777,7 @@ pub mod mouse_inject {
             SetConsoleCtrlHandler(Some(survive_break), 0);
 
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             ok != 0
@@ -2815,7 +2833,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "send_modified_key_event") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2836,7 +2854,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log(&format!("send_modified_key_event: CreateFileW(CONIN$) FAILED"));
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2921,7 +2939,7 @@ pub mod mouse_inject {
             CloseHandle(handle);
             FreeConsole();
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             result != 0 && written >= 1
@@ -2944,7 +2962,7 @@ pub mod mouse_inject {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             if !free_and_attach(child_pid, "send_modified_enter_event") {
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -2965,7 +2983,7 @@ pub mod mouse_inject {
             if handle == INVALID_HANDLE || handle == 0 {
                 debug_log(&format!("send_modified_enter_event: CreateFileW(CONIN$) FAILED"));
                 FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                if had_console { reattach_parent_console(); }
                 return false;
             }
 
@@ -3055,7 +3073,7 @@ pub mod mouse_inject {
             CloseHandle(handle);
             FreeConsole();
             if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+                reattach_parent_console();
             }
 
             result != 0 && written >= 1

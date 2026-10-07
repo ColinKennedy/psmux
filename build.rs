@@ -128,7 +128,7 @@ fn embed_windows_resources() {
         // All three binaries (psmux, pmux, tmux) are the same image built from
         // src/main.rs; psmux.exe is the canonical name.
         .set("OriginalFilename", "psmux.exe")
-        .set("LegalCopyright", "Copyright (c) psmux contributors. MIT licensed.")
+        .set("LegalCopyright", "Copyright (c) 2025 Godwin Sam Josh. MIT licensed.")
         .set("FileVersion", version)
         .set("ProductVersion", version);
 

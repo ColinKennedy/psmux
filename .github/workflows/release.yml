@@ -23,6 +23,9 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: windows-latest
+    # Windows files are signed only when this workflow runs on a release
+    # tag. Dispatch it from the tag itself to get a signed build.
+    environment: ${{ github.ref_type == 'tag' && 'windows-signing' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +53,34 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Parallel legs sign one at a time.
+      - name: Stagger Certum logins across legs
+        if: runner.os == 'Windows' && github.ref_type == 'tag'
+        shell: pwsh
+        run: Start-Sleep -Seconds (35 * ${{ strategy.job-index }})
+
+      # Windows code signing. The action is pinned to a reviewed commit.
+      - name: Log in to Certum SimplySign
+        id: certum
+        if: runner.os == 'Windows' && github.ref_type == 'tag'
+        uses: jay0lee/certum-cloud-code-sign@a3324503499c49090869856eeeecfe95fb613d87 # v1, reviewed 2026-10-07
+        with:
+          username: ${{ secrets.CERTUM_USERNAME }}
+          totp_secret: ${{ secrets.CERTUM_TOTP_SECRET }}
+          totp_algorithm: ${{ vars.CERTUM_TOTP_ALGORITHM || 'SHA-256' }}
+
+      # Sign the binaries before the zip and the installer are built, so
+      # both ship signed files and package checksums match them.
+      - name: Sign binaries
+        if: steps.certum.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseDir = "target/${{ matrix.target }}/release"
+          & "${{ steps.certum.outputs.signtool-path }}" sign /sha1 ${{ steps.certum.outputs.cert-thumbprint }} /tr http://time.certum.pl /td SHA256 /fd SHA256 /d "psmux" `
+            "$releaseDir/psmux.exe" "$releaseDir/pmux.exe" "$releaseDir/tmux.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool could not sign the psmux binaries" }
 
       - name: Create release package
         shell: pwsh
@@ -122,6 +153,41 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $setup).Length / 1MB, 2)
           Write-Output "NSIS installer: $setup ($sizeMB MB)"
 
+      - name: Sign NSIS installer
+        if: steps.certum.outcome == 'success'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ inputs.tag }}" -replace '^v', ''
+          $setup = "target\installer\psmux-v${version}-${{ matrix.nsis_arch }}-setup.exe"
+          & "${{ steps.certum.outputs.signtool-path }}" sign /sha1 ${{ steps.certum.outputs.cert-thumbprint }} /tr http://time.certum.pl /td SHA256 /fd SHA256 /d "psmux" $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool could not sign $setup" }
+
+      # A release tag never ships an unsigned Windows file. This checks the
+      # binaries inside the zip as well as the installer.
+      - name: Verify signatures
+        if: runner.os == 'Windows' && github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signtool = "${{ steps.certum.outputs.signtool-path }}"
+          if (-not $signtool) { Write-Output "::error::Certum login did not run, so nothing is signed"; exit 1 }
+          $version = "${{ inputs.tag }}" -replace '^v', ''
+          $zipName = "psmux-${{ inputs.tag }}-${{ matrix.artifact }}"
+          $check = Join-Path $env:RUNNER_TEMP "verify-zip"
+          Expand-Archive -Path "$zipName.zip" -DestinationPath $check -Force
+          $files = @(
+            "$check/psmux.exe", "$check/pmux.exe", "$check/tmux.exe",
+            "target\installer\psmux-v${version}-${{ matrix.nsis_arch }}-setup.exe"
+          )
+          $bad = 0
+          foreach ($f in $files) {
+            & $signtool verify /pa /q $f
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::not signed: $f"; $bad = 1 }
+            else { Write-Output "signed: $f" }
+          }
+          if ($bad) { exit 1 }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -129,6 +195,10 @@ jobs:
           path: |
             psmux-*-${{ matrix.artifact }}.zip
             target/installer/*-${{ matrix.nsis_arch }}-setup.exe
+
+      - name: Log out of Certum SimplySign
+        if: always() && steps.certum.outcome != 'skipped' && steps.certum.outcome != ''
+        uses: jay0lee/certum-cloud-code-sign/teardown@a3324503499c49090869856eeeecfe95fb613d87
 
   release:
     name: Create Release
