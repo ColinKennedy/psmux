@@ -16,9 +16,18 @@
 //!    issues #787 #848 #1008 #1072, PRs #857 #1009 #1073, none merged, and
 //!    0.29.0 is still the newest release.
 //! 2. Control characters delivered as `vk = 0` with the character in
-//!    `uChar`, the shape a Cygwin or MSYS pseudo console produces for Ctrl+B.
-//!    crossterm sends those to `ToUnicodeEx(vk = 0)`, which has no character
-//!    for them, so the prefix key never arrived.
+//!    `uChar`. crossterm sends those to `ToUnicodeEx(vk = 0)`, which has no
+//!    character for them, so the key was dropped. This half is defensive: no
+//!    terminal measured types a control key in this shape. A ConPTY host that
+//!    writes bytes (mintty through the Cygwin pseudo console, winpty, sshd)
+//!    gets a real virtual key from conhost (`VkKeyScanW` maps every C0 byte
+//!    in every layout tried: 0x02 is Ctrl+B, 0x0A is Ctrl+Enter), and so does
+//!    a conhost paste. What does produce it: WM_CHAR posted to a console
+//!    window with no key behind it, a win32-input-mode report with Vk=0, and
+//!    WriteConsoleInput. Those were dropped before and arrive now; nothing
+//!    that carried a virtual key passes through here. A SendInput
+//!    KEYEVENTF_UNICODE control character arrives as vk = VK_PACKET (0xE7),
+//!    which is not this shape and is still crossterm's.
 //!
 //! The seam: every read on the console route goes through
 //! `crossterm::event::poll(Duration::ZERO)`, and with a zero timeout crossterm
