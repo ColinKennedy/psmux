@@ -298,6 +298,7 @@ if ($IdleSeconds -lt 1) { $IdleSeconds = 1 }
 # ───────────────────────────────────────────────────────── setup ──
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Psmux = $Binary
+if (-not $Psmux) { $Psmux = $env:PSMUX_EXE }
 if (-not $Psmux) { $Psmux = $env:PSMUX_TEST_BIN }
 if (-not $Psmux) {
     $cand = Join-Path $RepoRoot "target\release\psmux.exe"
@@ -908,6 +909,35 @@ $WtWasRunning = [bool](Get-Process WindowsTerminal -ErrorAction SilentlyContinue
 # identifiable and never mixed up with one the user opened.
 $WtWindow = "psmuxbench$PID"
 
+# A terminal that is installed but cannot be STARTED. Sweeps 2026-10-07_01-38-07
+# and 2026-10-07_10-59-31 both lost this whole suite to its 900 s timeout: the
+# Windows Terminal app alias (WindowsApps\wt.exe) refused every launch with
+# "The file cannot be accessed by the system", and each refused launch still
+# waited out the 30 s marker, then retried and waited again. Three WT cells,
+# two attempts, five rounds is 900 s, so the suite never reached the keystroke
+# or creation sections and its JSON stayed "complete": false. The cause was the
+# machine, not psmux: a staged WT update (1.24.12741) cannot register while the
+# older WT hosting the developer's own session is still running (package
+# activation returns 0x80073D02, ERROR_PACKAGES_IN_USE), and the alias still
+# points at the old package. Restarting Windows Terminal applies the update.
+#
+# So the first refused Start-Process marks the HOST down: every later cell on
+# that host is skipped at once, the reason goes into the JSON as hosts_down,
+# and T9 fails loudly, because a comparison against Windows Terminal that
+# silently has no Windows Terminal in it is worse than a failure. Everything
+# that does not need the broken host is still measured.
+$script:HostDown = [ordered]@{}
+function Set-HostDown {
+    param([string]$Gui, [string]$Why)
+    if (-not $Gui -or $script:HostDown.Contains($Gui)) { return }
+    $hint = ""
+    if ($Why -match 'cannot be accessed by the system') {
+        $hint = " (an app execution alias that cannot be opened usually means a staged package update is waiting for the running copy to exit: restart that terminal)"
+    }
+    $script:HostDown[$Gui] = "$Why$hint"
+    Warn ("{0} could not be started, so every cell it hosts is skipped for the rest of the run: {1}{2}" -f $Gui, $Why, $hint)
+}
+
 # The sha is the one of the tree the MEASURED binary was built in, or
 # "installed" for a cargo install copy, never the checkout this script happens
 # to sit in: pointed at the installed psmux, the old form stamped the run with
@@ -1037,6 +1067,7 @@ function Save-Metrics {
         ref_spread     = $script:RefSpread
         ref_unstable   = $script:RefUnstable
         hosts_present  = [ordered]@{ windows_terminal = [bool]$WT; wezterm = [bool]$WEZ; alacritty = [bool]$ALAC }
+        hosts_down     = $script:HostDown
         wt_was_running = $WtWasRunning
         params         = [ordered]@{
             n = $N; keys = $Keys; creates = $Creates; idle_seconds = $IdleSeconds
@@ -1089,8 +1120,15 @@ function Invoke-LaunchRep {
     $snap = Snapshot-Hosts
     $since = Get-Date
 
+    if ($gui -and $script:HostDown.Contains($gui)) { return -1.0 }
     $t0 = [Diagnostics.Stopwatch]::GetTimestamp()
-    $p = Start-Process -FilePath $spec.Exe -ArgumentList $spec.Argv -PassThru
+    try {
+        $p = Start-Process -FilePath $spec.Exe -ArgumentList $spec.Argv -PassThru -ErrorAction Stop
+    } catch {
+        Set-HostDown $gui ($_.Exception.Message -replace '\s+', ' ')
+        if (-not $gui) { Warn ("    {0,-22} rep {1}: could not start: {2}" -f $name, $Rep, $_.Exception.Message) }
+        return -1.0
+    }
     Register-Started $p.Id
     $m = Wait-Marker $mf 30000
     $ms = -1.0
@@ -1281,9 +1319,18 @@ function Measure-KeyCell {
         Get-ChildItem -Path (Split-Path -Parent $TraceBase) -Filter ((Split-Path -Leaf $TraceBase) + ".*") -ErrorAction SilentlyContinue |
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
+    if ($GuiProcName -and $script:HostDown.Contains($GuiProcName)) {
+        Skip "  $Cell : $GuiProcName could not be started earlier in this run (see hosts_down)"
+        return $false
+    }
+    $p = $null
     try {
         if ($TraceBase) { $env:PSMUX_PTY_TRACE = $TraceBase }
-        $p = Start-Process -FilePath $Exe -ArgumentList $Argv -PassThru
+        $p = Start-Process -FilePath $Exe -ArgumentList $Argv -PassThru -ErrorAction Stop
+    } catch {
+        Set-HostDown $GuiProcName ($_.Exception.Message -replace '\s+', ' ')
+        if (-not $GuiProcName) { Warn "  $Cell : could not start: $($_.Exception.Message)" }
+        return $false
     } finally {
         Remove-Item Env:\PSMUX_PTY_TRACE -ErrorAction SilentlyContinue
     }
@@ -2241,8 +2288,16 @@ if (-not $SkipKeys -and $KeyLat) {
     }
 }
 if (-not $SkipCreate) { foreach ($c in $script:CreateCells) { if (-not $script:Create[$c]) { [void]$missing.Add("creation:$c") } } }
+# A cell whose terminal could not be started at all is T9's to report, once,
+# with the reason; counting it again here would turn one machine fault into
+# five failures.
+$hostCellRe = @{ "WindowsTerminal" = '(^|:)(wt_|psmux_in_wt)'; "wezterm-gui" = '(^|:)wezterm'; "alacritty" = '(^|:)alacritty' }
+$downRe = @($script:HostDown.Keys | ForEach-Object { $hostCellRe[$_] } | Where-Object { $_ })
+$missing = [System.Collections.ArrayList]@(@($missing) | Where-Object { $m = $_; -not ($downRe | Where-Object { $m -match $_ }) })
 Check "T0 every cell that was not skipped produced data" $missing.Count 0 "" `
     $(if ($missing.Count -gt 0) { "missing: " + ($missing -join ", ") } else { "launch, keystroke, memory, CPU and creation all populated" })
+Check "T9 every installed terminal could be started" $script:HostDown.Count 0 "" `
+    $(if ($script:HostDown.Count -gt 0) { "could not start: " + (@($script:HostDown.Keys | ForEach-Object { "$_ ($($script:HostDown[$_]))" }) -join "; ") } else { "every installed host launched" })
 
 $script:Complete = $true
 $null = Save-Metrics -Rows $rows -Deltas $deltas
