@@ -63,6 +63,16 @@ fn list_clients_format_is_expanded_for_each_client() {
 }
 
 #[test]
+fn client_termfeatures_include_hyperlinks() {
+    let app = app_with_two_clients();
+    assert_eq!(expand_format("#{client_termfeatures}", &app), "256,RGB,hyperlinks,title");
+    assert_eq!(
+        format_list_clients(&app, "#{client_termfeatures}", None),
+        "256,RGB,hyperlinks,title\n256,RGB,hyperlinks,title\n",
+    );
+}
+
+#[test]
 fn list_clients_filter_keeps_matching_rows() {
     let app = app_with_two_clients();
     let out = format_list_clients(&app, "#{client_pid}", Some("#{client_readonly}"));
