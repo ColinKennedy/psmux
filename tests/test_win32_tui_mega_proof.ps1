@@ -76,6 +76,15 @@ public class Win32Mega {
     public const byte VK_BACK    = 0x08;
     public const uint KEYEVENTF_KEYUP = 0x0002;
 
+    // C-u clears the prompt line. Like tmux (command-prompt -I'#S' / -I'#W'),
+    // the rename prompts open holding the current name, so typing alone appends.
+    public static void SendCtrlU() {
+        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+        keybd_event(0x55, 0, 0, UIntPtr.Zero);
+        keybd_event(0x55, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
     public static void SendCtrlB() {
         keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
         keybd_event(0x42, 0, 0, UIntPtr.Zero);       // B
@@ -408,6 +417,8 @@ $origWinName = (& $PSMUX display-message -t $SESSION -p '#{window_name}' 2>&1 | 
 Start-Sleep -Milliseconds 400
 [Win32Mega]::SendDollar()
 Start-Sleep -Milliseconds 600
+[Win32Mega]::SendCtrlU()
+Start-Sleep -Milliseconds 200
 
 $renamed = "proven201"
 [Win32Mega]::SendString($renamed)
@@ -434,6 +445,8 @@ Write-Test "Issue #201: prefix+comma renames WINDOW"
 Start-Sleep -Milliseconds 400
 [Win32Mega]::SendComma()
 Start-Sleep -Milliseconds 600
+[Win32Mega]::SendCtrlU()
+Start-Sleep -Milliseconds 200
 
 $newWin = "proven201win"
 [Win32Mega]::SendString($newWin)
