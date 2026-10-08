@@ -126,9 +126,14 @@ if ($sp -eq 0) {
     if ($kids.Count -eq 0) {
         Write-Skip "no pane children visible to check (they may have been reparented)"
     } else {
-        $raised = @($kids | Where-Object { (Get-Class $_.ProcessId) -ne 'Normal' })
+        # Only a class ABOVE Normal is a raise. The server's own console host
+        # (conhost 0x4) is created at the class of whoever launched the server
+        # before the server raises itself, so a runner started BelowNormal (a
+        # Task Scheduler launch defaults to priority 7) leaves it BelowNormal;
+        # that is the environment, not psmux boosting a workload.
+        $raised = @($kids | Where-Object { (Get-Class $_.ProcessId) -in @('AboveNormal', 'High', 'RealTime') })
         if ($raised.Count -eq 0) {
-            Write-Pass "all $($kids.Count) pane children stayed at Normal"
+            Write-Pass "none of $($kids.Count) pane children was raised above Normal"
         } else {
             Write-Fail "pane children were raised: $(($raised | ForEach-Object { "$($_.Name)=$(Get-Class $_.ProcessId)" }) -join ', ')"
         }
