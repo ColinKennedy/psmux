@@ -971,6 +971,11 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "escape-time" => Some(app.escape_time_ms.to_string()),
         "history-limit" => Some(app.history_limit.to_string()),
         "pipe-max-bytes" => Some(app.pipe_max_bytes.to_string()),
+        // Read-only view of the cap the direct file sink actually applies.
+        // Unlike `#{pipe-max-bytes}`, a psmux without this option can't
+        // answer it from the user-option fallback (nothing ever sets an
+        // option by this name), so a client can tell whether the cap is real.
+        "pipe-max-bytes-effective" => Some(app.pipe_max_bytes.to_string()),
         "mouse" => Some(if app.mouse_enabled { "on".into() } else { "off".into() }),
         "bold-is-bright" => Some(if app.bold_is_bright { "on".into() } else { "off".into() }),
         "scroll-enter-copy-mode" => Some(if app.scroll_enter_copy_mode { "on".into() } else { "off".into() }),
