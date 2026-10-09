@@ -683,6 +683,10 @@ pub struct AppState {
     pub tab_positions: Vec<(usize, u16, u16)>,
     /// history-limit: scrollback buffer size (default 2000)
     pub history_limit: usize,
+    /// pipe-max-bytes: the most bytes a `pipe-pane` direct file sink
+    /// (`cat > file` / `cat >> file`) writes before it stops recording and
+    /// appends one truncation marker (0 = unlimited, the default)
+    pub pipe_max_bytes: u64,
     /// display-time: how long messages are shown (ms, default 750)
     pub display_time_ms: u64,
     /// display-panes-time: how long pane overlay is shown (ms, default 1000)
@@ -1240,6 +1244,7 @@ impl AppState {
             last_pane_path: Vec::new(),
             tab_positions: Vec::new(),
             history_limit: 2000,
+            pipe_max_bytes: 0,
             display_time_ms: 750,
             display_panes_time_ms: 1000,
             pane_base_index: 0,
@@ -2081,6 +2086,83 @@ pub static PIPE_PANE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// and cross-session forward tunnels (TcpStream) without a second reader
 /// competing for the ConPTY output pipe.
 pub static PIPE_WRITERS: Mutex<Vec<(usize, Box<dyn std::io::Write + Send>)>> = Mutex::new(Vec::new());
+
+/// A pipe-pane direct file sink with an optional byte cap (`pipe-max-bytes`).
+/// Up to `cap` bytes are written; past it, one truncation marker line is
+/// appended and every later write is accepted and dropped, so the pane's
+/// reader thread keeps the writer registered and never blocks. `cap == 0`
+/// writes everything.
+pub struct CappedFileSink {
+    file: std::fs::File,
+    cap: u64,
+    written: u64,
+    marker_written: bool,
+}
+
+impl CappedFileSink {
+    pub fn new(file: std::fs::File, cap: u64) -> Self {
+        Self { file, cap, written: 0, marker_written: false }
+    }
+}
+
+impl std::io::Write for CappedFileSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.cap == 0 {
+            return self.file.write(buf);
+        }
+        if self.written < self.cap {
+            let take = ((self.cap - self.written) as usize).min(buf.len());
+            self.file.write_all(&buf[..take])?;
+            self.written += take as u64;
+        }
+        if self.written >= self.cap && !self.marker_written {
+            self.marker_written = true;
+            write!(self.file, "\n[psmux pipe-pane: truncated at {} bytes]\n", self.cap)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(test)]
+mod capped_file_sink_tests {
+    use super::CappedFileSink;
+    use std::io::Write;
+
+    fn sink_file(tag: &str) -> (std::path::PathBuf, std::fs::File) {
+        let path = std::env::temp_dir()
+            .join(format!("psmux-capped-sink-{}-{}", tag, std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        (path, file)
+    }
+
+    #[test]
+    fn writes_up_to_the_cap_then_one_marker_then_drops() {
+        let (path, file) = sink_file("cap");
+        let mut sink = CappedFileSink::new(file, 10);
+        assert_eq!(sink.write(b"0123456").unwrap(), 7);
+        assert_eq!(sink.write(b"789abc").unwrap(), 6);
+        assert_eq!(sink.write(b"more").unwrap(), 4);
+        sink.flush().unwrap();
+        drop(sink);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "0123456789\n[psmux pipe-pane: truncated at 10 bytes]\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_cap_writes_everything() {
+        let (path, file) = sink_file("nocap");
+        let mut sink = CappedFileSink::new(file, 0);
+        sink.write_all(b"hello world").unwrap();
+        drop(sink);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly

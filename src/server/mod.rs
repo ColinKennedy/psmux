@@ -4505,7 +4505,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             match opts.open(&path) {
                                 Ok(file) => {
                                     if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
-                                        writers.push((pane_id, Box::new(file)));
+                                        writers.push((
+                                            pane_id,
+                                            Box::new(crate::types::CappedFileSink::new(
+                                                file,
+                                                app.pipe_max_bytes,
+                                            )),
+                                        ));
                                         crate::types::PIPE_PANE_COUNT
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         app.pipe_panes.push(PipePaneState {

@@ -3286,7 +3286,7 @@ fn run_main() -> io::Result<()> {
                         "history-limit", "escape-time", "display-time", "display-panes-time",
                         "repeat-time", "message-limit", "status-interval", "base-index",
                         "pane-base-index", "status-left-length", "status-right-length",
-                        "history-file-limit",
+                        "history-file-limit", "pipe-max-bytes",
                     ];
                     // Collect positional (non-flag) args, skipping -t/-p values.
                     // `@user-options` start with '@', not '-', so they are

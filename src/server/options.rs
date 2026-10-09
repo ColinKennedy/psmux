@@ -77,6 +77,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "status-left" => app.status_left.clone(),
         "status-right" => app.status_right.clone(),
         "history-limit" => app.history_limit.to_string(),
+        "pipe-max-bytes" => app.pipe_max_bytes.to_string(),
         "display-time" => app.display_time_ms.to_string(),
         "display-panes-time" => app.display_panes_time_ms.to_string(),
         "mode-keys" => app.mode_keys.clone(),
@@ -367,6 +368,11 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
         "escape-time" => {
             if let Ok(ms) = value.parse::<u64>() {
                 app.escape_time_ms = ms;
+            }
+        }
+        "pipe-max-bytes" => {
+            if let Ok(cap) = value.parse::<u64>() {
+                app.pipe_max_bytes = cap;
             }
         }
         "history-limit" => {

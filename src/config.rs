@@ -1100,6 +1100,11 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
                 app.history_limit = limit;
             }
         }
+        "pipe-max-bytes" => {
+            if let Ok(cap) = value.parse::<u64>() {
+                app.pipe_max_bytes = cap;
+            }
+        }
         "display-time" => {
             if let Ok(ms) = value.parse::<u64>() {
                 app.display_time_ms = ms;

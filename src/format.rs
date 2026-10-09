@@ -970,6 +970,7 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "pane-base-index" => Some(app.pane_base_index.to_string()),
         "escape-time" => Some(app.escape_time_ms.to_string()),
         "history-limit" => Some(app.history_limit.to_string()),
+        "pipe-max-bytes" => Some(app.pipe_max_bytes.to_string()),
         "mouse" => Some(if app.mouse_enabled { "on".into() } else { "off".into() }),
         "bold-is-bright" => Some(if app.bold_is_bright { "on".into() } else { "off".into() }),
         "scroll-enter-copy-mode" => Some(if app.scroll_enter_copy_mode { "on".into() } else { "off".into() }),
