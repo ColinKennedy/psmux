@@ -9348,11 +9348,37 @@ impl ClipboardHeadCache {
     const HEAD_CHARS: usize = 64;
 
     fn get(&mut self) -> Option<&str> {
-        let seq = crate::clipboard::clipboard_sequence_number();
+        self.get_with(
+            crate::clipboard::clipboard_sequence_number(),
+            crate::clipboard::try_read_from_system_clipboard,
+        )
+    }
+
+    /// A read that could not open the clipboard is not cached: another
+    /// window (a clipboard history listener, a paste in flight) holding it
+    /// open for a moment would otherwise blank the head until the clipboard
+    /// next changed, and every later paste of the same text would be flushed
+    /// as typing, one character at a time (issue #684).
+    fn get_with(
+        &mut self,
+        seq: u32,
+        read: impl FnOnce() -> Result<Option<String>, crate::clipboard::ClipboardBusy>,
+    ) -> Option<&str> {
         if self.seq != Some(seq) {
-            self.seq = Some(seq);
-            self.head = read_from_system_clipboard()
-                .map(|t| t.chars().take(Self::HEAD_CHARS).collect::<String>());
+            match read() {
+                Ok(text) => {
+                    self.seq = Some(seq);
+                    self.head = text.map(|t| t.chars().take(Self::HEAD_CHARS).collect::<String>());
+                }
+                Err(_) => {
+                    if input_log_enabled() {
+                        input_log("paste", &format!(
+                            "clipboard busy (seq {}), head not cached", seq));
+                    }
+                    self.seq = None;
+                    self.head = None;
+                }
+            }
         }
         self.head.as_deref()
     }
@@ -9662,6 +9688,10 @@ mod test_zoom_bleed;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue744_paste_overlay_routing.rs"]
 mod test_issue744_paste_overlay_routing;
+
+#[cfg(all(test, windows))]
+#[path = "../tests-rs/test_issue684_clipboard_head_cache.rs"]
+mod test_issue684_clipboard_head_cache;
 
 /// How long the client keeps polling console input at 1ms after sending a key,
 /// waiting for that key's echo to come back and be drawn.
