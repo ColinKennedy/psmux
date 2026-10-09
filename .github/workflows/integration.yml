@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - ralphus
   workflow_dispatch:
     inputs:
       test-pattern:

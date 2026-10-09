@@ -384,6 +384,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("base-index",                 "0"),
     ("pane-base-index",            "0"),
     ("history-limit",              "2000"),
+    ("pipe-max-bytes",             "0"),
     ("mouse",                      "on"),
     ("mode-keys",                  "emacs"),
     ("focus-events",               "off"),

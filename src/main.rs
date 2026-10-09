@@ -3286,7 +3286,7 @@ fn run_main() -> io::Result<()> {
                         "history-limit", "escape-time", "display-time", "display-panes-time",
                         "repeat-time", "message-limit", "status-interval", "base-index",
                         "pane-base-index", "status-left-length", "status-right-length",
-                        "history-file-limit",
+                        "history-file-limit", "pipe-max-bytes",
                     ];
                     // Collect positional (non-flag) args, skipping -t/-p values.
                     // `@user-options` start with '@', not '-', so they are
@@ -3940,6 +3940,14 @@ fn run_main() -> io::Result<()> {
                         "-I" => { cmd.push_str(" -I"); }
                         "-O" => { cmd.push_str(" -O"); }
                         "-o" => { cmd.push_str(" -o"); }
+                        // `-F <path>`: literal file-sink path, quoted so any
+                        // character survives the wire as one token.
+                        "-F" => {
+                            if let Some(p) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -F {}", crate::util::quote_arg_if_needed(p)));
+                                i += 1;
+                            }
+                        }
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -t {}", t));

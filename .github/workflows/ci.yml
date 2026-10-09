@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - master
+      - ralphus
   pull_request:
     branches:
       - master
+      - ralphus
   workflow_dispatch:
 
 permissions:

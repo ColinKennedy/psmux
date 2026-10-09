@@ -2708,9 +2708,20 @@ match cmd {
         // so the command's OWN dash-flags survive (e.g.
         // `pwsh -NoProfile -EncodedCommand <b64>`). Previously every dash-token
         // was filtered out, silently mangling the piped command.
+        // `-F <path>`: write the pane's output straight to <path> with the
+        // in-server file sink, taking the path literally -- no shell, no
+        // `cat > file` parsing, so any character a filename can hold works.
+        let mut file_path: Option<String> = None;
         let mut start = 0;
-        while start < args.len() && matches!(args[start], "-I" | "-O" | "-o") {
-            start += 1;
+        while start < args.len() {
+            match args[start] {
+                "-I" | "-O" | "-o" => start += 1,
+                "-F" if start + 1 < args.len() => {
+                    file_path = Some(args[start + 1].to_string());
+                    start += 2;
+                }
+                _ => break,
+            }
         }
         let cmd = args[start..].join(" ");
         let (stdin, stdout) = if !stdin_flag && !stdout_flag {
@@ -2723,7 +2734,7 @@ match cmd {
         // rc-0 no-op. The handler answers "" on acceptance; only an
         // "ERROR: ..." reply is forwarded.
         let (rtx, rrx) = mpsc::channel::<String>();
-        let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout, toggle, Some(rtx)));
+        let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout, toggle, file_path, Some(rtx)));
         let resp = rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
         if !persistent {
             if !resp.is_empty() {

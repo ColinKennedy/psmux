@@ -4372,7 +4372,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     let _ = resp.send(output);
                 }
-                CtrlReq::PipePane(cmd, stdin, stdout, toggle, mut reply) => {
+                CtrlReq::PipePane(cmd, stdin, stdout, toggle, file_path, mut reply) => {
                     // The `-t` target (if any) was temp-focused by the connection
                     // layer before this request ran, so the active pane here IS the
                     // requested target pane (issue #440 defect 2). The pipe binds to
@@ -4435,7 +4435,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // one-shot CLI can exit non-zero (see CtrlReq::PipePane).
                     let mut outcome = String::new();
 
-                    if cmd.is_empty() {
+                    if cmd.is_empty() && file_path.is_none() {
                         // No command: close any existing pipe on this pane
                         if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
                             unregister_writer(pane_id);
@@ -4472,7 +4472,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // into the file (byte-faithful, no shell, no child to
                         // fail silently). Output direction only; `-I` and
                         // every other command shape keep the shell sink.
-                        let file_sink = if stdout && !stdin {
+                        // `-F <path>` names the file directly (always
+                        // appending), so the path is never re-parsed as shell
+                        // text and may contain any character a filename can.
+                        let file_sink = if let Some(path) = file_path.clone() {
+                            Some((path, true))
+                        } else if stdout && !stdin {
                             crate::util::parse_cat_file_sink(&cmd)
                         } else {
                             None
@@ -4505,7 +4510,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             match opts.open(&path) {
                                 Ok(file) => {
                                     if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
-                                        writers.push((pane_id, Box::new(file)));
+                                        writers.push((
+                                            pane_id,
+                                            Box::new(crate::types::CappedFileSink::new(
+                                                file,
+                                                app.pipe_max_bytes,
+                                            )),
+                                        ));
                                         crate::types::PIPE_PANE_COUNT
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         app.pipe_panes.push(PipePaneState {
