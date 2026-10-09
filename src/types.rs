@@ -1726,7 +1726,8 @@ pub enum CtrlReq {
     /// rc 0 (same shape as #559/#566). Shell-sink spawns are answered
     /// BEFORE spawning (CreateProcess can stall on a cold AV scan); their
     /// failures are reported on the status bar and never recorded.
-    PipePane(String, bool, bool, bool, Option<mpsc::Sender<String>>),
+    /// (shell command, stdin, stdout, toggle, literal file-sink path from `-F`, reply)
+    PipePane(String, bool, bool, bool, Option<String>, Option<mpsc::Sender<String>>),
     SelectLayout(String),
     NextLayout,
     ListClients(mpsc::Sender<String>),

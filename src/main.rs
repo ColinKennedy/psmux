@@ -3940,6 +3940,14 @@ fn run_main() -> io::Result<()> {
                         "-I" => { cmd.push_str(" -I"); }
                         "-O" => { cmd.push_str(" -O"); }
                         "-o" => { cmd.push_str(" -o"); }
+                        // `-F <path>`: literal file-sink path, quoted so any
+                        // character survives the wire as one token.
+                        "-F" => {
+                            if let Some(p) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -F {}", crate::util::quote_arg_if_needed(p)));
+                                i += 1;
+                            }
+                        }
                         "-t" => {
                             if let Some(t) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -t {}", t));
